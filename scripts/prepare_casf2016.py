@@ -34,14 +34,21 @@ except ImportError:
 class CASF2016Organizer:
     """CASF-2016 数据集整理器"""
     
-    def __init__(self, raw_data_dir: str, output_dir: str):
+    def __init__(self, raw_data_dir: str, output_dir: Optional[str] = None):
         """
         Args:
             raw_data_dir: 原始 CASF-2016 解压目录
-            output_dir: 输出目录根路径
+            output_dir: 输出目录根路径（默认为脚本所在项目根目录）
         """
         self.raw_data_dir = Path(raw_data_dir)
-        self.output_dir = Path(output_dir)
+        
+        # 如果未指定输出目录，使用脚本所在的项目根目录
+        if output_dir is None:
+            # 获取脚本所在目录的上一级（项目根目录）
+            script_dir = Path(__file__).resolve().parent
+            self.output_dir = script_dir.parent
+        else:
+            self.output_dir = Path(output_dir)
         
         # 定义目录结构
         self.complexes_dir = self.output_dir / "data" / "casf2016" / "complexes"
@@ -428,18 +435,28 @@ class CASF2016Organizer:
 
 def main():
     """主函数"""
-    # 默认路径
-    raw_data_dir = "/Users/apple/code/BINDRAE/data/CASF-2016"
-    output_dir = "/Users/apple/code/BINDRAE"
+    # 默认路径（相对路径）
+    script_dir = Path(__file__).resolve().parent
+    project_root = script_dir.parent
+    
+    raw_data_dir = project_root / "data" / "CASF-2016"
+    output_dir = None  # 使用默认值（项目根目录）
     
     # 可以从命令行参数获取
     if len(sys.argv) > 1:
-        raw_data_dir = sys.argv[1]
+        raw_data_dir = Path(sys.argv[1])
     if len(sys.argv) > 2:
-        output_dir = sys.argv[2]
+        output_dir = Path(sys.argv[2])
+    
+    print("="*80)
+    print("CASF-2016 数据集整理与完整性校验")
+    print("="*80)
+    print(f"原始数据目录: {raw_data_dir}")
+    print(f"输出目录: {output_dir if output_dir else project_root}")
+    print()
     
     # 运行整理器
-    organizer = CASF2016Organizer(raw_data_dir, output_dir)
+    organizer = CASF2016Organizer(str(raw_data_dir), str(output_dir) if output_dir else None)
     organizer.run()
 
 
