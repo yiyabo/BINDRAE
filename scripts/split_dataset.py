@@ -181,7 +181,13 @@ class DatasetSplitter:
 
 def main():
     """主函数"""
-    base_dir = sys.argv[1] if len(sys.argv) > 1 else "/Users/apple/code/BINDRAE"
+    # 使用项目根目录
+    script_dir = Path(__file__).resolve().parent
+    base_dir = script_dir.parent
+    
+    # 允许命令行指定
+    if len(sys.argv) > 1:
+        base_dir = Path(sys.argv[1])
     
     # 可以通过命令行参数调整比例和种子
     train_ratio = float(sys.argv[2]) if len(sys.argv) > 2 else 0.8
@@ -189,7 +195,7 @@ def main():
     test_ratio = float(sys.argv[4]) if len(sys.argv) > 4 else 0.1
     random_seed = int(sys.argv[5]) if len(sys.argv) > 5 else 2025
     
-    splitter = DatasetSplitter(base_dir, train_ratio, val_ratio, test_ratio, random_seed)
+    splitter = DatasetSplitter(str(base_dir), train_ratio, val_ratio, test_ratio, random_seed)
     splitter.run()
 
 

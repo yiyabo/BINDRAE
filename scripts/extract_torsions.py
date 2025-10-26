@@ -431,9 +431,15 @@ class TorsionExtractor:
 
 def main():
     """主函数"""
-    base_dir = sys.argv[1] if len(sys.argv) > 1 else "/Users/apple/code/BINDRAE"
+    # 使用项目根目录
+    script_dir = Path(__file__).resolve().parent
+    base_dir = script_dir.parent
     
-    extractor = TorsionExtractor(base_dir)
+    # 允许命令行指定
+    if len(sys.argv) > 1:
+        base_dir = Path(sys.argv[1])
+    
+    extractor = TorsionExtractor(str(base_dir))
     extractor.run()
 
 

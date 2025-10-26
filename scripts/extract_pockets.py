@@ -353,14 +353,20 @@ class PocketExtractor:
 
 def main():
     """主函数"""
-    base_dir = sys.argv[1] if len(sys.argv) > 1 else "/Users/apple/code/BINDRAE"
+    # 使用项目根目录
+    script_dir = Path(__file__).resolve().parent
+    base_dir = script_dir.parent
+    
+    # 允许命令行指定
+    if len(sys.argv) > 1:
+        base_dir = Path(sys.argv[1])
     
     # 可以通过命令行参数调整超参数
     contact_radius = float(sys.argv[2]) if len(sys.argv) > 2 else 5.0
     k_hops = int(sys.argv[3]) if len(sys.argv) > 3 else 1
     rbf_sigma = float(sys.argv[4]) if len(sys.argv) > 4 else 2.0
     
-    extractor = PocketExtractor(base_dir, contact_radius, k_hops, rbf_sigma)
+    extractor = PocketExtractor(str(base_dir), contact_radius, k_hops, rbf_sigma)
     extractor.run()
 
 

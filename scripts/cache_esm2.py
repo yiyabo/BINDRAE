@@ -344,9 +344,13 @@ class ESM2Cache:
 def main():
     import argparse
     
+    # 默认使用项目根目录
+    script_dir = Path(__file__).resolve().parent
+    default_base_dir = str(script_dir.parent)
+    
     parser = argparse.ArgumentParser(description='ESM-2 编码器缓存（智能模型选择）')
-    parser.add_argument('--base_dir', type=str, default='.',
-                       help='项目根目录（默认: 当前目录）')
+    parser.add_argument('--base_dir', type=str, default=default_base_dir,
+                       help=f'项目根目录（默认: 脚本所在项目根目录）')
     parser.add_argument('--fallback', action='store_true',
                        help='使用备选模型（显存不足时）')
     
