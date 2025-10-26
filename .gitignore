@@ -1,28 +1,42 @@
-# 数据目录已包含在仓库中，不再忽略
-# data
+# ============================================================================
+# BINDRAE .gitignore
+# ============================================================================
 
-# 排除原始压缩包（太大）
-data/CASF-2016.tar.gz
-data/**/*.tar.gz
-data/**/*.zip
+# 数据目录（太大，使用 GitHub Release 分发）
+data/
 
-# 临时文件
+# Python 编译文件
 *.pyc
 __pycache__/
 *.egg-info/
+.pytest_cache/
+
+# 系统文件
 .DS_Store
+Thumbs.db
 
 # 日志文件
 *.log
-logs/*.txt
+logs/
 
-# 临时输出
+# 训练输出
 outputs/
 checkpoints/
+runs/
 wandb/
 
-# IDE
+# IDE 配置
 .vscode/
 .idea/
 *.swp
 *.swo
+*.code-workspace
+
+# 临时文件
+*.tmp
+*.bak
+*~
+
+# 环境变量
+.env
+.env.local
