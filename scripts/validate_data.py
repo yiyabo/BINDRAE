@@ -116,7 +116,17 @@ class DataValidator:
         print("验证报告")
         print("="*80)
         print(f"总样本数: {total_count}")
-        print(f"有效样本: {valid_count} ({100*valid_count/total_count:.1f}%)")
+        
+        if total_count > 0:
+            print(f"有效样本: {valid_count} ({100*valid_count/total_count:.1f}%)")
+        else:
+            print("⚠️  未找到任何配体文件！")
+            print("\n可能原因:")
+            print("  1. processed/features/ 目录为空")
+            print("  2. 数据未上传或解压")
+            print("  3. 路径配置错误")
+            return
+        
         print()
         
         # 详细问题
@@ -149,8 +159,15 @@ class DataValidator:
 
 
 def main():
-    base_dir = sys.argv[1] if len(sys.argv) > 1 else "/Users/apple/code/BINDRAE"
-    validator = DataValidator(base_dir)
+    # 使用项目根目录
+    script_dir = Path(__file__).resolve().parent
+    base_dir = script_dir.parent
+    
+    # 允许命令行指定
+    if len(sys.argv) > 1:
+        base_dir = Path(sys.argv[1])
+    
+    validator = DataValidator(str(base_dir))
     validator.run()
 
 

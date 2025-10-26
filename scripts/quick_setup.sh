@@ -79,7 +79,7 @@ N_COMPLEXES=$(ls data/casf2016/complexes 2>/dev/null | wc -l | tr -d ' ')
 N_LIGANDS=$(ls data/casf2016/processed/features/*_ligand_coords.npy 2>/dev/null | wc -l | tr -d ' ')
 N_POCKETS=$(ls data/casf2016/processed/pockets/*_w_res.npy 2>/dev/null | wc -l | tr -d ' ')
 N_TORSIONS=$(ls data/casf2016/processed/features/*_torsions.npz 2>/dev/null | wc -l | tr -d ' ')
-N_ESM=$(ls data/casf2016/processed/features/esm2_cache/*.pt 2>/dev/null | wc -l | tr -d ' ')
+N_ESM=$(ls data/casf2016/processed/features/*_esm.pt 2>/dev/null | wc -l | tr -d ' ')
 
 echo "  - 复合物: $N_COMPLEXES"
 echo "  - 配体特征: $N_LIGANDS"
