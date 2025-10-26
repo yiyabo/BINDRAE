@@ -1,0 +1,28 @@
+# 数据目录已包含在仓库中，不再忽略
+# data
+
+# 排除原始压缩包（太大）
+data/CASF-2016.tar.gz
+data/**/*.tar.gz
+data/**/*.zip
+
+# 临时文件
+*.pyc
+__pycache__/
+*.egg-info/
+.DS_Store
+
+# 日志文件
+*.log
+logs/*.txt
+
+# 临时输出
+outputs/
+checkpoints/
+wandb/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

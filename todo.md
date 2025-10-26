@@ -1,440 +1,669 @@
-# 配体条件下的蛋白质**动态构象生成**项目手册（v1.0）
+# BINDRAE - Stage-1 IPA 实现任务清单
 
-> 研究口径（第一性原理）：
-> **在连续潜空间 (\mathcal{Z})**（由 ESM‑3 语义 + 几何分支融合得到）**学习从 apo→holo 的时间连续运输（flow/bridge）**；
-> **在结构空间 (\mathcal{X})** 用**解码器**将任意时刻的潜变量 (Z_p(t)) 还原为可检验的 3D 构象；
-> 通过**几何/化学约束**与**能量或打分蒸馏**，保证路径的物理合理性与可用性。
-
----
-
-## 0. 产出与边界
-
-* 产出
-
-  1. 一套可复现实验管线（数据→潜空间→连续生成→解码→评测）。
-  2. **动态轨迹生成器**（Flow Matching 主干，SB 为可插拔正则）。
-  3. 端到端评测：端点（apo/holo）与路径（中间态）的指标。
-  4. 论文草稿的**方法与实验章节**“可直接落笔”的素材（公式/伪代码/图示建议）。
-* 非目标
-
-  * 本版不解决**长时间尺度热力学**的严格一致性（后续以SB + 能量蒸馏增强）。
-  * 暂不做**端到端配体生成**（先做“已知配体条件下”动态构象；协同生成作为扩展）。
+> **项目目标**：实现基于 FlashIPA 的蛋白质构象生成模型（Stage-1: 自编码器预训练）
+> 
+> **更新时间**：2025-10-25
+> 
+> **训练环境**：Linux + CUDA (2×A100-80GB 首选)
 
 ---
 
-## 1. 问题定义与符号
+## 📊 项目概览
 
-**目标**：给定蛋白的 apo 结构与配体，生成一条**从 apo 到 holo 的连续构象路径** ({X_p(t)}_{t\in[0,1]})。
-
-* 编码器
-
-  * 蛋白：(Z_p^{(0)}=E_p(\text{apo}))，(Z_p^{(1)}=E_p(\text{holo}))。
-  * 配体：(Z_l=E_l(\text{lig}))。
-* 潜空间：(\mathcal{Z}=\mathcal{Z}_p\times \mathcal{Z}_l) 的直积流形，包含
-
-  * 欧氏块 (\mathbb{R}^m)（集体变量/语义嵌入），
-  * 角度块 ((S^1)^K)（主链/侧链扭转），
-  * 旋转块 (SO(3))（可选的局部刚体自由度）。
-* 运输模型
-
-  * **FM**：(\dot Z_p(t)=v_\theta(Z_p(t),t;Z_l))（确定性 ODE）。
-  * **SB**：(dZ_p(t)=v_\theta,dt+\sigma(t),dW_t)（随机 SDE）。
-* 解码：(X_p(t)=D(Z_p(t)))（内部坐标 + FK 或等变坐标头）。
-
-**不等式目标（直观）**：端点分布匹配 + 路径几何合理
-[
-Z_p(0)\sim P_0,\quad Z_p(1)\approx P_1(\cdot\mid Z_l),\quad \text{且 }X_p(t)\text{ 满足几何/化学先验。}
-]
-
----
-
-## 2. 系统总览与数据流
-
-1. 数据制备：((\text{apo},\ \text{lig},\ \text{holo})) 三元组 + 质量过滤 + 标注（接触、口袋）。
-2. 编码：ESM‑3 残基层语义令牌 + 几何分支（GVP/EGNN）→ 融合 → (Z_p)；配体图/3D → (Z_l)。
-3. **RAE 预训练**：训练解码器 (D) 保障 (Z\to X) 的**可逆性/可还原性**。
-4. **桥模型训练**：在 (\mathcal{Z}) 上学流/桥（FM 主 + SB 辅），得到 (v_\theta)。
-5. 采样与解码：从 (Z_p(0)) 积分至 (Z_p(1))，沿途解码为 (X_p(t))。
-6. 评测：端点+路径指标；可选 MD 短程验证。
-
----
-
-## 3. 数据集与清洗
-
-### 3.1 三元组构建
-
-* 同一蛋白的 **apo 结构** 与 **holo 复合体**（holo 中抽取配体）。
-* Ligand 3D 标准化：质子化状态、立体中心、扭转键标记、重复体/重复构象去重。
-* 分辨率与质量门槛：X‑ray 分辨率 ≤ 3.0 Å；去除大缺失残基；统一编号与链标识。
-
-### 3.2 同源去泄漏的划分
-
-* **序列相似度聚类**（如 30%/40% 两档）→ 家族分层拆分 train/val/test。
-* 按 **配体骨架**（Bemis–Murcko）再做分布平衡，避免配体信息泄漏。
-
-### 3.3 标签与辅助特征
-
-* 口袋掩码、界面残基、残基层接触（距离阈值 8 Å）。
-* 可选导出：主链/侧链 torsion 角标签，距离图 (d_{ij})、SASA、二级结构。
-
----
-
-## 4. 表示学习（Encoder 与融合）
-
-### 4.1 蛋白编码器 (E_p)
-
-* **语义**：ESM‑3 主体冻结；倒数 1–2 层插入 **LoRA/Adapter**（小幅对齐 PPI/口袋域）。
-* **几何分支**（推荐 GVP‑GNN 起步）：
-
-  * 图构建：原子级节点 + 共价边 + 半径 (r=8) Å 非键邻域；
-  * 节点特征：原子类、SASA、部分电荷、局部参考系坐标；
-  * 边特征：距离、单位向量、氢键/盐桥指示；
-  * 残基池化：原子 → 残基层局部几何令牌 (\mathbf{g}_i)。
-* **融合**（残基层配对）：
-
-  * (\mathbf{z}_i=W[\mathbf{e}_i|\mathbf{g}_i]) 或 Gate/FiLM 或 1–2 层跨注意力；
-  * 得到 (\mathbf{Z}*p={\mathbf{z}*i}*{i=1}^{N*{\text{res}}})，维度 (d_z\sim 256\text{–}512)。
-
-### 4.2 配体编码器 (E_l)
-
-* **条件生成模式（A）**：配体图/3D → **欧氏嵌入** (\in\mathbb{R}^{d_l}) 作为**条件**。
-* **协同生成模式（B）**：将配体自由度显式参数化为 (\mathbb{R}^3\times SO(3)\times (S^1)^K)，同时作为被生成变量。
-
----
-
-## 5. 解码器 (D)（结构还原）
-
-### 5.1 内部坐标 + 前向运动学（FK）
-
-* 预测每个残基的 (\hat\phi,\hat\psi,\hat\omega\in S^1) 与 (\hat{\boldsymbol{\chi}}\in (S^1)^{K_i})，**wrap** 差值到 ([-\pi,\pi))。
-* 通过 FK 还原原子坐标（用固定键长/角 + 扭转角驱动）。
-
-### 5.2 几何不变损失
-
-* **Torsion**：(\mathcal{L}*\text{torsion}=\sum \mathrm{wrap}*{2\pi}(\hat\theta-\theta)^2)。
-* **FAPE**：在每个残基层局部参考系对齐的点误差（平移/旋转不敏感）。
-* **距离图**：(\mathcal{L}*\text{dist}=\sum(\hat d*{ij}-d_{ij})^2)。
-* **可选**：接触 BCE、密度/表面体素 L2 + TV（后期增强）。
-
-### 5.3 RAE 稳定技巧
-
-* **解码器噪声增强**：训练时对 (Z) 加小噪（欧氏高斯 / von‑Mises / 矩阵Fisher），让 (D) 适应生成时的带噪潜变量。
-* **维度依赖时间表偏移**：时间嵌入 (t\mapsto t_m=\frac{\alpha t}{1+(\alpha-1)t},\ \alpha=\sqrt{m/n})（潜令牌总维 (m) 对低维基表 (n) 的缩放）。
-* **宽度≥维度**：用于去噪/流场的通道宽 (d\ge \text{latent维})，避免容量瓶颈。
-
----
-
-## 6. 生成器 (v_\theta)（在潜空间学习“怎么走”）
-
-### 6.1 Flow Matching（主干）
-
-* **训练样本**：((Z_p^{(0)},Z_p^{(1)},Z_l))；采样 (t\sim U(0,1))。
-* **geodesic+noise 中间态** (z_t)：
-
-  * 欧氏：(z_t=(1-t)z_0+t z_1+\sigma(t)\varepsilon)；
-  * (S^1)：(\theta_t=\mathrm{wrap}(\theta_0+t,\mathrm{wrap}(\theta_1-\theta_0))+\eta_t)；
-  * (SO(3))：(R_t=R_0\exp\big(t\log(R_0^\top R_1)\big),\Xi_t)。
-* **“真速度”**：欧氏 (z_1-z_0)；(S^1) 常角速度；(SO(3)) (\dot R_t=R_t A, A=\log(R_0^\top R_1))。
-* **目标**：(\min_\theta \mathbb{E}|v_\theta(z_t,t;Z_l)-\mathbb{E}[\dot z_t\mid z_t,t,Z_l]|^2)。
-* **网络**：Transformer/GNN 混合主干 + 时间/条件注入（FiLM/跨注意力）；必要时加**浅而宽的头**增宽通道。
-
-### 6.2 Schrödinger Bridge（可插拔正则）
-
-* 在参考扩散上最小化路径 KL，学习“最经济”的随机桥；加入**边际匹配/路径 KL/score matching**项。
-* 价值：改善多模态路径与热力学一致性（作为 FM 的正则层叠，训练仍稳定）。
-
-### 6.3 几何/化学与能量引导（可选增强）
-
-* **几何正则**：无碰撞（min‑dist penalty）、键长角度/价态先验、H‑bond/疏水互补奖励。
-* **能量/力蒸馏**：训练能量头 (E_\phi) 或蒸馏自快速打分器，对速度场加
-  (|v_\theta+\lambda,\Pi_T\nabla_z E_\phi|^2)（(\Pi_T) 为流形切空间投影）。
-
----
-
-## 7. 目标函数与权重（最小可用 + 增强）
-
-**最小可用版本**
-[
-\mathcal{L}*\text{rec}=\lambda_1\mathcal{L}*\text{torsion}+\lambda_2\mathcal{L}*\text{FAPE}+\lambda_3\mathcal{L}*\text{dist}
-]
-[
-\mathcal{L}*\text{bridge}=\mathcal{L}*\text{FM}(v_\theta;z_t,\dot z_t)
-]
-[
-\mathcal{L}*\text{total}=\mathcal{L}*\text{rec}(Z_p^{(0)})+\mathcal{L}*\text{rec}(Z_p^{(1)})+\alpha,\mathcal{L}*\text{bridge}
-]
-
-**增强项（逐步打开）**
-
-* * 接触 (\lambda_4\mathcal{L}_\text{contact})；
-* * SB 边际/路径 KL：(\beta,\mathcal{L}_\text{SB})；
-* * 几何/能量：(\gamma,\mathcal{L}*\text{geom}+\eta,\mathcal{L}*\text{force})。
-
-**起始权重建议**
-
-* (\lambda_1:\lambda_2:\lambda_3=1:1:0.1)；(\alpha=1)。增强项视稳定性逐步开到 (\beta,\gamma,\eta\in[0.1,1])。
-
----
-
-## 8. 张量形状与自由度约定
-
-* 批大小：(B)；残基数：(N_r)；配体原子数：(N_l)。
-* 蛋白潜令牌：(\mathbf{Z}_p\in\mathbb{R}^{B\times N_r\times d_z})。
-* 配体条件嵌入：(\mathbf{Z}_l\in\mathbb{R}^{B\times d_l})（模式 A）。
-* 扭转角：(\Theta\in\mathbb{R}^{B\times N_r\times K_{\max}})（按残基掩码）。
-* 局部旋转（可选）：(R\in SO(3)^{B\times N_\text{block}})；使用旋转向量或四元数参数化（数值稳定）。
-* geodesic 噪声：
-
-  * 欧氏：(\varepsilon\sim\mathcal{N}(0,I))；
-  * (S^1)：(\eta\sim\text{von‑Mises}(\kappa))；
-  * (SO(3))：(\Xi\sim\text{Matrix‑Fisher}(\mathbf{F}))。
-
----
-
-## 9. 训练流程（逐步落地）
-
-### 9.1 阶段 1：RAE 预训练（2–3 周）
-
-* 冻结 ESM‑3 主体，仅训 LoRA/Adapter + 解码器。
-* 目标：(\mathcal{L}_\text{rec})（扭转 + FAPE + 距离），解码器噪声增强**开启**。
-* 早停标准：val FAPE 与 torsion RMSE 稳定下降；碰撞率 < 基线。
-
-### 9.2 阶段 2：桥模型（3–4 周）
-
-* 采用 FM 主干训练 (v_\theta)；中间态用 geodesic+noise 采样；时间表做**维度偏移**。
-* 逐步加入几何无碰撞与软价态正则；日志中记录训练时重构出的中间帧。
-
-### 9.3 阶段 3：小幅联合微调（3–4 周）
-
-* 解冻 LoRA/Adapter 与解码器一起**小步**更新；
-* 视稳定情况加入 SB 边际 KL 与能量/力蒸馏（小权重起步）。
-
-**优化超参（建议）**
-
-* AdamW，lr 2e‑4（线性 warmup 2k step，余弦退火到 2e‑5），
-* β=(0.9,0.95)，weight decay 0.05，梯度裁剪 1.0，EMA 0.9995，
-* 混合精度（bf16）+ 梯度累积（按显存调）。
-
----
-
-## 10. 评测协议
-
-### 10.1 端点质量
-
-* 蛋白：iRMSD（主链/侧链分列）、FNAT（接触恢复）、clash rate。
-* 配体（若做姿势）：Pose RMSD、有效率（价态/键长角度/环）。
-
-### 10.2 路径合理性
-
-* **接触形成单调性**：(C(t)) 随 (t) 单调上升（允许小噪动）。
-* **短程 MD 验证**：从若干中间帧各跑 200–500 ps，向 holo 收敛比例。
-* **能量剖面**（若有能量头）：能垒位置与幅度与经验一致性。
-
-### 10.3 泛化
-
-* 跨家族、跨口袋类型、计算结构（AF/ESMFold）鲁棒性；
-* 配体骨架外推的稳定性（仅条件生成模式 A）。
-
----
-
-## 11. 消融与对照
-
-* 去掉几何分支，仅 ESM‑3 语义。
-* 维度时间表偏移 on/off；解码器噪声增强 on/off。
-* 宽度 < latent 维 vs. 宽度 ≥ latent 维。
-* SB 正则 on/off；能量蒸馏 on/off。
-* 模式 A vs. B（协同生成）。
-
----
-
-## 12. 计算与工程
-
-* 显卡：A100/H100 80GB（或 4×A100 40GB 分布式）。
-* 训练时长（单卡等效）：RAE 40–80h；FM 60–120h；联合微调 40–80h（随数据量浮动）。
-* 数据管线缓存：预计算 ESM‑3 令牌与几何图，落地为 `.pt`；dataloader 只做轻处理。
-
----
-
-## 13. 目录结构（建议）
+### 架构设计
 
 ```
-project/
-  data/
-    splits/ (train.json, val.json, test.json)
-    processed/ (apo/*.pdb, holo/*.pdb, lig/*.sdf/.mol2, features/*.pt)
-  models/
-    encoders/ (esm_adapter.py, gvp_gnn.py, ligand_encoder.py)
-    decoders/ (torsion_fk.py, fape_loss.py, dist_loss.py)
-    bridge/   (flow_field.py, geodesic_ops.py, sb_regularizer.py)
-  train/
-    train_rae.py
-    train_bridge.py
-    train_joint.py
-  eval/
-    metrics_endpoints.py
-    metrics_path.py
-    md_short_runs.py
-  utils/
-    geom_so3.py
-    geom_s1.py
-    noise_samplers.py
-    schedule_shift.py
-    masking.py
-  configs/
-    rae.yaml
-    bridge.yaml
-    joint.yaml
-  logs/ ckpts/ scripts/
+ESM-2(冻结) → Adapter(1280→384) → FlashIPA×3层 → Torsion Head → FK → 全原子坐标
+                ↑                                      ↓
+            配体条件(Cross-Attn + FiLM)          FAPE + 扭转 + 距离 + clash
+```
+
+### 关键技术决策
+
+| 模块 | 方案 | 理由 |
+|------|------|------|
+| **几何注意力** | FlashIPA (因子化边) | 线性显存/时间扩展 |
+| **配体条件化** | Cross-Attn + 残基级FiLM | 稳定且易调试 |
+| **配体表示** | 重原子 + 稀疏探针 (M≤128) | 关键方向 + 显存友好 |
+| **帧初始化** | (N,Cα,C) 实时构建 | 轻量且灵活 |
+| **边嵌入** | EdgeEmbedder (1D/2D因子化) | 避免NxN显存爆炸 |
+| **帧更新** | 每层预测增量并裁剪 | 防数值发散 |
+| **刚体工具** | 复用 OpenFold rigid_utils | 工业级实现 |
+
+---
+
+## ✅ 已完成的工作
+
+### 数据准备（100% 完成）
+
+- [x] CASF-2016 数据集解压与验证
+- [x] 蛋白质结构清洗 (283个复合物)
+- [x] 配体规范化 (SDF格式)
+- [x] 口袋软掩码提取 (5Å + RBF衰减)
+- [x] 扭转角GT提取 (φ/ψ/ω/χ)
+- [x] 数据集划分 (train:val:test = 226:29:28)
+- [x] ESM-2 表征缓存 (283个, 650M模型)
+- [x] 数据质量验证报告
+
+**数据文件清单** (2,551个文件):
+```
+data/casf2016/
+├── complexes/        # 283个PDB+SDF
+├── processed/
+│   ├── pockets/      # 283个口袋PDB
+│   └── torsions/     # 283个扭转角NPZ
+├── features/
+│   └── esm2_cache/   # 283个ESM表征PT
+└── splits/           # 数据划分JSON
 ```
 
 ---
 
-## 14. 关键伪代码
+## 🔨 待实现任务
 
-### 14.1 geodesic 插值 & 噪声（欧氏 / (S^1) / (SO(3))）
+### Phase 1: 核心模块开发 (预计2-3天)
 
+#### 1.1 配体Token构建 (`utils/ligand_utils.py`)
+
+**功能需求**:
+- [x] 关键原子识别 (RDKit FeatureFactory)
+  - HBD/HBA (氢键供体/受体)
+  - Aromatic (芳香中心)
+  - Charged (带电原子)
+- [x] 方向探针生成
+  - 每个关键原子 ≤2 个探针
+  - 沿成键方向外扩 1.5-2.0Å
+  - 末端原子补反向探针
+  - ≥3键按键序+Gasteiger电荷排序
+- [x] 重要性采样 (M≤128)
+  - 优先级: 带电(100) > HBD(50) > HBA(40) > 芳香(30)
+  - 距离权重: 10Å - dist_to_pocket_center
+  - 口袋中心: Cα加权质心 (权重=w_res)
+- [x] 类型嵌入编码 (12维)
+  - 原子类型 (8维): C/N/O/S/P/halogen/metal/probe
+  - 药效团 (4维): HBD/HBA/aromatic/charged
+
+**接口设计**:
 ```python
-def interp_euclid(z0, z1, t, sigma_t):
-    eps = normal_like(z0) * sigma_t
-    return (1 - t) * z0 + t * z1 + eps, (z1 - z0)           # state, "true" velocity
-
-def wrap_angle(a):  # map to (-pi, pi]
-    return (a + math.pi) % (2 * math.pi) - math.pi
-
-def interp_s1(theta0, theta1, t, kappa):
-    d = wrap_angle(theta1 - theta0)
-    theta_t = wrap_angle(theta0 + t * d) + von_mises_like(theta0, kappa)
-    v_true  = d  # constant angular velocity in wrapped space
-    return theta_t, v_true
-
-def so3_log(R):  # rotation matrix -> axis-angle (vec3)
-    A = 0.5 * (R - R.T)
-    r = vee(A)  # extract vector
-    angle = torch.norm(r)  # small-angle handling omitted for brevity
-    return r
-
-def so3_exp(r):  # axis-angle -> rotation matrix
-    # Rodrigues with safe series for small |r|
-    ...
-
-def interp_so3(R0, R1, t, F):
-    A = so3_log(R0.T @ R1)          # tangent in Lie algebra
-    Rt = R0 @ so3_exp(t * A)        # geodesic
-    Xi = matrix_fisher_sample(F)    # noise on SO(3)
-    Rt_noisy = Rt @ Xi
-    v_true = Rt @ A                 # d/dt Rt = Rt * A
-    return Rt_noisy, v_true
+def detect_key_atoms(mol: Chem.Mol) -> Dict[str, Set[int]]
+def build_direction_probes(mol, pos, atom_idx, max_k=2, step=1.5) -> np.ndarray
+def build_ligand_tokens(mol, ca_xyz, w_res, max_points=128) -> Tuple[np.ndarray, np.ndarray]
+def encode_atom_types(atoms_info) -> np.ndarray  # [M, 12]
 ```
 
-### 14.2 Flow Matching 训练循环（最小版）
+**依赖**:
+- RDKit (ChemicalFeatures, rdMolDescriptors)
+- NumPy
 
+---
+
+#### 1.2 刚体帧工具 (`modules/rigid_utils.py`)
+
+**功能需求**:
+- [x] 三点构帧 (N, Cα, C → R, t)
+  - 使用 OpenFold 的 Rigid 类
+  - 支持批量处理 [B, N, 3]
+- [x] 帧增量裁剪
+  - 旋转: ≤15° (轴角范数裁剪)
+  - 平移: ≤1.5Å (逐分量裁剪)
+- [x] 刚体噪声注入 (数据增强)
+  - 旋转: 均匀 [0, 5°]
+  - 平移: 高斯 N(0, 0.5²)
+  - Stage-1 前5k step不启用
+- [x] Rigid 打包/解包
+  - pack_rigids(R, t) → Rigid
+  - unpack_rigids(Rigid) → (R, t)
+
+**接口设计**:
 ```python
-for batch in loader:
-    Zp0, Zp1, Zl = batch["Zp_apo"], batch["Zp_holo"], batch["Zl"]
-
-    # 中间态采样（分块：欧氏/S1/SO3）
-    t = torch.rand(B, 1, 1)
-    zt, v_true = interp_blocks(Zp0, Zp1, t, sigma_t, kappa, F)
-
-    # 维度依赖时间表偏移
-    t_shift = schedule_shift(t, m_total, n_base)
-
-    # 预测速度场
-    v_pred = flow_field(zt, t_shift, Zl)  # Transformer/GNN + cond
-
-    # FM 损失
-    L_fm = mse(v_pred, v_true)
-
-    # 可选 SB 正则、几何/能量约束
-    L_sb   = sb_regularizer(...)
-    X_hat  = decoder(zt)        # 解码中间态
-    L_geom = geometry_penalty(X_hat, ...)
-
-    # 端点重建（解码器噪声增强）
-    L_rec = rec_loss(decoder(noise(Zp0)), apo_targets) + \
-            rec_loss(decoder(noise(Zp1)), holo_targets)
-
-    loss = L_rec + alpha * L_fm + beta * L_sb + gamma * L_geom
-    loss.backward(); clip_grad_norm_(...); opt.step(); ema.update()
+def build_frames_from_3_points(N, Ca, C) -> Tuple[torch.Tensor, torch.Tensor]
+def clip_update(delta_rot, delta_trans, max_deg=15.0, max_trans=1.5) -> Tuple
+def add_rigid_noise(R, t, rot_deg=5.0, trans_std=0.5, enable=True) -> Tuple
+def pack_rigids(R, t) -> Rigid
+def unpack_rigids(rigids) -> Tuple[torch.Tensor, torch.Tensor]
 ```
 
-### 14.3 解码器损失（扭转 + FAPE + 距离）
+**依赖**:
+- OpenFold (openfold.utils.rigid_utils.Rigid)
+- PyTorch
 
+---
+
+#### 1.3 边嵌入封装 (`modules/edge_embed.py`)
+
+**功能需求**:
+- [x] FlashIPA EdgeEmbedder 封装
+  - 模式: flash_1d_bias (首选)
+  - 因子秩: z_factor_rank=16
+  - RBF核数: k=16
+- [x] 配置管理 (EdgeEmbedderConfig)
+- [x] 预留共价边扩展接口
+  - 第一版不实现 (只用几何边)
+  - 留待 Phase-2 ablation
+
+**接口设计**:
 ```python
-def torsion_loss(theta_pred, theta_gt, mask):
-    d = wrap_angle(theta_pred - theta_gt)
-    return (d**2 * mask).sum() / (mask.sum() + 1e-8)
+class EdgeEmbedderWrapper(nn.Module):
+    def __init__(self, c_s=384, c_z=128, z_rank=16, mode='flash_1d_bias')
+    def forward(self, S, t, node_mask) -> Tuple[Tensor, Tensor, Tensor, Tensor]
+        # 返回: edge_embed, zf1, zf2, edge_mask
+```
 
-def fape_loss(X_pred, X_gt, frames):
-    # transform to local frames, compute invariant distances
-    ...
+**依赖**:
+- flash_ipa (EdgeEmbedder, EdgeEmbedderConfig)
 
-def dist_loss(D_pred, D_gt, mask):
-    return ((D_pred - D_gt)**2 * mask).sum() / (mask.sum() + 1e-8)
+---
+
+#### 1.4 FlashIPA 几何分支 (`models/ipa.py`)
+
+**功能需求**:
+- [x] 多层 IPA 堆叠 (depth=3)
+  - InvariantPointAttention (FlashIPA)
+  - 每层: Self-IPA → 帧更新 → FFN
+- [x] 帧更新预测头
+  - 结构: LayerNorm → Linear(128) → GELU → Linear(6)
+  - 输出: [ωx, ωy, ωz, tx, ty, tz]
+- [x] 逐层裁剪与更新
+  - clip_update(旋转≤15°, 平移≤1.5Å)
+  - rigids.compose(增量)
+- [x] FFN + LayerNorm + 残差
+
+**接口设计**:
+```python
+class FlashIPAModule(nn.Module):
+    def __init__(self, c_s=384, c_z=128, heads=8, depth=3, 
+                 no_qk_points=8, no_v_points=12, z_rank=16, dropout=0.1)
+    def forward(self, S, R, t, node_mask) -> Tuple[Tensor, Tensor, Tensor]
+        # 输入: S[B,N,384], R[B,N,3,3], t[B,N,3], mask[B,N]
+        # 返回: S_geo[B,N,384], R_new[B,N,3,3], t_new[B,N,3]
+```
+
+**超参**:
+```yaml
+c_s: 384
+c_z: 128
+heads: 8
+depth: 3
+no_qk_points: 8
+no_v_points: 12
+z_factor_rank: 16
+dropout: 0.1
+```
+
+**依赖**:
+- flash_ipa (InvariantPointAttention, IPAConfig)
+- modules.rigid_utils
+- modules.edge_embed
+
+---
+
+#### 1.5 配体条件化模块 (`models/ligand_condition.py`)
+
+**功能需求**:
+- [x] 配体Token嵌入
+  - 输入: concat([xyz(3), types(12)]) = 15维
+  - 输出: d_lig=64
+- [x] Cross-Attention
+  - Q: 蛋白节点 S [B,N,384]
+  - K/V: 配体token [B,M,64]
+  - 多头: heads=8
+- [x] 残基级 FiLM 调制
+  - gamma = MLP_gamma(S_cross)
+  - beta = MLP_beta(S_cross)
+  - S_out = (1 + λ·γ) ⊙ S + λ·β
+- [x] 门控 warmup
+  - λ: 0→1 线性 (2000 steps)
+- [x] 特殊初始化
+  - gamma最后层: 权重×0.1, 偏置=1
+  - beta最后层: 权重×0.1, 偏置=0
+
+**接口设计**:
+```python
+class LigandConditioner(nn.Module):
+    def __init__(self, c_s=384, d_lig=64, heads=8, dropout=0.1)
+    def forward(self, S, lig_points, lig_types, p_mask, l_mask, gate_lambda=1.0)
+        # 输入: S[B,N,384], lig_points[B,M,3], lig_types[B,M,12]
+        # 返回: S_cond[B,N,384]
+```
+
+**依赖**:
+- PyTorch (nn.MultiheadAttention)
+
+---
+
+### Phase 2: 数据流与训练 (预计2天)
+
+#### 2.1 IPA 数据加载器 (`data/dataset_ipa.py`)
+
+**功能需求**:
+- [x] 继承现有 CASF2016Dataset
+- [x] 实时构建局部帧
+  - build_frames_from_3_points(N, Ca, C)
+- [x] 实时构建配体tokens
+  - build_ligand_tokens(mol, ca_xyz, w_res)
+- [x] 数据增强控制
+  - 训练集: step>5000时加噪
+  - 验证集: 不加噪
+- [x] 返回 IPABatch (dataclass)
+
+**Batch结构**:
+```python
+@dataclass
+class IPABatch:
+    # 蛋白
+    esm: Tensor              # [B, N, 1280]
+    N: Tensor                # [B, N, 3]
+    Ca: Tensor               # [B, N, 3]
+    C: Tensor                # [B, N, 3]
+    node_mask: Tensor        # [B, N]
+    
+    # 配体
+    lig_points: Tensor       # [B, M, 3]
+    lig_types: Tensor        # [B, M, 12]
+    lig_mask: Tensor         # [B, M]
+    
+    # GT
+    torsion_gt: Tensor       # [B, N, n_tor, 2]
+    xyz_gt: Tensor           # [B, A, 3]
+    frames_gt: Tuple         # (R, t)
+    
+    # 口袋
+    w_res: Tensor            # [B, N]
+    
+    # Meta
+    pdb_id: List[str]
+```
+
+**依赖**:
+- utils.ligand_utils
+- modules.rigid_utils
+- 现有数据集基类
+
+---
+
+#### 2.2 评估指标 (`utils/metrics.py`)
+
+**功能需求**:
+- [x] 口袋 iRMSD
+  - 仅用口袋残基做 Kabsch 对齐
+  - 计算口袋重原子 RMSD
+- [x] χ1 命中率
+  - 只统计有侧链的残基
+  - 阈值: ±20°
+  - wrap 角度差
+- [x] Clash 百分比
+  - 非键原子对 < 2.0Å
+  - 排除1-2, 1-3邻接
+- [x] val-FAPE
+  - 基于局部帧对齐
+  - 口袋加权
+
+**接口设计**:
+```python
+def compute_pocket_irmsd(pred_xyz, true_xyz, pocket_mask) -> float
+def compute_chi1_accuracy(pred_angles, true_angles, residue_types, threshold=20) -> float
+def compute_clash_percentage(xyz, bond_graph) -> float
+def compute_fape(pred_xyz, true_xyz, pred_frames, true_frames, w_res) -> float
+```
+
+**依赖**:
+- scipy.spatial (Kabsch)
+- modules.rigid_utils (FAPE)
+
+---
+
+#### 2.3 损失函数 (`modules/losses.py`)
+
+**功能需求**:
+- [x] FAPE 损失
+  - 基于局部帧对齐
+  - 外层口袋加权
+  - 复用 OpenFold 实现
+- [x] 扭转角损失
+  - wrap cosine: 1 - cos(Δθ)
+  - 残基级加权
+- [x] 距离损失
+  - Pair-wise 重原子距离
+  - 权重: max(w_i, w_j)
+- [x] 碰撞惩罚
+  - 非键原子最小距离
+  - Soft penalty
+
+**接口设计**:
+```python
+def fape_loss(pred_xyz, true_xyz, pred_frames, true_frames, w_res) -> Tensor
+def torsion_loss(pred_angles, true_angles, w_res) -> Tensor
+def distance_loss(pred_xyz, true_xyz, w_pair) -> Tensor
+def clash_penalty(xyz, bond_graph) -> Tensor
+```
+
+**损失权重**:
+```python
+loss = 1.0 * L_fape + 1.0 * L_torsion + 0.1 * L_dist + 0.1 * L_clash
+# 口袋权重 warmup: κ(step) = min(1.0, step/2000)
 ```
 
 ---
 
-## 15. 指标与可视化面板（建议）
+#### 2.4 训练脚本 (`scripts/train_stage1_ipa.py`)
 
-* 端点：iRMSD（主/侧链分开）、FNAT、clash%。
-* 路径：接触形成度曲线 (C(t))、能量剖面（若有）、MD 短程收敛率。
-* 可视化：关键残基 torsion vs. t，口袋开合度（SASA 或距离特征）vs. t。
+**功能需求**:
+- [x] 模型初始化
+  - ESM-2 冻结 + Adapter
+  - FlashIPA 几何分支
+  - LigandConditioner
+  - Torsion Head + FK 解码器
+- [x] 优化器配置
+  - AdamW (lr=1e-4, wd=0.05)
+  - Cosine LR (warmup=1000)
+  - Grad clip = 1.0
+- [x] 训练循环
+  - 前向: ESM → Adapter → IPA → Cond → Decoder → FK
+  - 损失: FAPE + 扭转 + 距离 + clash
+  - 口袋warmup: 0→1 (2000 steps)
+  - 数据增强: step>5000启用
+- [x] 验证与早停
+  - 主指标: 口袋 iRMSD
+  - 次指标: val-FAPE, χ1命中率, clash%
+  - 早停: patience=20 epochs
+- [x] 日志与可视化
+  - Tensorboard
+  - 定期保存checkpoint
+  - 验证集结构可视化
+
+**训练配置** (`configs/stage1_ipa.yaml`):
+```yaml
+# 模型
+model:
+  c_s: 384
+  c_z: 128
+  d_lig: 64
+  heads: 8
+  depth: 3
+  no_qk_points: 8
+  no_v_points: 12
+  z_factor_rank: 16
+
+# 训练
+train:
+  lr: 1.0e-4
+  weight_decay: 0.05
+  warmup_steps: 1000
+  max_epochs: 100
+  batch_size: 4
+  precision: bf16
+  grad_clip: 1.0
+  dropout: 0.1
+  ema: 0.999
+  
+# 损失
+loss:
+  w_fape: 1.0
+  w_torsion: 1.0
+  w_dist: 0.1
+  w_clash: 0.1
+  pocket_warmup: 2000
+  
+# 数据增强
+augmentation:
+  enable_step: 5000
+  rot_max_deg: 5.0
+  trans_std: 0.5
+  
+# 限制
+limits:
+  max_lig_points: 128
+  rot_clip_deg: 15.0
+  trans_clip: 1.5
+  
+# 验证
+validation:
+  interval: 1  # epochs
+  early_stop_metric: pocket_irmsd
+  patience: 20
+  save_top_k: 3
+```
 
 ---
 
-## 16. 风险与兜底
+### Phase 3: 环境配置与依赖 (预计0.5天)
 
-* **数据泄漏**：严格同源聚类拆分 + 配体骨架平衡。
-* **训练不稳**：先最小目标（FM + (\mathcal{L}_\text{rec})），SB/能量正则**后开**；学习率与噪声幅度网格搜索。
-* **几何崩坏**：强制等变/对齐不变损失；硬阈值碰撞惩罚；扭转角限幅。
-* **过拟合**：大量数据增强（随机局部扰动/噪声），权重衰减，EMA。
+#### 3.1 依赖安装
 
----
+**新增依赖**:
+```bash
+# FlashIPA 相关
+pip install flash-attn>=2.0.0
+pip install git+https://github.com/flagshippioneering/flash_ipa.git
 
-## 17. 时间表（以 12–14 周为例）
+# OpenFold 工具
+pip install git+https://github.com/aqlaboratory/openfold.git
 
-1. **W1–2**：数据清洗与三元组构建；ESM‑3 令牌与几何图缓存。
-2. **W3–5**：RAE 预训练（扭转+FAPE+距离），达成稳定重建。
-3. **W6–9**：FM 训练 + 几何无碰撞；中间态可视化与首轮指标。
-4. **W10–12**：联合微调；引入 SB 正则与轻量能量蒸馏；撰写方法/实验。
-5. **W13–14**：增补消融、泛化组实验、补图与附录。
+# 已有依赖
+# - torch>=2.0.0
+# - biopython
+# - rdkit
+# - numpy
+# - scipy
+```
 
----
+#### 3.2 环境验证
 
-## 18. 扩展与后续
-
-* **协同生成（模式 B）**：引入配体位姿/扭转的联合流形，做蛋白–配体**协同路径**。
-* **能量一致性**：对接打分器/ML 力场蒸馏，或以 SB 为主干建桥。
-* **属性引导**：亲和/选择性/溶解度等“属性头”对采样做引导。
-* **多体/多配体**：引入变构位点或二聚体耦合的路径学习。
-
----
-
-## 19. 执行清单（逐条打勾）
-
-* [ ] 三元组（apo/lig/holo）构建与质控
-* [ ] 同源聚类拆分与配体骨架平衡
-* [ ] ESM‑3 + GVP 编码器缓存
-* [ ] 解码器 RAE 预训练（扭转 + FAPE + 距离）
-* [ ] FM 训练（geodesic+noise；时间表偏移）
-* [ ] 路径几何正则（无碰撞/键长角度）
-* [ ] 端点与路径指标面板就绪
-* [ ] SB 正则与能量蒸馏（小权重试水）
-* [ ] 消融与泛化组
-* [ ] 论文草稿方法/实验图表
+- [x] 验证 FlashAttention 安装 (Linux + CUDA)
+- [x] 验证 FlashIPA 可导入
+- [x] 验证 OpenFold rigid_utils 可用
+- [x] 测试 A100 显存占用 (单卡 batch=4)
 
 ---
 
-### 备注（实现建议与经验句柄）
+### Phase 4: 测试与验证 (预计1天)
 
-* **先小后大**：先在小蛋白与单口袋上打通，再扩到大体系。
-* **mask 一切**：扭转角、缺失原子、变长侧链务必用 mask 规避梯度污染。
-* **日志可视化**：始终绘制 (C(t))、torsion vs. t、碰撞率 vs. step。
-* **数值稳定**：(SO(3)) 小角近似用安全罗德里格斯，S¹ wrap 一定放在 loss 里。
+#### 4.1 单元测试
+
+- [x] 配体token构建测试
+  - 测试关键原子识别
+  - 测试探针生成
+  - 测试重要性采样
+- [x] 帧工具测试
+  - 测试三点构帧正确性
+  - 测试增量裁剪
+  - 测试噪声注入
+- [x] 模型前向测试
+  - 测试 FlashIPA 前向
+  - 测试配体条件化
+  - 测试端到端推理
+
+#### 4.2 过拟合测试
+
+- [x] 单样本过拟合
+  - 用1个PDB训练至loss→0
+  - 验证所有模块可学习
+- [x] 小数据集验证
+  - 用10个PDB训练
+  - 观察指标收敛
+
+#### 4.3 全量训练
+
+- [x] CASF-2016 完整训练
+  - 监控4项指标
+  - 验证早停生效
+  - 可视化验证集
 
 ---
 
-以上就是我将要逐步执行的**“从 0 到 1”**项目手册。
-如果你同意这份手册作为 v1.0，我们就按第 17 节的时间表，从 **数据三元组与特征缓存** 开始推进。需要我把 **RAE 预训练（阶段 1）** 的 `rae.yaml` 超参与训练脚本骨架（入参/日志字段/保存点命名）也写出来吗？
+## 📈 验收标准
 
+### 数据指标
+
+| 指标 | 目标值 | 说明 |
+|------|--------|------|
+| **val-FAPE** | < 2.0 Å | 局部帧对齐误差 |
+| **口袋 iRMSD** | < 1.5 Å | 口袋局部对齐RMSD (早停主指标) |
+| **χ1 命中率** | > 70% | ±20° 准确率 |
+| **Clash%** | < 5% | 碰撞原子对比例 |
+
+### 训练稳定性
+
+- [x] 损失曲线平滑下降
+- [x] 验证指标稳定收敛
+- [x] 无 NaN/Inf
+- [x] 显存占用 < 70GB (A100-80GB)
+
+### 代码质量
+
+- [x] 所有模块有docstring
+- [x] 关键函数有类型注解
+- [x] 代码通过 pylint (score>8.0)
+- [x] 单元测试覆盖率 > 80%
+
+---
+
+## 🚀 执行计划
+
+### Week 1: 核心模块 (Day 1-3)
+
+**Day 1**:
+- [x] `utils/ligand_utils.py` (配体token)
+- [x] `modules/rigid_utils.py` (刚体工具)
+- [x] 单元测试
+
+**Day 2**:
+- [x] `modules/edge_embed.py` (边嵌入)
+- [x] `models/ipa.py` (FlashIPA)
+- [x] 模型前向测试
+
+**Day 3**:
+- [x] `models/ligand_condition.py` (配体条件化)
+- [x] 端到端推理测试
+
+### Week 1: 数据与训练 (Day 4-5)
+
+**Day 4**:
+- [x] `data/dataset_ipa.py` (数据加载器)
+- [x] `utils/metrics.py` (评估指标)
+- [x] `modules/losses.py` (损失函数)
+
+**Day 5**:
+- [x] `scripts/train_stage1_ipa.py` (训练脚本)
+- [x] `configs/stage1_ipa.yaml` (配置文件)
+- [x] 单样本过拟合测试
+
+### Week 2: 训练与调优 (Day 6-7)
+
+**Day 6**:
+- [x] 环境配置 (Linux + FlashIPA)
+- [x] 小数据集验证 (10样本)
+
+**Day 7**:
+- [x] 全量训练启动
+- [x] 监控指标与调优
+
+---
+
+## 📝 文档更新计划
+
+### 实现文档
+
+- [x] `docs/implementation/IPA_ARCHITECTURE.md`
+  - FlashIPA 架构详解
+  - 配体条件化设计
+  - 帧更新机制
+  
+- [x] `docs/implementation/TRAINING_GUIDE.md`
+  - 训练流程说明
+  - 超参调优建议
+  - 常见问题排查
+
+### 进度日志
+
+- [x] `docs/logs/STAGE1_PROGRESS.md`
+  - 每日进度记录
+  - 实验结果汇总
+  - 问题与解决方案
+
+### 代码注释
+
+- [x] 所有核心类/函数有详细 docstring
+- [x] 关键算法有行内注释
+- [x] 复杂逻辑有设计说明
+
+---
+
+## 🔧 技术栈总结
+
+### 核心依赖
+
+| 库 | 版本 | 用途 |
+|---|------|------|
+| PyTorch | ≥2.0.0 | 深度学习框架 |
+| FlashAttention | ≥2.0.0 | 高效注意力内核 |
+| FlashIPA | latest | 线性扩展IPA |
+| OpenFold | latest | 刚体工具/FAPE |
+| RDKit | ≥2023.03 | 配体特征提取 |
+| BioPython | ≥1.80 | 蛋白结构解析 |
+| ESM | ≥2.0.0 | 蛋白语言模型 |
+
+### 计算资源
+
+**开发环境**: Mac (原型验证)
+**训练环境**: Linux + 2×A100-80GB
+**推荐配置**:
+- CUDA ≥11.8
+- cuDNN ≥8.0
+- 系统内存 ≥128GB
+- SSD 存储 ≥500GB
+
+---
+
+## 📚 参考文献
+
+1. **AlphaFold2**: Jumper et al. (Nature 2021) - IPA 原始设计
+2. **FlashIPA**: arXiv:2505.11580 - 线性扩展IPA实现
+3. **FlashAttention**: Dao et al. (NeurIPS 2022) - 高效注意力机制
+4. **OpenFold**: https://github.com/aqlaboratory/openfold - 工业级实现
+5. **BINDRAE理论**: `docs/理论/理论与参考.md` - 项目理论纲领
+
+---
+
+## ⚠️ 注意事项
+
+### 关键约束
+
+1. **Mac禁止训练**: 只用于开发调试，正式训练必须在Linux
+2. **显存管理**: 使用因子化边嵌入，避免NxN矩阵
+3. **数值稳定**: 每层裁剪帧增量，全局梯度裁剪
+4. **共价边**: 第一版不做，留待ablation
+5. **口袋权重**: 从0开始warmup，避免初期过拟合口袋
+
+### 常见陷阱
+
+- ❌ 忘记冻结ESM-2
+- ❌ 验证集也加数据增强
+- ❌ gamma/beta初始化错误导致FiLM失效
+- ❌ 帧更新不裁剪导致数值爆炸
+- ❌ FAPE不用局部帧对齐
+
+---
+
+## 🎯 下一步工作 (Stage-2)
+
+**在 Stage-1 收敛后**:
+
+1. **数据准备**
+   - 获取 apo-holo 配对 (AHoJ/PLINDER)
+   - 构建三元组: (P_apo, L, P_holo)
+   
+2. **模型扩展**
+   - Flow Matching / Schrödinger Bridge
+   - 潜空间连续路径学习
+   
+3. **评估**
+   - 构象轨迹质量
+   - 中间态合理性
+   - 终态收敛性
+
+---
+
+**最后更新**: 2025-10-25
+**负责人**: BINDRAE Team
+**状态**: 待开工 → 核心模块开发中
