@@ -62,10 +62,10 @@ class ESM2Cache:
             'description': 'Mac 系统 - 使用轻量模型'
         },
         'Linux': {  # 服务器
-            'name': 'esm2_t33_650M_UR50D',  # 标准模型
-            'fallback': 'esm2_t30_150M_UR50D',  # 备选（显存不足时）
+            'name': 'esm2_t33_650M_UR50D',  # 标准模型 (650M)
+            'fallback': 'esm2_t33_650M_UR50D',  # 备选也用 650M
             'batch_size': 4,
-            'description': 'Linux 系统 - 使用标准模型'
+            'description': 'Linux 系统 - 使用 650M 标准模型'
         }
     }
     
