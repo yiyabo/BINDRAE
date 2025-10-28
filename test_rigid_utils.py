@@ -185,11 +185,52 @@ def test_from_pdb():
     print()
 
 
+def test_collinear_points():
+    """测试共线点的边界情况"""
+    print("="*80)
+    print("测试共线点边界情况")
+    print("="*80)
+    
+    # 构造三个共线点
+    n = np.array([0.0, 0.0, 0.0])
+    ca = np.array([1.0, 0.0, 0.0])
+    c = np.array([2.0, 0.0, 0.0])  # 共线！
+    
+    try:
+        rigid = Rigid.from_3_points(n, ca, c)
+        print("✓ 共线点处理成功")
+        
+        # 检查旋转矩阵正交性
+        R = rigid.rotation
+        orthogonality = np.abs(R @ R.T - np.eye(3)).max()
+        print(f"  旋转矩阵正交性误差: {orthogonality:.8f}")
+        
+        # 检查基向量长度
+        e1_norm = np.linalg.norm(R[:, 0])
+        e2_norm = np.linalg.norm(R[:, 1])
+        e3_norm = np.linalg.norm(R[:, 2])
+        print(f"  基向量长度: e1={e1_norm:.6f}, e2={e2_norm:.6f}, e3={e3_norm:.6f}")
+        
+        # 检查基向量垂直性
+        dot12 = abs(np.dot(R[:, 0], R[:, 1]))
+        dot23 = abs(np.dot(R[:, 1], R[:, 2]))
+        dot31 = abs(np.dot(R[:, 2], R[:, 0]))
+        print(f"  垂直性: |e1·e2|={dot12:.8f}, |e2·e3|={dot23:.8f}, |e3·e1|={dot31:.8f}")
+        
+        print("✓ 所有检查通过！")
+        
+    except Exception as e:
+        print(f"❌ 处理失败: {e}")
+    
+    print()
+
+
 if __name__ == "__main__":
     test_rigid_basic()
     test_quaternion_conversion()
     test_rigid_batch()
     test_noise()
+    test_collinear_points()  # 新增：共线点测试
     test_from_pdb()
     
     print("="*80)

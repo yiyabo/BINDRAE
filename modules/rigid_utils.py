@@ -101,7 +101,18 @@ class Rigid:
         
         # Y 轴：垂直于 v1 和 v2
         e2 = v2 - np.dot(v2, e1) * e1  # Gram-Schmidt 正交化
-        e2 = e2 / (np.linalg.norm(e2) + EPS)
+        e2_norm = np.linalg.norm(e2)
+        
+        # 处理三点共线的边界情况
+        if e2_norm < 1e-6:
+            # 三点接近共线，使用备用方案：找一个与e1垂直的向量
+            if abs(e1[2]) < 0.9:
+                e2 = np.cross(e1, np.array([0, 0, 1]))
+            else:
+                e2 = np.cross(e1, np.array([1, 0, 0]))
+            e2 = e2 / (np.linalg.norm(e2) + EPS)
+        else:
+            e2 = e2 / e2_norm
         
         # Z 轴：X × Y
         e3 = np.cross(e1, e2)
