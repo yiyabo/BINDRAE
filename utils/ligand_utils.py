@@ -440,10 +440,22 @@ def build_ligand_tokens_from_file(ligand_coords_file: Path,
     mol = None
     if ligand_sdf_file is not None and ligand_sdf_file.exists() and RDKIT_AVAILABLE:
         try:
-            supplier = Chem.SDMolSupplier(str(ligand_sdf_file), removeHs=True)
+            # 先尝试保留氢原子，如果失败再去除
+            supplier = Chem.SDMolSupplier(str(ligand_sdf_file), removeHs=False, sanitize=False)
             mol = supplier[0]
-        except Exception:
-            pass
+            if mol is not None:
+                # 去除氢原子
+                mol = Chem.RemoveHs(mol, sanitize=False)
+                # 尝试标准化
+                try:
+                    Chem.SanitizeMol(mol)
+                except:
+                    pass  # 忽略标准化失败
+        except Exception as e:
+            # 记录错误但不中断
+            import warnings
+            warnings.warn(f"Failed to load molecule from {ligand_sdf_file}: {e}")
+            mol = None
     
     # 构建 tokens
     builder = LigandTokenBuilder(max_tokens=max_tokens)
