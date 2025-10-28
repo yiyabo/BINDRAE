@@ -21,9 +21,9 @@ import warnings
 warnings.filterwarnings('ignore')
 
 try:
-    from rdkit import Chem
-    from rdkit.Chem import AllChem, Descriptors
-    from rdkit.Chem.Features import BuildFeatureFactory
+    from rdkit import Chem, RDConfig
+    from rdkit.Chem import AllChem, Descriptors, ChemicalFeatures
+    import os
     RDKIT_AVAILABLE = True
 except ImportError:
     RDKIT_AVAILABLE = False
@@ -74,8 +74,8 @@ class LigandTokenBuilder:
         
         # RDKit Feature Factory (用于检测HBD/HBA)
         if RDKIT_AVAILABLE:
-            fdefName = 'BaseFeatures.fdef'
-            self.feature_factory = BuildFeatureFactory(fdefName)
+            fdefName = os.path.join(RDConfig.RDDataDir, 'BaseFeatures.fdef')
+            self.feature_factory = ChemicalFeatures.BuildFeatureFactory(fdefName)
         else:
             self.feature_factory = None
     

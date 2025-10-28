@@ -7,8 +7,7 @@ from pathlib import Path
 
 try:
     from rdkit import Chem
-    from rdkit.Chem import AllChem
-    from rdkit.Chem.Features import BuildFeatureFactory
+    from rdkit.Chem import AllChem, ChemicalFeatures
     RDKIT_AVAILABLE = True
 except ImportError as e:
     print(f"❌ RDKit 导入失败: {e}")
@@ -74,8 +73,10 @@ def debug_ligand():
     # 5. 检测 HBD/HBA
     print("[5] 检测 HBD/HBA...")
     try:
-        fdefName = 'BaseFeatures.fdef'
-        factory = BuildFeatureFactory(fdefName)
+        from rdkit import RDConfig
+        import os
+        fdefName = os.path.join(RDConfig.RDDataDir, 'BaseFeatures.fdef')
+        factory = ChemicalFeatures.BuildFeatureFactory(fdefName)
         features = factory.GetFeaturesForMol(mol)
         
         hbd = []
