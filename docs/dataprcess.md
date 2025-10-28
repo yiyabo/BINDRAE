@@ -286,3 +286,230 @@ splits/
 4. **可重现性**：固定随机种子和详细日志
 
 通过这个完整的7步数据处理流程，我们将原始的、质量参差不齐的CASF-2016数据集转换为高质量的、标准化的、可直接用于深度学习训练的完整数据集，为蛋白-配体结合亲和力预测模型提供了可靠的数据基础。以后其他的数据库也可以参考此处理流程，我们可以考虑构造一套基于Agent的智能数据处理系统。
+
+---
+
+## 最终数据形式与模型使用
+
+### 完整数据结构
+
+处理完成后，数据集具有以下结构：
+
+```
+data/casf2016/
+├── complexes/                    # 原始复合物结构
+│   ├── 1abc/
+│   │   ├── protein.pdb
+│   │   └── ligand.sdf
+│   └── ...
+├── meta/                        # 元数据
+│   ├── INDEX_core.txt           # 有效样本索引
+│   └── filtered.csv            # 过滤记录
+├── processed/
+│   ├── features/               # 特征文件
+│   │   ├── 1abc_esm.pt        # ESM-2特征
+│   │   ├── 1abc_ligand_coords.npy    # 配体坐标
+│   │   ├── 1abc_ligand_props.npy     # 配体属性
+│   │   └── 1abc_torsions.npz         # 扭转角
+│   ├── pockets/                # 口袋数据
+│   │   ├── 1abc_w_res.npy            # 残基权重
+│   │   ├── 1abc_pocket_mask.npy      # 口袋掩码
+│   │   └── 1abc_residue_info.npy     # 残基信息
+│   └── splits/                 # 数据划分
+│       ├── train.json           # 训练集
+│       ├── val.json             # 验证集
+│       └── test.json            # 测试集
+```
+
+### 单个样本的数据组成
+
+每个PDB ID（如1abc）包含以下数据：
+
+#### 1. ESM-2蛋白质特征 (`1abc_esm.pt`)
+```python
+{
+    'per_residue': torch.Tensor,  # (N_res, 512/1280) - 每残基表征
+    'sequence': torch.Tensor,     # (512/1280,) - 全序列表征
+    'sequence_str': str,         # 氨基酸序列
+    'n_residues': int           # 残基数量
+}
+```
+
+#### 2. 配体数据
+- **坐标** (`1abc_ligand_coords.npy`): (N_atoms, 3) - 重原子3D坐标
+- **属性** (`1abc_ligand_props.npy`): 分子量、氢键供体/受体等描述符
+
+#### 3. 口袋数据
+- **权重** (`1abc_w_res.npy`): (N_res,) - 残基重要性权重 [0,1]
+- **掩码** (`1abc_pocket_mask.npy`): (N_res,) - 口袋区域标识
+- **残基信息** (`1abc_residue_info.npy`): 残基详细信息
+
+#### 4. 扭转角 (`1abc_torsions.npz`)
+```python
+{
+    'phi': np.array,           # (N_res,) - 主链φ角
+    'psi': np.array,           # (N_res,) - 主链ψ角
+    'omega': np.array,         # (N_res,) - 主链ω角
+    'chi': np.array,          # (N_res, 4) - 侧链χ角
+    'bb_mask': np.array,       # (N_res,) - 主链角度有效性
+    'chi_mask': np.array,      # (N_res, 4) - 侧链角度有效性
+}
+```
+
+#### 5. 标签数据
+从`meta/INDEX_core.txt`获取：
+- **logKa**: 结合亲和力对数值（预测目标）
+- **resolution**: 结构分辨率
+- **year**: 发表年份
+- **target**: 靶标类型
+
+---
+
+## ESM+几何双分支模型的数据使用
+
+### 模型架构设计
+
+```
+输入数据 → ESM分支 → 蛋白质序列特征
+        ↓
+        几何分支 → 配体+口袋几何特征
+        ↓
+        特征融合 → 结合亲和力预测
+```
+
+### ESM分支数据使用
+
+#### 输入数据
+```python
+# 加载ESM-2特征
+esm_data = torch.load('features/1abc_esm.pt')
+
+# 序列特征 (全局表征)
+sequence_features = esm_data['sequence']  # (512,)
+
+# 残基特征 (局部表征)
+residue_features = esm_data['per_residue']  # (N_res, 512)
+
+# 口袋权重加权
+pocket_weights = np.load('pockets/1abc_w_res.npy')  # (N_res,)
+weighted_residue_features = residue_features * pocket_weights.unsqueeze(-1)
+
+# 池化得到固定维度
+pooled_features = torch.sum(weighted_residue_features, dim=0)  # (512,)
+```
+
+#### 处理逻辑
+1. **全局特征**: 直接使用sequence表征
+2. **局部特征**: 使用口袋权重加权残基表征
+3. **特征融合**: 拼接全局和局部特征
+4. **维度统一**: 确保所有样本特征维度一致
+
+### 几何分支数据使用
+
+#### 输入数据
+```python
+# 配体坐标
+ligand_coords = np.load('features/1abc_ligand_coords.npy')  # (N_atoms, 3)
+
+# 扭转角
+torsions = np.load('features/1abc_torsions.npz')
+phi = torsions['phi']  # (N_res,)
+psi = torsions['psi']  # (N_res,)
+chi = torsions['chi']  # (N_res, 4)
+
+# 口袋掩码
+pocket_mask = np.load('pockets/1abc_pocket_mask.npy')  # (N_res,)
+
+# 配体属性
+ligand_props = np.load('features/1abc_ligand_props.npy').item()
+```
+
+#### 处理逻辑
+1. **配体几何**: 使用3D坐标计算距离、角度等几何特征
+2. **蛋白质几何**: 使用扭转角描述局部构象
+3. **口袋特征**: 基于掩码提取结合区域几何信息
+4. **分子描述符**: 使用配体化学描述符
+
+### 数据加载器实现
+
+```python
+class BINDRAEDataset(torch.utils.data.Dataset):
+    def __init__(self, pdb_ids, data_dir):
+        self.pdb_ids = pdb_ids
+        self.data_dir = Path(data_dir)
+        
+    def __len__(self):
+        return len(self.pdb_ids)
+    
+    def __getitem__(self, idx):
+        pdb_id = self.pdb_ids[idx]
+        
+        # 加载ESM特征
+        esm_data = torch.load(self.data_dir / 'features' / f'{pdb_id}_esm.pt')
+        
+        # 加载几何数据
+        ligand_coords = np.load(self.data_dir / 'features' / f'{pdb_id}_ligand_coords.npy')
+        torsions = np.load(self.data_dir / 'features' / f'{pdb_id}_torsions.npz')
+        pocket_weights = np.load(self.data_dir / 'pockets' / f'{pdb_id}_w_res.npy')
+        
+        # 加载标签
+        metadata = self.load_metadata(pdb_id)
+        
+        return {
+            'pdb_id': pdb_id,
+            'esm_sequence': esm_data['sequence'],
+            'esm_residues': esm_data['per_residue'],
+            'pocket_weights': torch.tensor(pocket_weights),
+            'ligand_coords': torch.tensor(ligand_coords),
+            'torsions': {k: torch.tensor(v) for k, v in torsions.items()},
+            'target': torch.tensor(metadata['logKa'], dtype=torch.float32)
+        }
+```
+
+### 模型训练流程
+
+```python
+# 数据准备
+train_ids = json.load(open('processed/splits/train.json'))['pdb_ids']
+val_ids = json.load(open('processed/splits/val.json'))['pdb_ids']
+
+train_dataset = BINDRAEDataset(train_ids, 'data/casf2016')
+val_dataset = BINDRAEDataset(val_ids, 'data/casf2016')
+
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+
+# 模型训练
+for batch in train_loader:
+    # ESM分支
+    esm_seq_features = model.esm_branch(batch['esm_sequence'])
+    esm_res_features = model.esm_branch(batch['esm_residues'])
+    esm_weighted = esm_res_features * batch['pocket_weights'].unsqueeze(-1)
+    esm_pooled = torch.sum(esm_weighted, dim=1)
+    
+    # 几何分支
+    geo_features = model.geometry_branch(
+        batch['ligand_coords'], 
+        batch['torsions'],
+        batch['pocket_weights']
+    )
+    
+    # 特征融合
+    combined = torch.cat([esm_seq_features, esm_pooled, geo_features], dim=-1)
+    
+    # 预测
+    prediction = model.predictor(combined)
+    
+    # 损失计算
+    loss = F.mse_loss(prediction, batch['target'])
+```
+
+### 数据优势
+
+1. **多模态特征**: 结合序列语义和3D几何信息
+2. **高质量输入**: 多层过滤确保数据可靠性
+3. **标准化格式**: 支持批量训练和模型开发
+4. **可解释性**: 口袋权重提供残基重要性信息
+5. **扩展性**: 模块化设计便于添加新特征
+
+通过这种数据组织方式，ESM+几何双分支模型可以充分利用蛋白质的序列语义信息和3D结构信息，实现更准确的结合亲和力预测。
