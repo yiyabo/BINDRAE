@@ -137,31 +137,51 @@ def unpack_rigids(rigids) -> Tuple[torch.Tensor, torch.Tensor]
 
 ---
 
-#### 1.3 边嵌入封装 (`modules/edge_embed.py`)
+#### 1.3 边嵌入封装 (`modules/edge_embed.py`) ✅ 已完成
 
-**功能需求**:
+**实现方案**:
 
-- [ ] FlashIPA EdgeEmbedder 封装
-  - 模式: flash_1d_bias (首选)
+- [X] **使用FlashIPA原生EdgeEmbedder**（替代自实现）
+  - 模式: flash_1d_bias (线性显存O(N))
   - 因子秩: z_factor_rank=16
-  - RBF核数: k=16
-- [ ] 配置管理 (EdgeEmbedderConfig)
-- [ ] 预留共价边扩展接口
+  - RBF核数: num_rbf=16（项目配置，原生默认32）
+- [X] **ProjectEdgeConfig配置适配**
+  - 项目配置 → FlashIPA配置转换
+  - 参数：c_s=384, c_p=128, z_rank=16
+- [X] **EdgeEmbedderAdapter简化接口**
+  - 原生6参数 → 简化3参数
+  - 自动处理侧链坐标（trans_sc用主链代替）
+  - 返回dict格式（含自动生成的edge_mask）
+- [X] **预留共价边扩展接口**
   - 第一版不实现 (只用几何边)
   - 留待 Phase-2 ablation
 
-**接口设计**:
+**输出格式**:
+```python
+{
+    'z_f1': [B, N, 16, 128],  # 边因子1
+    'z_f2': [B, N, 16, 128],  # 边因子2  
+    'edge_mask': [B, N, N]     # 边掩码
+}
+```
+
+**测试状态**: ✅ 通过（RTX 4090 D, 50残基显存18.73 MB）
+
+**文档**: `src/stage1/modules/FlashIPA_USAGE.md`
+
+**实际接口**:
 
 ```python
-class EdgeEmbedderWrapper(nn.Module):
-    def __init__(self, c_s=384, c_z=128, z_rank=16, mode='flash_1d_bias')
-    def forward(self, S, t, node_mask) -> Tuple[Tensor, Tensor, Tensor, Tensor]
-        # 返回: edge_embed, zf1, zf2, edge_mask
+from src.stage1.modules.edge_embed import create_edge_embedder
+
+embedder = create_edge_embedder(c_s=384, c_p=128, z_rank=16, num_rbf=16)
+outputs = embedder(node_embed, translations, node_mask)
+# 返回: {'z_f1', 'z_f2', 'edge_mask', 'raw_output'}
 ```
 
 **依赖**:
 
-- flash_ipa (EdgeEmbedder, EdgeEmbedderConfig)
+- flash_ipa (EdgeEmbedder, EdgeEmbedderConfig) - 原生库
 
 ---
 
