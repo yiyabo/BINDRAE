@@ -166,8 +166,18 @@ class LigandTokenBuilder:
         if mol is None or not RDKIT_AVAILABLE:
             return info
         
-        # 提取原子信息
-        for i, atom in enumerate(mol.GetAtoms()):
+        # 提取原子信息（只处理前 n_atoms 个）
+        mol_n_atoms = mol.GetNumAtoms()
+        if mol_n_atoms != n_atoms:
+            # 分子原子数与坐标不匹配，只取最小值
+            import warnings
+            warnings.warn(f"Molecule has {mol_n_atoms} atoms but coords have {n_atoms}. Using min={min(mol_n_atoms, n_atoms)}")
+            process_n = min(mol_n_atoms, n_atoms)
+        else:
+            process_n = n_atoms
+        
+        for i in range(process_n):
+            atom = mol.GetAtomWithIdx(i)
             info['elements'][i] = atom.GetSymbol()
             info['aromatic'][i] = atom.GetIsAromatic()
             info['charge'][i] = atom.GetFormalCharge()
