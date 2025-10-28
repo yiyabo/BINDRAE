@@ -227,8 +227,8 @@ def _test_flashipa_adapter():
     print(f"\n创建EdgeEmbedder适配器...")
     embedder = create_edge_embedder(c_s=c_s, c_p=128, z_rank=16, num_rbf=16)
     
-    # 前向传播
-    print(f"\n前向传播...")
+    # 前向传播（无梯度）
+    print(f"\n前向传播（no_grad）...")
     with torch.no_grad():
         outputs = embedder(node_embed, translations, node_mask)
     
@@ -244,12 +244,15 @@ def _test_flashipa_adapter():
     if outputs['z_f2'] is not None:
         print(f"  z_f2 范围: [{outputs['z_f2'].min():.3f}, {outputs['z_f2'].max():.3f}]")
     
-    # 梯度测试
+    # 梯度测试（需要重新前向传播）
     print(f"\n梯度测试...")
-    if outputs['z_f1'] is not None and outputs['z_f2'] is not None:
-        loss = outputs['z_f1'].sum() + outputs['z_f2'].sum()
+    node_embed_grad = torch.randn(B, N, c_s, requires_grad=True)
+    outputs_grad = embedder(node_embed_grad, translations, node_mask)
+    if outputs_grad['z_f1'] is not None and outputs_grad['z_f2'] is not None:
+        loss = outputs_grad['z_f1'].sum() + outputs_grad['z_f2'].sum()
         loss.backward()
         print(f"  ✓ 反向传播成功")
+        print(f"  ✓ 梯度形状: {node_embed_grad.grad.shape}")
     
     print(f"\n✅ FlashIPA适配器测试通过！")
     print("=" * 80)
