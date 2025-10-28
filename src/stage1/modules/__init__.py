@@ -2,20 +2,18 @@
 Stage-1 核心模块集合
 
 包含：
-- edge_embed: 边嵌入封装（FlashIPA EdgeEmbedder）
+- edge_embed: FlashIPA EdgeEmbedder 适配层
 """
 
 from .edge_embed import (
-    EdgeEmbedderWrapper,
-    EdgeEmbedderConfig,
-    GaussianRBF,
+    EdgeEmbedderAdapter,
+    ProjectEdgeConfig,
     create_edge_embedder,
 )
 
 __all__ = [
-    'EdgeEmbedderWrapper',
-    'EdgeEmbedderConfig',
-    'GaussianRBF',
+    'EdgeEmbedderAdapter',
+    'ProjectEdgeConfig',
     'create_edge_embedder',
 ]
 
