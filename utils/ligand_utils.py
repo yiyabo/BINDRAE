@@ -446,11 +446,16 @@ def build_ligand_tokens_from_file(ligand_coords_file: Path,
             if mol is not None:
                 # 去除氢原子
                 mol = Chem.RemoveHs(mol, sanitize=False)
-                # 尝试标准化
+                # 尝试标准化（忽略失败）
                 try:
                     Chem.SanitizeMol(mol)
                 except:
-                    pass  # 忽略标准化失败
+                    # 标准化失败，手动初始化必要信息
+                    try:
+                        mol.UpdatePropertyCache(strict=False)
+                        Chem.GetSymmSSSR(mol)  # 初始化环信息
+                    except:
+                        pass  # 如果还失败就放弃
         except Exception as e:
             # 记录错误但不中断
             import warnings

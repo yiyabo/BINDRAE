@@ -56,7 +56,13 @@ def debug_ligand():
         print("✓ 标准化成功")
     except Exception as e:
         print(f"⚠️  标准化失败: {e}")
-        print("  继续使用未标准化的分子")
+        print("  手动初始化环信息...")
+        try:
+            mol.UpdatePropertyCache(strict=False)
+            Chem.GetSymmSSSR(mol)  # 初始化环信息
+            print("✓ 环信息初始化成功")
+        except Exception as e2:
+            print(f"⚠️  环信息初始化失败: {e2}")
     print()
     
     # 4. 检查元素类型
@@ -72,6 +78,8 @@ def debug_ligand():
     
     # 5. 检测 HBD/HBA
     print("[5] 检测 HBD/HBA...")
+    hbd = []
+    hba = []
     try:
         from rdkit import RDConfig
         import os
@@ -79,8 +87,6 @@ def debug_ligand():
         factory = ChemicalFeatures.BuildFeatureFactory(fdefName)
         features = factory.GetFeaturesForMol(mol)
         
-        hbd = []
-        hba = []
         for feat in features:
             if feat.GetFamily() == 'Donor':
                 hbd.extend(feat.GetAtomIds())
