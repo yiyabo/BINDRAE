@@ -30,7 +30,7 @@ if os.path.exists(flash_ipa_path) and flash_ipa_path not in sys.path:
     sys.path.insert(0, flash_ipa_path)
 
 from flash_ipa.ipa import InvariantPointAttention, IPAConfig
-from flash_ipa.rigid import Rigid
+from flash_ipa.rigid import Rigid, Rotation
 
 
 # ============================================================================
@@ -215,6 +215,30 @@ def clip_frame_update(axis_angle: torch.Tensor,
     return axis_angle_clipped, translation_clipped
 
 
+def create_rigid_from_updates(axis_angle: torch.Tensor,
+                              translation: torch.Tensor) -> Rigid:
+    """
+    从轴角+平移创建Rigid增量
+    
+    Args:
+        axis_angle: [B, N, 3] 轴角向量
+        translation: [B, N, 3] 平移向量
+        
+    Returns:
+        delta_rigid: Rigid对象 [B, N]
+    """
+    # 轴角 → 旋转矩阵
+    rot_mats = axis_angle_to_rotation_matrix(axis_angle)  # [B, N, 3, 3]
+    
+    # 创建Rotation对象
+    rotation = Rotation(rot_mats=rot_mats)
+    
+    # 创建Rigid对象
+    delta_rigid = Rigid(rots=rotation, trans=translation)
+    
+    return delta_rigid
+
+
 # ============================================================================
 # FFN (Feed-Forward Network)
 # ============================================================================
@@ -347,10 +371,9 @@ class IPABlock(nn.Module):
             max_trans=self.config.max_trans_update
         )
         
-        # 4. 转换为旋转矩阵并更新帧
-        # TODO: 需要实现compose_with_updates方法
-        # 暂时先返回原帧
-        rigids_updated = rigids  # 占位符
+        # 4. 创建增量Rigid并compose
+        delta_rigid = create_rigid_from_updates(axis_angle, translation)
+        rigids_updated = rigids.compose(delta_rigid)
         
         # 5. FFN
         s_ffn = self.ffn(s)
