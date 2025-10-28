@@ -120,8 +120,8 @@ class EdgeEmbedderAdapter(nn.Module):
             
         Returns:
             {
-                'z_f1': (B, N, z_rank) 因子1
-                'z_f2': (B, N, z_rank) 因子2
+                'z_f1': (B, N, z_factor_rank, c_p) 边因子1
+                'z_f2': (B, N, z_factor_rank, c_p) 边因子2
                 'edge_mask': (B, N, N) 边掩码
                 'raw_output': tuple - FlashIPA原始输出
             }
@@ -142,21 +142,18 @@ class EdgeEmbedderAdapter(nn.Module):
             edge_mask=None
         )
         
-        # FlashIPA返回tuple: (z_f1, z_f2, edge_mask, ?)
-        # 根据之前的测试，有4个元素，其中2个为None
-        z_f1, z_f2, other1, other2 = outputs
+        # FlashIPA返回tuple: (None, z_f1, z_f2, None)
+        # z_f1, z_f2 的形状: [B, N, z_factor_rank, c_p]
+        none1, z_f1, z_f2, none2 = outputs
         
-        # 生成边掩码（如果FlashIPA没有返回）
-        if z_f1 is not None and z_f2 is not None:
-            B, N = node_mask.shape
-            edge_mask = node_mask.unsqueeze(2) & node_mask.unsqueeze(1)  # (B, N, N)
-        else:
-            edge_mask = None
+        # 生成边掩码
+        B, N = node_mask.shape
+        edge_mask = node_mask.unsqueeze(2) & node_mask.unsqueeze(1)  # (B, N, N)
         
         return {
-            'z_f1': z_f1,
-            'z_f2': z_f2,
-            'edge_mask': edge_mask,
+            'z_f1': z_f1,  # [B, N, z_factor_rank, c_p]
+            'z_f2': z_f2,  # [B, N, z_factor_rank, c_p]
+            'edge_mask': edge_mask,  # [B, N, N]
             'raw_output': outputs
         }
 
@@ -239,6 +236,13 @@ def _test_flashipa_adapter():
     print(f"  z_f1: {outputs['z_f1'].shape if outputs['z_f1'] is not None else None}")
     print(f"  z_f2: {outputs['z_f2'].shape if outputs['z_f2'] is not None else None}")
     print(f"  edge_mask: {outputs['edge_mask'].shape if outputs['edge_mask'] is not None else None}")
+    
+    # 数值验证
+    print(f"\n数值验证:")
+    if outputs['z_f1'] is not None:
+        print(f"  z_f1 范围: [{outputs['z_f1'].min():.3f}, {outputs['z_f1'].max():.3f}]")
+    if outputs['z_f2'] is not None:
+        print(f"  z_f2 范围: [{outputs['z_f2'].min():.3f}, {outputs['z_f2'].max():.3f}]")
     
     # 梯度测试
     print(f"\n梯度测试...")
