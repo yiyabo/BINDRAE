@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
 """检查FlashIPA的实际接口"""
 
+import sys
+import os
+
+# 添加FlashIPA源码路径
+flash_ipa_path = '/tmp/flash_ipa/src'
+if os.path.exists(flash_ipa_path):
+    sys.path.insert(0, flash_ipa_path)
+
 try:
-    from flash_ipa import EdgeEmbedder, EdgeEmbedderConfig
+    from flash_ipa.edge_embedder import EdgeEmbedder, EdgeEmbedderConfig
     print("✅ FlashIPA导入成功\n")
     
     # 检查EdgeEmbedderConfig的参数
