@@ -10,8 +10,8 @@ try:
     from rdkit.Chem import AllChem
     from rdkit.Chem.Features import BuildFeatureFactory
     RDKIT_AVAILABLE = True
-except ImportError:
-    print("❌ RDKit 未安装")
+except ImportError as e:
+    print(f"❌ RDKit 导入失败: {e}")
     exit(1)
 
 def debug_ligand():
