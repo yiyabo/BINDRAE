@@ -250,8 +250,8 @@ class LigandTokenBuilder:
         return np.array(probe_coords), np.array(probe_atom_indices, dtype=np.int32)
     
     def _compute_probe_directions(self, atom_coord: np.ndarray,
-                                  neighbor_coords: List[np.ndarray],
-                                  max_probes: int = 2) -> List[np.ndarray]:
+                                neighbor_coords: List[np.ndarray],
+                                max_probes: int = 2) -> List[np.ndarray]:
         """
         计算探针方向 (基于邻近原子的法向量)
         
@@ -359,15 +359,15 @@ class LigandTokenBuilder:
         return keep_indices
     
     def _encode_atom_types(self, atom_indices: np.ndarray,
-                           is_probe: np.ndarray,
-                           atom_info: Dict) -> np.ndarray:
+                        is_probe: np.ndarray,
+                        atom_info: Dict) -> np.ndarray:
         """
         编码原子类型为 12 维 one-hot
         
         维度：[C, N, O, S, P, F, Cl, Br, I, 芳香, 正电, 负电]
         
         注意：芳香性是叠加属性，可以与元素类型同时为1
-              例如芳香碳：types[i, 0]=1 且 types[i, 9]=1
+            例如芳香碳：types[i, 0]=1 且 types[i, 9]=1
         
         Returns:
             types: (M, 12)
@@ -400,8 +400,8 @@ class LigandTokenBuilder:
         return types
     
     def _compute_importance(self, atom_indices: np.ndarray,
-                           is_probe: np.ndarray,
-                           atom_info: Dict) -> np.ndarray:
+                        is_probe: np.ndarray,
+                        atom_info: Dict) -> np.ndarray:
         """
         计算重要性权重 (用于注意力加权)
         
@@ -435,8 +435,8 @@ class LigandTokenBuilder:
 # ============================================================================
 
 def build_ligand_tokens_from_file(ligand_coords_file: Path,
-                                  ligand_sdf_file: Optional[Path] = None,
-                                  max_tokens: int = MAX_LIGAND_TOKENS) -> Dict[str, np.ndarray]:
+                                ligand_sdf_file: Optional[Path] = None,
+                                max_tokens: int = MAX_LIGAND_TOKENS) -> Dict[str, np.ndarray]:
     """
     从文件构建配体 tokens
     
@@ -483,7 +483,7 @@ def build_ligand_tokens_from_file(ligand_coords_file: Path,
 
 
 def encode_ligand_batch(ligand_tokens_list: List[Dict[str, np.ndarray]],
-                       max_seq_len: int = MAX_LIGAND_TOKENS) -> Dict[str, np.ndarray]:
+                    max_seq_len: int = MAX_LIGAND_TOKENS) -> Dict[str, np.ndarray]:
     """
     批量编码配体 tokens (用于 DataLoader)
     
