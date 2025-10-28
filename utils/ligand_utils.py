@@ -352,7 +352,9 @@ class LigandTokenBuilder:
         
         # 按重要性排序，保留前 max_tokens 个
         keep_indices = np.argsort(-importance_scores)[:self.max_tokens]
-        keep_indices = np.sort(keep_indices)  # 恢复原始顺序
+        # 恢复原始顺序（重原子在前，探针在后），方便后续处理
+        # 注意：重要性权重已保存在 importance 数组中，这里排序不影响
+        keep_indices = np.sort(keep_indices)
         
         return keep_indices
     
@@ -363,6 +365,9 @@ class LigandTokenBuilder:
         编码原子类型为 12 维 one-hot
         
         维度：[C, N, O, S, P, F, Cl, Br, I, 芳香, 正电, 负电]
+        
+        注意：芳香性是叠加属性，可以与元素类型同时为1
+              例如芳香碳：types[i, 0]=1 且 types[i, 9]=1
         
         Returns:
             types: (M, 12)
