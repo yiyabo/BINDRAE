@@ -157,7 +157,12 @@ class CASF2016IPADataset(Dataset):
         split_file = self.data_dir / "processed" / "splits" / f"{split}.json"
         import json
         with open(split_file, 'r') as f:
-            self.pdb_ids = json.load(f)
+            split_data = json.load(f)
+            # split文件是字典格式: {"pdb_ids": [...]}
+            if isinstance(split_data, dict):
+                self.pdb_ids = split_data.get('pdb_ids', split_data)
+            else:
+                self.pdb_ids = split_data
         
         print(f"✓ 加载 {split} 集: {len(self.pdb_ids)} 个样本")
     
