@@ -44,7 +44,7 @@ class ProjectEdgeConfig:
     """
     c_s: int = 384
     c_p: int = 128
-    z_factor_rank: int = 16
+    z_factor_rank: int = 2  # 必须≤2以满足FlashIPA的headdim_eff≤256限制
     num_rbf: int = 16
     mode: str = 'flash_1d_bias'
     feat_dim: int = 64
@@ -164,7 +164,7 @@ class EdgeEmbedderAdapter(nn.Module):
 
 def create_edge_embedder(c_s: int = 384,
                         c_p: int = 128,
-                        z_rank: int = 16,
+                        z_rank: int = 2,  # 默认2（FlashIPA硬件限制）
                         num_rbf: int = 16,
                         mode: str = 'flash_1d_bias',
                         **kwargs) -> EdgeEmbedderAdapter:

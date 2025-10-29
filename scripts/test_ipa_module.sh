@@ -51,7 +51,7 @@ else:
 
 # 创建EdgeEmbedder
 print("\n创建EdgeEmbedder...")
-edge_embedder = create_edge_embedder(c_s=384, c_p=128, z_rank=16)
+edge_embedder = create_edge_embedder(c_s=384, c_p=128, z_rank=2)  # 必须与IPA的z_factor_rank一致
 if torch.cuda.is_available():
     edge_embedder = edge_embedder.cuda()
 
