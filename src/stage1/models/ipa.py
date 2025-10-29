@@ -62,7 +62,7 @@ class FlashIPAModuleConfig:
     depth: int = 3
     no_qk_points: int = 8
     no_v_points: int = 12
-    z_factor_rank: int = 16
+    z_factor_rank: int = 2  # 降低到2以满足headdim_eff≤256（公式：128+36+2*32=228）
     dropout: float = 0.1
     max_rot_update_deg: float = 15.0
     max_trans_update: float = 1.5
