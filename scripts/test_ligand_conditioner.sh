@@ -93,8 +93,8 @@ loss = s_cond_grad.sum()
 loss.backward()
 print(f"  ✓ 反向传播成功")
 print(f"  ✓ 蛋白梯度: {protein_grad.grad.shape}")
-print(f"  ✓ 配体坐标梯度: {lig_points_grad.grad.shape}")
-print(f"  ✓ 配体类型梯度: {lig_types_grad.grad.shape}")
+print(f"  ✓ 配体坐标梯度: {lig_points_grad.grad.shape if lig_points_grad.grad is not None else 'None'}")
+print(f"  ✓ 配体类型梯度: {lig_types_grad.grad.shape if lig_types_grad.grad is not None else 'None'}")
 
 # 显存检查
 if torch.cuda.is_available():
