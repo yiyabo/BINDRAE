@@ -48,7 +48,10 @@ for i, batch in enumerate(trainer.train_loader):
     print(f"\nStep {i+1}/2:")
     losses = trainer.train_step(batch)
     print(f"  - Total loss: {losses['total']:.4f}")
-    print(f"  - Torsion loss: {losses['torsion']:.4f}")
+    print(f"  - Torsion: {losses['torsion']:.4f}")
+    print(f"  - FAPE: {losses['fape']:.6f}")
+    print(f"  - Distance: {losses['distance']:.6f}")
+    print(f"  - Clash: {losses['clash']:.6f}")
     print(f"  - LR: {trainer.optimizer.param_groups[0]['lr']:.2e}")
 
 print(f"\n✅ 训练启动成功！可以开始完整训练了")
