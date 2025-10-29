@@ -78,7 +78,7 @@ class FlashIPAModuleConfig:
             no_qk_points=self.no_qk_points,
             no_v_points=self.no_v_points,
             use_flash_attn=True,
-            attn_dtype='bf16',
+            attn_dtype='fp16',  # headdim_eff=676 > 256, 必须用fp16
         )
 
 

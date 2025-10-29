@@ -93,6 +93,14 @@ einops>=0.7.0
 # ----------------------------------------------------------------------------
 accelerate>=0.20.0
 
+# ----------------------------------------------------------------------------
+# FlashIPA 相关依赖 (Stage-1 核心)
+# ----------------------------------------------------------------------------
+beartype>=0.18.0
+jaxtyping>=0.2.0
+# flash-attn>=2.0.0  # 见下方特殊安装说明
+# flash_ipa  # 见下方特殊安装说明
+
 # ============================================================================
 # 特殊安装说明
 # ============================================================================
@@ -100,11 +108,23 @@ accelerate>=0.20.0
 # 1. RDKit 推荐用 conda 安装（避免依赖问题）:
 #    conda install -c conda-forge rdkit
 # 
-# 2. FlashAttention (仅 Linux + CUDA):
-#    pip install flash-attn --no-build-isolation
+# 2. FlashAttention (仅 Linux + CUDA，必须与PyTorch版本匹配):
+#    ⚠️  重要：必须在安装PyTorch后重新编译flash-attn
+#    pip uninstall flash-attn -y  # 卸载旧版本
+#    pip install flash-attn --no-build-isolation  # 重新编译
+#    
+#    验证安装:
+#    python -c "from flash_attn import flash_attn_varlen_func; print('FlashAttention OK')"
 # 
-# 3. FlashIPA:
+# 3. FlashIPA (依赖 FlashAttention):
 #    pip install git+https://github.com/flagshippioneering/flash_ipa.git
+#    
+#    或从源码安装（如果git安装失败）:
+#    git clone https://github.com/flagshippioneering/flash_ipa.git /tmp/flash_ipa
+#    pip install -e /tmp/flash_ipa
+#    
+#    验证安装:
+#    python -c "import sys; sys.path.insert(0, '/tmp/flash_ipa/src'); from flash_ipa.ipa import InvariantPointAttention; print('FlashIPA OK')"
 # 
 # 4. OpenFold (可选，用于 Rigid Utils):
 #    pip install git+https://github.com/aqlaboratory/openfold.git
@@ -118,5 +138,8 @@ accelerate>=0.20.0
 # python -c "from rdkit import Chem; print('RDKit: OK')"
 # python -c "from Bio import PDB; print('BioPython: OK')"
 # python -c "import transformers; print('Transformers: OK')"
+# python -c "import beartype, jaxtyping; print('beartype & jaxtyping: OK')"
+# python -c "from flash_attn import flash_attn_varlen_func; print('FlashAttention: OK')"
+# python -c "import sys; sys.path.insert(0, '/tmp/flash_ipa/src'); from flash_ipa.ipa import InvariantPointAttention; print('FlashIPA: OK')"
 # 
 # ============================================================================
