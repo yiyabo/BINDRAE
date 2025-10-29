@@ -42,8 +42,8 @@ class TorsionHead(nn.Module):
             nn.Linear(c_hidden, self.n_angles * 2)  # 7个角度 × 2(sin, cos)
         )
         
-        # 小初始化（避免初期预测过大）
-        nn.init.zeros_(self.net[-1].weight)
+        # 小随机初始化（不能用zeros，会导致预测恒为0）
+        nn.init.normal_(self.net[-1].weight, mean=0.0, std=0.01)
         nn.init.zeros_(self.net[-1].bias)
     
     def forward(self, s: torch.Tensor) -> torch.Tensor:
