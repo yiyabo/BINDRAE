@@ -143,11 +143,11 @@ def unpack_rigids(rigids) -> Tuple[torch.Tensor, torch.Tensor]
 
 - [X] **使用FlashIPA原生EdgeEmbedder**（替代自实现）
   - 模式: flash_1d_bias (线性显存O(N))
-  - 因子秩: z_factor_rank=16
+  - 因子秩: z_factor_rank=**2**（⚠️ FlashAttention限制headdim≤256）
   - RBF核数: num_rbf=16（项目配置，原生默认32）
 - [X] **ProjectEdgeConfig配置适配**
   - 项目配置 → FlashIPA配置转换
-  - 参数：c_s=384, c_p=128, z_rank=16
+  - 参数：c_s=384, c_p=128, **z_rank=2**
 - [X] **EdgeEmbedderAdapter简化接口**
   - 原生6参数 → 简化3参数
   - 自动处理侧链坐标（trans_sc用主链代替）
@@ -159,11 +159,13 @@ def unpack_rigids(rigids) -> Tuple[torch.Tensor, torch.Tensor]
 **输出格式**:
 ```python
 {
-    'z_f1': [B, N, 16, 128],  # 边因子1
-    'z_f2': [B, N, 16, 128],  # 边因子2  
-    'edge_mask': [B, N, N]     # 边掩码
+    'z_f1': [B, N, 2, 128],  # 边因子1
+    'z_f2': [B, N, 2, 128],  # 边因子2  
+    'edge_mask': [B, N, N]    # 边掩码
 }
 ```
+
+**限制说明**: z_rank=2（FlashAttention的headdim≤256限制，详见FlashIPA_USAGE.md）
 
 **测试状态**: ✅ 通过（RTX 4090 D, 50残基显存18.73 MB）
 
@@ -174,7 +176,7 @@ def unpack_rigids(rigids) -> Tuple[torch.Tensor, torch.Tensor]
 ```python
 from src.stage1.modules.edge_embed import create_edge_embedder
 
-embedder = create_edge_embedder(c_s=384, c_p=128, z_rank=16, num_rbf=16)
+embedder = create_edge_embedder(c_s=384, c_p=128, z_rank=2, num_rbf=16)
 outputs = embedder(node_embed, translations, node_mask)
 # 返回: {'z_f1', 'z_f2', 'edge_mask', 'raw_output'}
 ```
@@ -185,50 +187,56 @@ outputs = embedder(node_embed, translations, node_mask)
 
 ---
 
-#### 1.4 FlashIPA 几何分支 (`models/ipa.py`)
+#### 1.4 FlashIPA 几何分支 (`models/ipa.py`) ✅ 已完成
 
-**功能需求**:
+**实现方案**:
 
-- [ ] 多层 IPA 堆叠 (depth=3)
-  - InvariantPointAttention (FlashIPA)
-  - 每层: Self-IPA → 帧更新 → FFN
-- [ ] 帧更新预测头
+- [X] **多层 IPA 堆叠** (depth=3)
+  - InvariantPointAttention (FlashIPA原生)
+  - 每层: Self-IPA → 帧更新 → 裁剪 → compose → FFN → 残差
+- [X] **帧更新预测头** (BackboneUpdateHead)
   - 结构: LayerNorm → Linear(128) → GELU → Linear(6)
-  - 输出: [ωx, ωy, ωz, tx, ty, tz]
-- [ ] 逐层裁剪与更新
-  - clip_update(旋转≤15°, 平移≤1.5Å)
-  - rigids.compose(增量)
-- [ ] FFN + LayerNorm + 残差
+  - 输出: [ωx, ωy, ωz, tx, ty, tz] (轴角+平移)
+- [X] **逐层裁剪与更新**
+  - clip_frame_update (旋转≤15°, 平移≤1.5Å)
+  - axis_angle → Rotation → Rigid → compose
+- [X] **FFN + LayerNorm + 残差** (IPAFeedForward)
 
-**接口设计**:
+**实际接口**:
 
 ```python
-class FlashIPAModule(nn.Module):
-    def __init__(self, c_s=384, c_z=128, heads=8, depth=3, 
-                 no_qk_points=8, no_v_points=12, z_rank=16, dropout=0.1)
-    def forward(self, S, R, t, node_mask) -> Tuple[Tensor, Tensor, Tensor]
-        # 输入: S[B,N,384], R[B,N,3,3], t[B,N,3], mask[B,N]
-        # 返回: S_geo[B,N,384], R_new[B,N,3,3], t_new[B,N,3]
+from src.stage1.models.ipa import create_flashipa_module
+
+ipa_module = create_flashipa_module(c_s=384, c_z=128, depth=3)
+s_geo, rigids_final = ipa_module(s, rigids, z_f1, z_f2, mask)
+# 输入: s[B,N,384], rigids(Rigid对象), z_f1/z_f2[B,N,2,128], mask[B,N]
+# 返回: s_geo[B,N,384], rigids_final(Rigid对象)
 ```
 
-**超参**:
+**实际超参**:
 
 ```yaml
 c_s: 384
 c_z: 128
-heads: 8
+c_hidden: 128
+no_heads: 8
 depth: 3
 no_qk_points: 8
 no_v_points: 12
-z_factor_rank: 16
+z_factor_rank: 2        # ⚠️ 降为2（FlashAttention限制）
 dropout: 0.1
+attn_dtype: fp16        # headdim_eff=228
 ```
+
+**测试状态**: ✅ 通过（RTX 4090 D, 20残基显存48.08 MB，参数量9.96M）
+
+**文档**: `src/stage1/modules/FlashIPA_USAGE.md`
 
 **依赖**:
 
-- flash_ipa (InvariantPointAttention, IPAConfig)
-- modules.rigid_utils
-- modules.edge_embed
+- flash_ipa (InvariantPointAttention, IPAConfig, Rigid, Rotation)
+- flash_attn (FlashAttention2核心)
+- beartype, jaxtyping (类型检查)
 
 ---
 
