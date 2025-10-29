@@ -240,40 +240,47 @@ attn_dtype: fp16        # headdim_eff=228
 
 ---
 
-#### 1.5 配体条件化模块 (`models/ligand_condition.py`)
+#### 1.5 配体条件化模块 (`models/ligand_condition.py`) ✅ 已完成
 
-**功能需求**:
+**实现方案**:
 
-- [ ] 配体Token嵌入
+- [X] **配体Token嵌入** (LigandTokenEmbedding)
   - 输入: concat([xyz(3), types(12)]) = 15维
   - 输出: d_lig=64
-- [ ] Cross-Attention
+  - 网络: Linear(15→64) → LayerNorm → GELU → Linear(64→64)
+- [X] **Cross-Attention** (ProteinLigandCrossAttention)
   - Q: 蛋白节点 S [B,N,384]
   - K/V: 配体token [B,M,64]
   - 多头: heads=8
-- [ ] 残基级 FiLM 调制
+  - 完整投影: Q/K/V proj + 输出投影
+- [X] **残基级 FiLM 调制** (FiLMModulation)
   - gamma = MLP_gamma(S_cross)
   - beta = MLP_beta(S_cross)
   - S_out = (1 + λ·γ) ⊙ S + λ·β
-- [ ] 门控 warmup
+- [X] **门控 warmup**
   - λ: 0→1 线性 (2000 steps)
-- [ ] 特殊初始化
-  - gamma最后层: 权重×0.1, 偏置=1
-  - beta最后层: 权重×0.1, 偏置=0
+  - 支持手动指定或自动计算
+- [X] **特殊初始化**
+  - gamma最后层: std=0.01, 偏置=1 ✓
+  - beta最后层: std=0.01, 偏置=0 ✓
 
-**接口设计**:
+**实际接口**:
 
 ```python
-class LigandConditioner(nn.Module):
-    def __init__(self, c_s=384, d_lig=64, heads=8, dropout=0.1)
-    def forward(self, S, lig_points, lig_types, p_mask, l_mask, gate_lambda=1.0)
-        # 输入: S[B,N,384], lig_points[B,M,3], lig_types[B,M,12]
-        # 返回: S_cond[B,N,384]
+from src.stage1.models.ligand_condition import create_ligand_conditioner
+
+conditioner = create_ligand_conditioner(c_s=384, d_lig=64, num_heads=8, warmup_steps=2000)
+s_cond = conditioner(protein_features, lig_points, lig_types, 
+                     protein_mask, ligand_mask, current_step=1000)
+# 输入: protein[B,N,384], lig_points[B,M,3], lig_types[B,M,12], masks
+# 返回: s_cond[B,N,384]
 ```
+
+**测试状态**: ✅ 通过（RTX 4090 D, 30残基+50配体token，显存20.98 MB，参数量548K）
 
 **依赖**:
 
-- PyTorch (nn.MultiheadAttention)
+- PyTorch (nn.Linear, F.softmax等)
 
 ---
 
