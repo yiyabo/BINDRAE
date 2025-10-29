@@ -122,8 +122,8 @@ class BackboneUpdateHead(nn.Module):
     
     def _init_weights(self):
         """权重初始化"""
-        # 最后一层小初始化（不能用zeros，会导致rigids不更新）
-        nn.init.normal_(self.net[-1].weight, mean=0.0, std=0.001)  # 小随机
+        # 最后一层小初始化（需要足够大让rigids能更新）
+        nn.init.normal_(self.net[-1].weight, mean=0.0, std=0.01)  # 增大10倍
         nn.init.zeros_(self.net[-1].bias)
     
     def forward(self, s: torch.Tensor) -> torch.Tensor:
