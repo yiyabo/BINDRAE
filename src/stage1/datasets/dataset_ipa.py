@@ -182,6 +182,7 @@ class CASF2016IPADataset(Dataset):
         esm_file = self.features_dir / f"{pdb_id}_esm.pt"
         esm_data = torch.load(esm_file, weights_only=False)
         esm_features = esm_data['per_residue'].numpy()  # [N, 1280]
+        n_res = len(esm_features)  # 以ESM为准确定残基数
         
         # 2. 提取主链坐标
         protein_pdb = self.complexes_dir / pdb_id / "protein.pdb"
@@ -219,7 +220,6 @@ class CASF2016IPADataset(Dataset):
         torsions_data = np.load(torsions_file)
         
         # 组装扭转角 [N, 7]: phi, psi, omega, chi1-4
-        n_res = len(esm_features)
         torsion_angles = np.zeros((n_res, 7), dtype=np.float32)
         torsion_mask = np.zeros((n_res, 7), dtype=bool)
         
