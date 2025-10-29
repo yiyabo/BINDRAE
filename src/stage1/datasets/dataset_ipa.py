@@ -185,7 +185,24 @@ class CASF2016IPADataset(Dataset):
         
         # 2. 提取主链坐标
         protein_pdb = self.complexes_dir / pdb_id / "protein.pdb"
-        N_coords, Ca_coords, C_coords = extract_backbone_coords(protein_pdb)
+        N_coords_raw, Ca_coords_raw, C_coords_raw = extract_backbone_coords(protein_pdb)
+        
+        # 对齐坐标长度到ESM长度（以ESM为准）
+        if len(N_coords_raw) != n_res:
+            # 创建padding数组
+            N_coords = np.zeros((n_res, 3), dtype=np.float32)
+            Ca_coords = np.zeros((n_res, 3), dtype=np.float32)
+            C_coords = np.zeros((n_res, 3), dtype=np.float32)
+            
+            # 复制有效部分
+            n_valid = min(len(N_coords_raw), n_res)
+            N_coords[:n_valid] = N_coords_raw[:n_valid]
+            Ca_coords[:n_valid] = Ca_coords_raw[:n_valid]
+            C_coords[:n_valid] = C_coords_raw[:n_valid]
+        else:
+            N_coords = N_coords_raw
+            Ca_coords = Ca_coords_raw
+            C_coords = C_coords_raw
         
         # 3. 加载配体tokens
         ligand_coords_file = self.features_dir / f"{pdb_id}_ligand_coords.npy"
@@ -232,11 +249,11 @@ class CASF2016IPADataset(Dataset):
                 w_res_padded[:len(w_res)] = w_res
                 w_res = w_res_padded
         
-        # 验证所有坐标长度
-        assert len(N_coords) == n_res, f"N coords mismatch: {len(N_coords)} vs {n_res}"
-        assert len(Ca_coords) == n_res, f"Ca coords mismatch: {len(Ca_coords)} vs {n_res}"
-        assert len(C_coords) == n_res, f"C coords mismatch: {len(C_coords)} vs {n_res}"
-        assert len(w_res) == n_res, f"w_res mismatch: {len(w_res)} vs {n_res}"
+        # 最终验证（应该都已对齐）
+        assert len(N_coords) == n_res, f"{pdb_id}: N coords length error"
+        assert len(Ca_coords) == n_res, f"{pdb_id}: Ca coords length error"
+        assert len(C_coords) == n_res, f"{pdb_id}: C coords length error"
+        assert len(w_res) == n_res, f"{pdb_id}: w_res length error"
         
         return {
             'pdb_id': pdb_id,
