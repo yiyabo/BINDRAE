@@ -4,8 +4,20 @@
 import numpy as np
 import torch
 from pathlib import Path
+import os
 
-base_dir = Path("/Users/apple/code/BINDRAE/data/casf2016")
+# 自动检测项目根目录
+script_dir = Path(__file__).resolve().parent
+base_dir = script_dir / "data" / "casf2016"
+
+# 如果不存在，尝试其他可能的路径
+if not base_dir.exists():
+    # 尝试当前目录
+    base_dir = Path.cwd() / "data" / "casf2016"
+
+print(f"数据目录: {base_dir}")
+print(f"存在: {base_dir.exists()}\n")
+
 features_dir = base_dir / "processed" / "features"
 pockets_dir = base_dir / "processed" / "pockets"
 complexes_dir = base_dir / "complexes"
