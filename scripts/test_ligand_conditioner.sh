@@ -77,16 +77,24 @@ print(f"  ✓ Step 2000 (λ=1.00): {s_cond_2000.shape}")
 
 # 梯度测试
 print("\n梯度测试...")
+# 创建需要梯度的输入（叶子节点）
 protein_grad = torch.randn(B, N, c_s, requires_grad=True)
+lig_points_grad = torch.randn(B, M, 3, requires_grad=True)
+lig_types_grad = torch.randn(B, M, 12, requires_grad=True)
+
 if torch.cuda.is_available():
     protein_grad = protein_grad.cuda()
+    lig_points_grad = lig_points_grad.cuda()
+    lig_types_grad = lig_types_grad.cuda()
 
-s_cond_grad = conditioner(protein_grad, lig_points, lig_types,
+s_cond_grad = conditioner(protein_grad, lig_points_grad, lig_types_grad,
                           protein_mask, ligand_mask, gate_lambda=0.5)
 loss = s_cond_grad.sum()
 loss.backward()
 print(f"  ✓ 反向传播成功")
-print(f"  ✓ 梯度形状: {protein_grad.grad.shape}")
+print(f"  ✓ 蛋白梯度: {protein_grad.grad.shape}")
+print(f"  ✓ 配体坐标梯度: {lig_points_grad.grad.shape}")
+print(f"  ✓ 配体类型梯度: {lig_types_grad.grad.shape}")
 
 # 显存检查
 if torch.cuda.is_available():
