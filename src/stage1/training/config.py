@@ -19,7 +19,7 @@ class TrainingConfig:
     num_workers: int = 4
     
     # 优化器
-    lr: float = 1e-4
+    lr: float = 1e-3  # 增大10倍（从1e-4）- 加速初期学习
     weight_decay: float = 0.05
     grad_clip: float = 1.0
     
