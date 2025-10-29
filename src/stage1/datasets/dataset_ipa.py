@@ -220,6 +220,24 @@ class CASF2016IPADataset(Dataset):
         w_res_file = self.pockets_dir / f"{pdb_id}_w_res.npy"
         w_res = np.load(w_res_file)
         
+        # 确保所有数据长度一致（以ESM特征为准）
+        # 有时w_res可能包含非标准残基，需要截断或padding
+        if len(w_res) != n_res:
+            if len(w_res) > n_res:
+                # 截断
+                w_res = w_res[:n_res]
+            else:
+                # Padding
+                w_res_padded = np.zeros(n_res, dtype=np.float32)
+                w_res_padded[:len(w_res)] = w_res
+                w_res = w_res_padded
+        
+        # 验证所有坐标长度
+        assert len(N_coords) == n_res, f"N coords mismatch: {len(N_coords)} vs {n_res}"
+        assert len(Ca_coords) == n_res, f"Ca coords mismatch: {len(Ca_coords)} vs {n_res}"
+        assert len(C_coords) == n_res, f"C coords mismatch: {len(C_coords)} vs {n_res}"
+        assert len(w_res) == n_res, f"w_res mismatch: {len(w_res)} vs {n_res}"
+        
         return {
             'pdb_id': pdb_id,
             'esm': esm_features,           # [N, 1280]
