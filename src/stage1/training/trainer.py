@@ -273,6 +273,8 @@ class Stage1Trainer:
             pbar.set_postfix({
                 'loss': f"{step_losses['total']:.3f}",
                 'tor': f"{step_losses['torsion']:.3f}",
+                'fape': f"{step_losses['fape']:.3f}",
+                'dist': f"{step_losses['distance']:.3f}",
                 'lr': f"{self.optimizer.param_groups[0]['lr']:.1e}",
             }, refresh=True)
         
@@ -363,10 +365,12 @@ class Stage1Trainer:
             # 训练
             train_losses = self.train_epoch()
             
-            # 单行输出训练结果
+            # 单行输出训练结果（显示所有分项）
             train_info = (f"Epoch {epoch:3d} | "
-                         f"Train Loss: {train_losses['total']:.4f} "
-                         f"(Tor:{train_losses['torsion']:.3f})")
+                         f"Loss: {train_losses['total']:.4f} "
+                         f"(T:{train_losses['torsion']:.2f} "
+                         f"F:{train_losses['fape']:.2f} "
+                         f"D:{train_losses['distance']:.2f})")
             
             # 验证
             if epoch % self.config.val_interval == 0:
