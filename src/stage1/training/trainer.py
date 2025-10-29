@@ -240,7 +240,10 @@ class Stage1Trainer:
             'fape': 0.0,
         }
         
-        pbar = tqdm(self.train_loader, desc=f'Epoch {self.current_epoch}')
+        pbar = tqdm(self.train_loader, 
+                   desc=f'Epoch {self.current_epoch:3d}',
+                   ncols=100,  # 固定宽度，避免换行
+                   leave=True)  # 保留进度条
         
         for batch_idx, batch in enumerate(pbar):
             # 训练步
@@ -250,13 +253,12 @@ class Stage1Trainer:
             for k in epoch_losses:
                 epoch_losses[k] += step_losses[k]
             
-            # 更新进度条
-            if batch_idx % self.config.log_interval == 0:
-                pbar.set_postfix({
-                    'loss': f"{step_losses['total']:.4f}",
-                    'tor': f"{step_losses['torsion']:.4f}",
-                    'lr': f"{self.optimizer.param_groups[0]['lr']:.2e}",
-                })
+            # 实时更新进度条（每步都更新）
+            pbar.set_postfix({
+                'loss': f"{step_losses['total']:.3f}",
+                'tor': f"{step_losses['torsion']:.3f}",
+                'lr': f"{self.optimizer.param_groups[0]['lr']:.1e}",
+            }, refresh=True)
         
         # 平均损失
         n_batches = len(self.train_loader)
@@ -278,7 +280,12 @@ class Stage1Trainer:
             'chi1_acc': 0.0,
         }
         
-        for batch in tqdm(self.val_loader, desc='Validation'):
+        pbar = tqdm(self.val_loader, 
+                   desc='  Validating',
+                   ncols=100,
+                   leave=False)  # 验证完成后清除进度条
+        
+        for batch in pbar:
             batch = self._batch_to_device(batch)
             
             outputs = self.model(batch, self.global_step)
@@ -314,7 +321,7 @@ class Stage1Trainer:
         
         return results
     
-    def save_checkpoint(self, filepath: str):
+    def save_checkpoint(self, filepath: str, verbose: bool = True):
         """保存checkpoint"""
         torch.save({
             'epoch': self.current_epoch,
@@ -325,12 +332,13 @@ class Stage1Trainer:
             'best_val_metric': self.best_val_metric,
             'config': self.config,
         }, filepath)
-        print(f"✓ Checkpoint saved: {filepath}")
+        if verbose:
+            print(f"  ✓ Saved: {Path(filepath).name}")
     
     def train(self):
         """完整训练流程"""
         print(f"\n{'='*80}")
-        print(f"开始训练")
+        print(f"开始训练 - BINDRAE Stage-1")
         print(f"{'='*80}\n")
         
         for epoch in range(self.current_epoch, self.config.max_epochs):
@@ -339,42 +347,49 @@ class Stage1Trainer:
             # 训练
             train_losses = self.train_epoch()
             
-            print(f"\nEpoch {epoch} 训练损失:")
-            print(f"  Total: {train_losses['total']:.4f}")
-            print(f"  Torsion: {train_losses['torsion']:.4f}")
+            # 单行输出训练结果
+            train_info = (f"Epoch {epoch:3d} | "
+                         f"Train Loss: {train_losses['total']:.4f} "
+                         f"(Tor:{train_losses['torsion']:.3f})")
             
             # 验证
             if epoch % self.config.val_interval == 0:
                 val_results = self.validate()
                 
-                print(f"\nEpoch {epoch} 验证结果:")
-                print(f"  Val Loss: {val_results['total']:.4f}")
-                print(f"  χ1 Acc: {val_results['chi1_acc']:.1%}")
+                val_info = (f" | Val Loss: {val_results['total']:.4f} "
+                           f"χ1:{val_results['chi1_acc']:5.1%}")
                 
                 # 早停检查
                 current_metric = val_results['total']
                 if current_metric < self.best_val_metric:
                     self.best_val_metric = current_metric
                     self.patience_counter = 0
-                    # 保存最佳模型
                     save_path = Path(self.config.save_dir) / 'best_model.pt'
-                    self.save_checkpoint(str(save_path))
+                    self.save_checkpoint(str(save_path), verbose=False)
+                    val_info += " | ⭐ Best"
                 else:
                     self.patience_counter += 1
-                    print(f"  ⚠️  No improvement ({self.patience_counter}/{self.config.early_stop_patience})")
+                    val_info += f" | ↑{self.patience_counter}"
                     
                     if self.patience_counter >= self.config.early_stop_patience:
-                        print(f"\n早停！验证损失{self.config.early_stop_patience}个epoch未改善")
+                        print(f"\n{'='*80}")
+                        print(f"早停！验证损失{self.config.early_stop_patience}个epoch未改善")
+                        print(f"{'='*80}\n")
                         break
+                
+                print(train_info + val_info)
+            else:
+                print(train_info)
             
-            # 定期保存
-            if epoch % 10 == 0:
+            # 定期保存（静默）
+            if epoch % 10 == 0 and epoch > 0:
                 save_path = Path(self.config.save_dir) / f'epoch_{epoch}.pt'
-                self.save_checkpoint(str(save_path))
+                self.save_checkpoint(str(save_path), verbose=False)
         
         print(f"\n{'='*80}")
         print(f"训练完成！")
-        print(f"  - 最佳验证损失: {self.best_val_metric:.4f}")
+        print(f"  最佳验证损失: {self.best_val_metric:.4f}")
+        print(f"  Checkpoint: {self.config.save_dir}/best_model.pt")
         print(f"{'='*80}\n")
 
 
