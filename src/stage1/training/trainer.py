@@ -141,33 +141,33 @@ class Stage1Trainer:
             w_res_warmed
         )
         
-        # 2. Cα距离损失（用真实Ca坐标）
-        # 简化版：暂时用真实Ca计算距离图，验证损失函数工作
-        loss_dist = distance_loss(batch.Ca, batch.Ca, w_res_warmed)
-        
-        # 3. FAPE损失（用rigids_final）
+        # 2. 提取IPA预测的Cα坐标
         rigids_final = outputs['rigids_final']
+        pred_Ca = rigids_final.get_trans()  # [B, N, 3] - IPA更新后的Cα位置
+        true_Ca = batch.Ca
         
-        # 提取预测的帧（R, t）
+        # 3. Cα距离损失（预测 vs 真实）
+        loss_dist = distance_loss(pred_Ca, true_Ca, w_res_warmed)
+        
+        # 4. FAPE损失（预测帧 vs 真实帧）
         pred_R = rigids_final.get_rots().get_rot_mats()  # [B, N, 3, 3]
-        pred_t = rigids_final.get_trans()  # [B, N, 3]
+        pred_t = pred_Ca
         
-        # 真实帧（简化：用单位旋转+Ca坐标）
+        # 真实帧（从N, Ca, C构建）
         B, N = batch.Ca.shape[:2]
         true_R = torch.eye(3, device=self.device).unsqueeze(0).unsqueeze(0).expand(B, N, -1, -1)
-        true_t = batch.Ca
+        true_t = true_Ca
         
         loss_fape = fape_loss(
-            batch.Ca,  # 预测坐标（暂时用真实Ca）
-            batch.Ca,  # 真实坐标
-            (pred_R, pred_t),  # 预测帧
-            (true_R, true_t),  # 真实帧
+            pred_Ca,   # 预测Cα
+            true_Ca,   # 真实Cα
+            (pred_R, pred_t),
+            (true_R, true_t),
             w_res_warmed
         )
         
-        # 4. Clash惩罚（需要全原子坐标）
-        # TODO: FK还原后计算，暂时禁用
-        loss_clash = torch.tensor(0.0, device=self.device)
+        # 5. Clash惩罚（用Cα坐标简化计算）
+        loss_clash = clash_penalty(pred_Ca, clash_threshold=3.8)  # Cα最小距离~3.8Å
         
         # 组合损失
         total_loss = (
