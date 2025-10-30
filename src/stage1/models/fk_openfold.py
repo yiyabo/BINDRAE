@@ -58,23 +58,18 @@ class OpenFoldFK(nn.Module):
     
     def _build_residue_constants(self):
         """构建残基常量张量"""
-        # 为每种残基构建atom14数据
-        # [21, 14, 3] - 21种类型（20氨基酸+1个UNK），14个atom，3D坐标
-        # [21, 14] - atom属于哪个rigid group (0-7)
+        from src.stage1.data.residue_constants import build_atom14_constants
         
-        restype_atom14_positions = np.zeros([21, 14, 3], dtype=np.float32)
-        restype_atom14_to_group = np.zeros([21, 14], dtype=np.int64)
-        restype_atom14_mask = np.zeros([21, 14], dtype=np.float32)
+        # 构建atom14常量
+        constants = build_atom14_constants()
         
-        # TODO: 填充这些数组（从rigid_group_atom_positions）
-        # 当前：注册为buffer以便GPU使用
-        
+        # 注册为buffer（可在GPU上使用）
         self.register_buffer('restype_atom14_positions', 
-                           torch.from_numpy(restype_atom14_positions))
+                           torch.from_numpy(constants['restype_atom14_positions']))
         self.register_buffer('restype_atom14_to_group',
-                           torch.from_numpy(restype_atom14_to_group))
+                           torch.from_numpy(constants['restype_atom14_to_group']))
         self.register_buffer('restype_atom14_mask',
-                           torch.from_numpy(restype_atom14_mask))
+                           torch.from_numpy(constants['restype_atom14_mask']))
     
     def torsion_angles_to_frames(self,
                                 torsions_sincos: torch.Tensor,
@@ -164,51 +159,56 @@ class OpenFoldFK(nn.Module):
                             all_frames: List[Rigid],
                             aatype: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
-        从8个刚体帧生成atom14坐标
+        从8个刚体帧生成atom14坐标（完整实现，含侧链）
         
-        最小可工作版本：
-        - 只返回主链4原子（N, CA, C, O）
-        - 使用文献固定坐标
-        - 保证键长正确
+        OpenFold方法：
+        1. 根据残基类型查询atom14文献坐标
+        2. 根据atom→group映射，应用对应的刚体帧
+        3. 得到全局坐标
         """
         B, N = aatype.shape
         device = aatype.device
         
-        backbone_frame = all_frames[0]  # 只用backbone帧
-        psi_frame = all_frames[3]  # psi帧（O在这里）
+        # 获取每个残基的atom14数据 [B, N, 14, 3/1]
+        # 使用aatype索引
+        lit_positions = self.restype_atom14_positions[aatype]  # [B, N, 14, 3]
+        atom_to_group = self.restype_atom14_to_group[aatype]  # [B, N, 14]
+        atom_mask = self.restype_atom14_mask[aatype]  # [B, N, 14]
         
-        # 主链4原子的文献坐标（以CA为原点的局部坐标）
-        # 来自rigid_group_atom_positions，所有残基的主链坐标很接近
-        
-        # 使用ALA的文献坐标作为默认（主链几何类似）
-        lit_N = torch.tensor([-0.525, 1.363, 0.000], device=device)   # N
-        lit_CA = torch.tensor([0.000, 0.000, 0.000], device=device)   # CA (原点)
-        lit_C = torch.tensor([1.526, 0.000, 0.000], device=device)    # C
-        lit_O_local = torch.tensor([0.627, 1.062, 0.000], device=device)  # O在psi帧
-        
-        # 应用backbone帧变换：local → global
-        # [B, N, 3]
-        N_global = backbone_frame.apply(lit_N.unsqueeze(0).unsqueeze(0).expand(B, N, -1))
-        CA_global = backbone_frame.apply(lit_CA.unsqueeze(0).unsqueeze(0).expand(B, N, -1))
-        C_global = backbone_frame.apply(lit_C.unsqueeze(0).unsqueeze(0).expand(B, N, -1))
-        
-        # O需要用psi帧
-        O_global = psi_frame.apply(lit_O_local.unsqueeze(0).unsqueeze(0).expand(B, N, -1))
-        
-        # 构建atom14
-        # Atom14索引: 0=N, 1=CA, 2=C, 3=O, 4=CB, ...
+        # 初始化全局坐标
         atom14_pos = torch.zeros(B, N, 14, 3, device=device)
-        atom14_pos[:, :, 0] = N_global
-        atom14_pos[:, :, 1] = CA_global
-        atom14_pos[:, :, 2] = C_global
-        atom14_pos[:, :, 3] = O_global
         
-        atom14_mask = torch.zeros(B, N, 14, device=device)
-        atom14_mask[:, :, :4] = 1.0  # N, CA, C, O都有效
+        # 对每个atom，应用其对应的刚体帧
+        for atom_idx in range(14):
+            # 该atom在不同残基中属于哪个group
+            groups = atom_to_group[:, :, atom_idx]  # [B, N]
+            
+            # 文献坐标
+            lit_pos = lit_positions[:, :, atom_idx, :]  # [B, N, 3]
+            
+            # 对每个group应用对应的帧
+            # 简化：逐group处理
+            for group_idx in range(8):
+                # 找到属于该group的atom
+                mask = (groups == group_idx)  # [B, N]
+                
+                if mask.any():
+                    # 应用该group的帧
+                    frame = all_frames[group_idx]
+                    
+                    # 变换坐标
+                    global_pos = frame.apply(lit_pos)  # [B, N, 3]
+                    
+                    # 只更新属于该group的atom
+                    atom14_pos[:, :, atom_idx, :] = torch.where(
+                        mask.unsqueeze(-1),
+                        global_pos,
+                        atom14_pos[:, :, atom_idx, :]
+                    )
         
         return {
             'atom14_pos': atom14_pos,
-            'atom14_mask': atom14_mask,
+            'atom14_mask': atom_mask,
         }
     
     def forward(self,
