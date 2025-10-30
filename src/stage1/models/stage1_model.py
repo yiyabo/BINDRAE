@@ -27,6 +27,7 @@ from .adapter import ESMAdapter
 from .ipa import FlashIPAModule, FlashIPAModuleConfig
 from .ligand_condition import LigandConditioner, LigandConditionerConfig
 from .torsion_head import TorsionHead
+from .fk_openfold import OpenFoldFK, create_openfold_fk
 from ..modules.edge_embed import EdgeEmbedderAdapter, ProjectEdgeConfig
 
 
@@ -133,8 +134,12 @@ class Stage1Model(nn.Module):
             dropout=config.dropout
         )
         
+        # 6. FK模块（扭转角→全原子坐标）
+        self.fk_module = create_openfold_fk()
+        
         print(f"✓ Stage1Model 初始化完成")
         print(f"  - 总参数量: {sum(p.numel() for p in self.parameters()):,}")
+        print(f"  - 包含FK模块（OpenFold式）")
     
     def forward(self,
                 batch: 'IPABatch',
@@ -186,10 +191,19 @@ class Stage1Model(nn.Module):
         # 6. TorsionHead
         pred_torsions = self.torsion_head(s_cond)  # [B, N, 7, 2]
         
+        # 7. FK重建全原子坐标
+        # 创建残基类型（暂时全部用ALA=0）
+        # TODO: 从数据集获取真实残基类型
+        aatype = torch.zeros(B, N, dtype=torch.long, device=device)
+        
+        atom14_result = self.fk_module(pred_torsions, rigids_updated, aatype)
+        
         return {
             'pred_torsions': pred_torsions,
             's_final': s_cond,
             'rigids_final': rigids_updated,
+            'atom14_pos': atom14_result['atom14_pos'],      # [B, N, 14, 3]
+            'atom14_mask': atom14_result['atom14_mask'],    # [B, N, 14]
         }
 
 
