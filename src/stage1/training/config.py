@@ -19,9 +19,9 @@ class TrainingConfig:
     num_workers: int = 4
     
     # 优化器
-    lr: float = 1e-3  # 增大10倍（从1e-4）- 加速初期学习
+    lr: float = 5e-4  # 折中值（1e-4太慢，1e-3可能不稳定）
     weight_decay: float = 0.05
-    grad_clip: float = 1.0
+    grad_clip: float = 1.0  # 梯度裁剪保护NaN
     
     # 学习率调度
     warmup_steps: int = 1000
