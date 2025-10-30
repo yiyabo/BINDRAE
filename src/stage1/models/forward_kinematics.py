@@ -224,49 +224,51 @@ class BackboneBuilder(nn.Module):
         
         # 迭代构建后续残基
         for i in range(1, N):
-            # 当前残基的3个扭转角
             phi_i = phi[:, i]
             psi_i = psi[:, i]
             omega_i = omega[:, i]
             
-            # 从前一个残基的C构建当前残基的N（用omega）
+            # 1. 构建N[i]：从 C[i-1]-N[i-1]-CA[i-1] 通过omega放置
+            # Z-matrix: (CA[i-1], C[i-1], N[i-1]) + omega → N[i]
             N_coords[:, i] = place_atom_nerf(
-                CA_coords[:, i-1],
-                C_coords[:, i-1],
-                N_coords[:, i-1],  # 前一个N（占位，实际不影响）
+                CA_coords[:, i-1],   # p1
+                C_coords[:, i-1],    # p2  
+                N_coords[:, i-1] if i > 1 else C_coords[:, i-1],  # p3（第1次用C占位）
                 self.C_N_length,
                 self.CA_C_N_angle,
                 omega_i
             )
             
-            # 从N构建CA（用phi）
+            # 2. 构建CA[i]：从 C[i-1]-N[i]-CA[i-1] 通过phi放置
+            # Z-matrix: (C[i-1], N[i], CA[i-1]) + phi → CA[i]
             CA_coords[:, i] = place_atom_nerf(
-                C_coords[:, i-1],
-                N_coords[:, i],
-                CA_coords[:, i-1],  # 占位
+                C_coords[:, i-1],    # p1
+                N_coords[:, i],      # p2
+                CA_coords[:, i-1],   # p3
                 self.N_CA_length,
                 self.C_N_CA_angle,
                 phi_i
             )
             
-            # 从CA构建C（用psi）
+            # 3. 构建C[i]：从 N[i]-CA[i]-C[i-1] 通过psi放置
+            # Z-matrix: (N[i], CA[i], C[i-1]) + psi → C[i]
             C_coords[:, i] = place_atom_nerf(
-                N_coords[:, i],
-                CA_coords[:, i],
-                C_coords[:, i-1],  # 占位
+                N_coords[:, i],      # p1
+                CA_coords[:, i],     # p2
+                C_coords[:, i-1],    # p3
                 self.CA_C_length,
                 self.N_CA_C_angle,
                 psi_i
             )
             
-            # 从C构建O
+            # 4. 构建O[i]：从 CA[i]-C[i]-N[i] 放置
             O_coords[:, i] = place_atom_nerf(
-                CA_coords[:, i],
-                CA_coords[:, i],  # 占位
-                C_coords[:, i],
+                CA_coords[:, i],     # p1
+                C_coords[:, i],      # p2
+                N_coords[:, i],      # p3（占位）
                 self.C_O_length,
                 self.CA_C_O_angle,
-                psi_i + math.pi
+                torch.zeros_like(psi_i)  # O的位置相对固定
             )
         
         return {
