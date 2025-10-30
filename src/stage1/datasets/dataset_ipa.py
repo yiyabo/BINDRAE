@@ -69,6 +69,7 @@ class IPABatch:
     # Meta
     pdb_ids: List[str]          # 样本ID列表
     n_residues: List[int]       # 每个样本的残基数
+    sequences: List[str]        # 氨基酸序列（单字母代码）
 
 
 # ============================================================================
@@ -178,10 +179,11 @@ class CASF2016IPADataset(Dataset):
         """
         pdb_id = self.pdb_ids[idx]
         
-        # 1. 加载ESM特征
+        # 1. 加载ESM特征和序列
         esm_file = self.features_dir / f"{pdb_id}_esm.pt"
         esm_data = torch.load(esm_file, weights_only=False)
         esm_features = esm_data['per_residue'].numpy()  # [N, 1280]
+        sequence_str = esm_data.get('sequence_str', '')  # 氨基酸序列
         n_res = len(esm_features)  # 以ESM为准确定残基数
         
         # 2. 提取主链坐标
@@ -261,6 +263,7 @@ class CASF2016IPADataset(Dataset):
             'N': N_coords,                 # [N, 3]
             'Ca': Ca_coords,               # [N, 3]
             'C': C_coords,                 # [N, 3]
+            'sequence': sequence_str,      # 氨基酸序列（单字母代码）
             'lig_points': lig_tokens['coords'],   # [M, 3]
             'lig_types': lig_tokens['types'],     # [M, 12]
             'torsion_angles': torsion_angles,     # [N, 7]
@@ -313,6 +316,7 @@ def collate_ipa_batch(samples: List[Dict]) -> IPABatch:
     
     pdb_ids = []
     n_residues_list = []
+    sequences = []
     
     # 填充数据
     for i, sample in enumerate(samples):
@@ -336,6 +340,7 @@ def collate_ipa_batch(samples: List[Dict]) -> IPABatch:
         
         pdb_ids.append(sample['pdb_id'])
         n_residues_list.append(n_res)
+        sequences.append(sample.get('sequence', ''))
     
     # 转换为Tensor
     return IPABatch(
@@ -352,6 +357,7 @@ def collate_ipa_batch(samples: List[Dict]) -> IPABatch:
         w_res=torch.from_numpy(w_res_batch),
         pdb_ids=pdb_ids,
         n_residues=n_residues_list,
+        sequences=sequences,
     )
 
 
