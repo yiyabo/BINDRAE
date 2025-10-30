@@ -194,23 +194,24 @@ class Stage1Model(nn.Module):
         rotation = Rotation(rot_mats=rot_identity)
         rigids = Rigid(rots=rotation, trans=batch.Ca)
         
-        # 3. EdgeEmbedder
-        edge_outputs = self.edge_embedder(s, batch.Ca, batch.node_mask)
-        z_f1 = edge_outputs['z_f1']
-        z_f2 = edge_outputs['z_f2']
-        
-        # 4. FlashIPA
-        s_geo, rigids_updated = self.ipa_module(s, rigids, z_f1, z_f2, batch.node_mask)
-        
-        # 5. LigandConditioner
-        s_cond = self.ligand_conditioner(
-            s_geo,
+        # 3. LigandConditioner（在IPA前注入，符合理论）
+        # 理论：配体信息应该影响IPA的几何建模（docs/理论 第15-26行）
+        s_with_ligand = self.ligand_conditioner(
+            s,  # 在Adapter后立即注入
             batch.lig_points,
             batch.lig_types,
             batch.node_mask,
             batch.lig_mask,
             current_step=current_step
         )
+        
+        # 4. EdgeEmbedder
+        edge_outputs = self.edge_embedder(s_with_ligand, batch.Ca, batch.node_mask)
+        z_f1 = edge_outputs['z_f1']
+        z_f2 = edge_outputs['z_f2']
+        
+        # 5. FlashIPA（几何分支，已包含配体信息）
+        s_geo, rigids_updated = self.ipa_module(s_with_ligand, rigids, z_f1, z_f2, batch.node_mask)
         
         # 6. TorsionHead
         pred_torsions = self.torsion_head(s_cond)  # [B, N, 7, 2]
