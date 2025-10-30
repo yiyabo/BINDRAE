@@ -175,8 +175,8 @@ class Stage1Trainer:
         true_t = true_CA
         
         loss_fape = fape_loss(
-            pred_backbone.reshape(B, -1, 3),  # [B, N*3, 3]
-            true_backbone.reshape(B, -1, 3),  # [B, N*3, 3]
+            pred_backbone,  # [B, N, 3, 3] - fape_loss会自动处理4维输入
+            true_backbone,  # [B, N, 3, 3]
             (pred_R, pred_t),
             (true_R, true_t),
             w_res_warmed
