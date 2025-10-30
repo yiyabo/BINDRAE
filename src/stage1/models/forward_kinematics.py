@@ -34,64 +34,62 @@ def place_atom_nerf(p1: torch.Tensor,
                    torsion: torch.Tensor,
                    eps: float = 1e-8) -> torch.Tensor:
     """
-    NeRF式原子放置（从3个原子+内坐标放置第4个原子）
+    标准Z-matrix原子放置
     
-    标准Z-matrix原子放置算法
+    从3个已知原子 p1-p2-p3 和内坐标 (r, θ, φ) 放置第4个原子 p4
+    使得：
+    - |p3-p4| = r (键长)
+    - ∠(p2-p3-p4) = θ (键角)
+    - 二面角(p1-p2-p3-p4) = φ (扭转角)
     
     Args:
-        p1: [..., 3] 第1个参考原子
-        p2: [..., 3] 第2个参考原子
-        p3: [..., 3] 第3个参考原子（连接点）
-        bond_length: 标准键长 r (Å)
-        bond_angle: 标准键角 θ (弧度)
-        torsion: [...] 扭转角 φ (弧度)
-        eps: 数值稳定性
+        p1, p2, p3: [..., 3] 参考原子
+        bond_length: r
+        bond_angle: θ (弧度)
+        torsion: φ (弧度，可以是张量)
         
     Returns:
-        p4: [..., 3] 新原子坐标
+        p4: [..., 3]
     """
-    # 1. 构建局部坐标系（以p3为原点）
-    # e1: p3 → p2 方向（指向前一个原子）
-    v32 = p2 - p3
-    e1 = v32 / (torch.norm(v32, dim=-1, keepdim=True) + eps)
+    # 1. 向量
+    bc = p3 - p2  # [..., 3]
+    bc_norm = torch.norm(bc, dim=-1, keepdim=True) + eps
+    bc = bc / bc_norm
     
-    # e2: 垂直于p1-p2-p3平面
-    v31 = p1 - p3
-    # 用叉积构建垂直向量
-    n = torch.cross(e1, v31, dim=-1)
-    e2 = n / (torch.norm(n, dim=-1, keepdim=True) + eps)
+    # 2. 平面法向量
+    n = torch.cross(p2 - p1, bc, dim=-1)
+    n_norm = torch.norm(n, dim=-1, keepdim=True) + eps
+    n = n / n_norm
     
-    # e3: e1 × e2（完成右手系）
-    e3 = torch.cross(e1, e2, dim=-1)
+    # 3. 第三个基向量
+    m = torch.cross(n, bc, dim=-1)
     
-    # 2. 新原子在局部坐标系下的位置
-    # 从p3出发，沿-e1方向（向外），键长r，键角θ，扭转φ
+    # 4. 局部坐标（p3为原点）
+    # 新原子相对于p3的位置
+    cos_theta = torch.cos(torch.tensor(bond_angle)) if isinstance(bond_angle, float) else torch.cos(bond_angle)
+    sin_theta = torch.sin(torch.tensor(bond_angle)) if isinstance(bond_angle, float) else torch.sin(bond_angle)
     
-    # 处理torsion维度
-    if torsion.dim() == 0:
+    # 处理torsion
+    if isinstance(torsion, (int, float)):
         cos_phi = math.cos(torsion)
         sin_phi = math.sin(torsion)
     else:
         cos_phi = torch.cos(torsion)
         sin_phi = torch.sin(torsion)
-        # 确保维度匹配
-        if cos_phi.dim() < e1.dim():
+        # 添加维度匹配
+        if cos_phi.dim() < bc.dim():
             cos_phi = cos_phi.unsqueeze(-1)
             sin_phi = sin_phi.unsqueeze(-1)
     
-    cos_theta = math.cos(bond_angle)
-    sin_theta = math.sin(bond_angle)
+    # d = r * [sin(θ)cos(φ), sin(θ)sin(φ), cos(θ)]
+    # 在局部坐标系 (m, n, -bc) 中
+    d = bond_length * (
+        sin_theta * cos_phi * m + 
+        sin_theta * sin_phi * n - 
+        cos_theta * bc
+    )
     
-    # 局部坐标（相对于-e1方向）
-    # x = -r * cos(θ)  # 沿-e1
-    # y = r * sin(θ) * cos(φ)  # 在e2方向
-    # z = r * sin(θ) * sin(φ)  # 在e3方向
-    x = -bond_length * cos_theta
-    y = bond_length * sin_theta * cos_phi
-    z = bond_length * sin_theta * sin_phi
-    
-    # 3. 转换到全局坐标
-    p4 = p3 + x * e1 + y * e2 + z * e3
+    p4 = p3 + d
     
     return p4
 
