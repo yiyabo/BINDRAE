@@ -159,10 +159,10 @@ class Stage1Trainer:
         # 3. Cα距离损失（使用FK重建的CA）
         loss_dist = distance_loss(pred_CA, true_CA, w_res_warmed)
         
-        # 4. FAPE损失（使用主链4原子）
-        # 预测坐标：[B, N, 4, 3]
-        pred_backbone = torch.stack([pred_N, pred_CA, pred_C, pred_O], dim=2)
-        true_backbone = torch.stack([true_N, true_CA, true_C], dim=2)  # 只用N,CA,C（O可能缺失）
+        # 4. FAPE损失（使用主链3原子：N, CA, C）
+        # 预测和真实都用3个原子，维度匹配
+        pred_backbone = torch.stack([pred_N, pred_CA, pred_C], dim=2)  # [B, N, 3, 3]
+        true_backbone = torch.stack([true_N, true_CA, true_C], dim=2)  # [B, N, 3, 3]
         
         # 提取帧
         rigids_final = outputs['rigids_final']
@@ -175,16 +175,16 @@ class Stage1Trainer:
         true_t = true_CA
         
         loss_fape = fape_loss(
-            pred_backbone.reshape(B, -1, 3),  # [B, N*4, 3]
+            pred_backbone.reshape(B, -1, 3),  # [B, N*3, 3]
             true_backbone.reshape(B, -1, 3),  # [B, N*3, 3]
             (pred_R, pred_t),
             (true_R, true_t),
             w_res_warmed
         )
         
-        # 5. Clash惩罚（使用主链4原子）
-        # 展平为[B, N*4, 3]
-        pred_all_atoms = pred_backbone.reshape(B, -1, 3)
+        # 5. Clash惩罚（使用主链4原子：N, CA, C, O）
+        pred_backbone_4 = torch.stack([pred_N, pred_CA, pred_C, pred_O], dim=2)  # [B, N, 4, 3]
+        pred_all_atoms = pred_backbone_4.reshape(B, -1, 3)  # [B, N*4, 3]
         loss_clash = clash_penalty(pred_all_atoms, clash_threshold=2.0)  # 主链原子最小距离~2.0Å
         
         # 组合损失
