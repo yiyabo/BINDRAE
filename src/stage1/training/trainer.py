@@ -169,10 +169,39 @@ class Stage1Trainer:
         pred_R = rigids_final.get_rots().get_rot_mats()  # [B, N, 3, 3]
         pred_t = pred_CA
         
-        # 真实帧（简化：单位旋转）
+        # 构建真实帧（从真实N, CA, C）- 符合理论要求
         B, N = batch.Ca.shape[:2]
-        true_R = torch.eye(3, device=self.device).unsqueeze(0).unsqueeze(0).expand(B, N, -1, -1)
-        true_t = true_CA
+        
+        # 使用FlashIPA的Rigid.from_3_points构建真实帧
+        # 需要逐残基构建
+        true_frames_list = []
+        for i in range(N):
+            # 每个batch的第i个残基
+            N_i = true_N[:, i, :]  # [B, 3]
+            CA_i = true_CA[:, i, :]
+            C_i = true_C[:, i, :]
+            
+            # 构建局部坐标系（简化：用向量叉积）
+            # x轴: CA → C
+            x_axis = C_i - CA_i  # [B, 3]
+            x_axis = x_axis / (torch.norm(x_axis, dim=-1, keepdim=True) + 1e-8)
+            
+            # y轴: 垂直于(CA-N)和x_axis
+            v = N_i - CA_i
+            v_proj = v - torch.sum(v * x_axis, dim=-1, keepdim=True) * x_axis
+            y_axis = v_proj / (torch.norm(v_proj, dim=-1, keepdim=True) + 1e-8)
+            
+            # z轴: x × y
+            z_axis = torch.cross(x_axis, y_axis, dim=-1)
+            
+            # 旋转矩阵: [B, 3, 3]
+            R_i = torch.stack([x_axis, y_axis, z_axis], dim=-1)
+            
+            true_frames_list.append((R_i, CA_i))
+        
+        # 合并为[B, N, 3, 3]和[B, N, 3]
+        true_R = torch.stack([f[0] for f in true_frames_list], dim=1)
+        true_t = torch.stack([f[1] for f in true_frames_list], dim=1)
         
         loss_fape = fape_loss(
             pred_backbone,  # [B, N, 3, 3] - fape_loss会自动处理4维输入
