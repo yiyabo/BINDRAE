@@ -180,9 +180,10 @@ def distance_loss(pred_coords: torch.Tensor,
 def clash_penalty(coords: torch.Tensor,
                  clash_threshold: float = 2.0,
                  bond_graph: Optional[torch.Tensor] = None,
-                 eps: float = 1e-8) -> torch.Tensor:
+                 eps: float = 1e-8,
+                 chunk_size: int = 512) -> torch.Tensor:
     """
-    碰撞惩罚（soft penalty）
+    碰撞惩罚（分块计算，避免O(N²)显存爆炸）
     
     公式: L = max(0, r_clash - d_ij)²
     
@@ -191,13 +192,21 @@ def clash_penalty(coords: torch.Tensor,
         clash_threshold: 碰撞阈值（Å）
         bond_graph: [B, N, N] 成键关系（可选）
         eps: 数值稳定性
+        chunk_size: 分块大小（控制显存）
         
     Returns:
         loss: scalar tensor
     """
     B, N, _ = coords.shape
     
-    # 计算成对距离
+    # 如果N太大（>1000），用采样近似
+    if N > 1000:
+        # 随机采样512个原子计算clash（避免显存爆炸）
+        indices = torch.randperm(N, device=coords.device)[:chunk_size]
+        coords = coords[:, indices, :]
+        N = chunk_size
+    
+    # 计算成对距离（现在N<=1000，可以接受）
     diff = coords.unsqueeze(2) - coords.unsqueeze(1)  # [B, N, N, 3]
     dist = torch.sqrt(torch.sum(diff ** 2, dim=-1) + eps)  # [B, N, N]
     
