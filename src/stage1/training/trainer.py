@@ -141,33 +141,51 @@ class Stage1Trainer:
             w_res_warmed
         )
         
-        # 2. 提取IPA预测的Cα坐标
+        # 2. 提取FK重建的坐标
+        atom14_pos = outputs['atom14_pos']  # [B, N, 14, 3]
+        atom14_mask = outputs['atom14_mask']  # [B, N, 14]
+        
+        # 提取主链4原子（N, CA, C, O）
+        pred_N = atom14_pos[:, :, 0]   # [B, N, 3]
+        pred_CA = atom14_pos[:, :, 1]
+        pred_C = atom14_pos[:, :, 2]
+        pred_O = atom14_pos[:, :, 3]
+        
+        # 真实坐标
+        true_N = batch.N
+        true_CA = batch.Ca
+        true_C = batch.C
+        
+        # 3. Cα距离损失（使用FK重建的CA）
+        loss_dist = distance_loss(pred_CA, true_CA, w_res_warmed)
+        
+        # 4. FAPE损失（使用主链4原子）
+        # 预测坐标：[B, N, 4, 3]
+        pred_backbone = torch.stack([pred_N, pred_CA, pred_C, pred_O], dim=2)
+        true_backbone = torch.stack([true_N, true_CA, true_C], dim=2)  # 只用N,CA,C（O可能缺失）
+        
+        # 提取帧
         rigids_final = outputs['rigids_final']
-        pred_Ca = rigids_final.get_trans()  # [B, N, 3] - IPA更新后的Cα位置
-        true_Ca = batch.Ca
-        
-        # 3. Cα距离损失（预测 vs 真实）
-        loss_dist = distance_loss(pred_Ca, true_Ca, w_res_warmed)
-        
-        # 4. FAPE损失（预测帧 vs 真实帧）
         pred_R = rigids_final.get_rots().get_rot_mats()  # [B, N, 3, 3]
-        pred_t = pred_Ca
+        pred_t = pred_CA
         
-        # 真实帧（从N, Ca, C构建）
+        # 真实帧（简化：单位旋转）
         B, N = batch.Ca.shape[:2]
         true_R = torch.eye(3, device=self.device).unsqueeze(0).unsqueeze(0).expand(B, N, -1, -1)
-        true_t = true_Ca
+        true_t = true_CA
         
         loss_fape = fape_loss(
-            pred_Ca,   # 预测Cα
-            true_Ca,   # 真实Cα
+            pred_backbone.reshape(B, -1, 3),  # [B, N*4, 3]
+            true_backbone.reshape(B, -1, 3),  # [B, N*3, 3]
             (pred_R, pred_t),
             (true_R, true_t),
             w_res_warmed
         )
         
-        # 5. Clash惩罚（用Cα坐标简化计算）
-        loss_clash = clash_penalty(pred_Ca, clash_threshold=3.8)  # Cα最小距离~3.8Å
+        # 5. Clash惩罚（使用主链4原子）
+        # 展平为[B, N*4, 3]
+        pred_all_atoms = pred_backbone.reshape(B, -1, 3)
+        loss_clash = clash_penalty(pred_all_atoms, clash_threshold=2.0)  # 主链原子最小距离~2.0Å
         
         # 组合损失
         total_loss = (
