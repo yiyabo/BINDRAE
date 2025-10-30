@@ -29,6 +29,7 @@ from .ligand_condition import LigandConditioner, LigandConditionerConfig
 from .torsion_head import TorsionHead
 from .fk_openfold import OpenFoldFK, create_openfold_fk
 from ..modules.edge_embed import EdgeEmbedderAdapter, ProjectEdgeConfig
+from ..data.residue_constants import restype_order
 
 
 # ============================================================================
@@ -141,6 +142,29 @@ class Stage1Model(nn.Module):
         print(f"  - 总参数量: {sum(p.numel() for p in self.parameters()):,}")
         print(f"  - 包含FK模块（OpenFold式）")
     
+    def _sequence_to_aatype(self, sequences: List[str], max_len: int, device) -> torch.Tensor:
+        """
+        将氨基酸序列转换为aatype索引
+        
+        Args:
+            sequences: List[氨基酸序列（单字母）]
+            max_len: 最大长度（用于padding）
+            device: 设备
+            
+        Returns:
+            aatype: [B, N] 残基类型索引(0-19, 20=UNK)
+        """
+        B = len(sequences)
+        aatype = torch.zeros(B, max_len, dtype=torch.long, device=device)
+        
+        for i, seq in enumerate(sequences):
+            for j, aa in enumerate(seq):
+                if j >= max_len:
+                    break
+                aatype[i, j] = restype_order.get(aa, 20)  # 20=UNK
+        
+        return aatype
+    
     def forward(self,
                 batch: 'IPABatch',
                 current_step: int = 0) -> Dict[str, torch.Tensor]:
@@ -192,9 +216,8 @@ class Stage1Model(nn.Module):
         pred_torsions = self.torsion_head(s_cond)  # [B, N, 7, 2]
         
         # 7. FK重建全原子坐标
-        # 创建残基类型（暂时全部用ALA=0）
-        # TODO: 从数据集获取真实残基类型
-        aatype = torch.zeros(B, N, dtype=torch.long, device=device)
+        # 将序列转换为aatype索引
+        aatype = self._sequence_to_aatype(batch.sequences, N, device)
         
         atom14_result = self.fk_module(pred_torsions, rigids_updated, aatype)
         
