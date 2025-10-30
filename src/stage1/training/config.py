@@ -48,7 +48,7 @@ class TrainingConfig:
     log_interval: int = 10  # 每几个step记录一次
     
     # 设备
-    device: str = 'cuda'
+    device: str = 'cuda:1'
     mixed_precision: bool = True  # fp16混合精度
     
     # 其他
