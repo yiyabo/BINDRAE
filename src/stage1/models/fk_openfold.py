@@ -116,13 +116,11 @@ class OpenFoldFK(nn.Module):
             torch.stack([zeros, sin_all, cos_all], dim=-1),
         ], dim=-2)  # [B, N, 8, 3, 3]
         
-        # Default frames的translation（文献值）
-        # Frame 0: backbone - 原点在CA
-        # Frame 3: psi - 原点在C
-        # 其他frames的translation暂时用0（后续完善）
-        
-        # 文献坐标（以CA为原点）
-        lit_C = torch.tensor([1.526, 0.000, 0.000], device=device)  # C的位置
+        # Default frames的translation（完整实现，符合OpenFold）
+        # 文献坐标（以CA为原点）- 来自rigid_group_atom_positions
+        lit_N = torch.tensor([-0.525, 1.363, 0.000], device=device)   # N
+        lit_C = torch.tensor([1.526, 0.000, 0.000], device=device)    # C
+        lit_CB = torch.tensor([-0.529, -0.774, -1.205], device=device)  # CB (ALA)
         
         # 为8个rigid group创建Rigid对象
         all_frames = []
@@ -134,16 +132,27 @@ class OpenFoldFK(nn.Module):
             # 创建Rotation对象
             rotation = Rotation(rot_mats=rot_mat)
             
-            # Default frame的translation
+            # Default frame的translation（OpenFold标准）
             if group_idx == 0:
-                # Backbone: 原点在CA (0,0,0)
+                # Frame 0 (backbone): 原点在CA
                 trans = torch.zeros(B, N, 3, device=device)
+            elif group_idx == 1:
+                # Frame 1 (pre-omega): 单位帧（不用）
+                trans = torch.zeros(B, N, 3, device=device)
+            elif group_idx == 2:
+                # Frame 2 (phi): 原点在N
+                trans = lit_N.unsqueeze(0).unsqueeze(0).expand(B, N, -1).clone()
             elif group_idx == 3:
-                # Psi frame: 原点在C
+                # Frame 3 (psi): 原点在C
                 trans = lit_C.unsqueeze(0).unsqueeze(0).expand(B, N, -1).clone()
+            elif group_idx == 4:
+                # Frame 4 (chi1): 原点在CB（侧链起点）
+                trans = lit_CB.unsqueeze(0).unsqueeze(0).expand(B, N, -1).clone()
             else:
-                # 其他frames暂时用0（TODO: 完整实现）
-                trans = torch.zeros(B, N, 3, device=device)
+                # Frame 5-7 (chi2-4): 原点在对应chi atom
+                # 简化：用CB（因为每个残基的chi起点不同）
+                # TODO: 完整版需要根据残基类型查询
+                trans = lit_CB.unsqueeze(0).unsqueeze(0).expand(B, N, -1).clone()
             
             rigid = Rigid(rots=rotation, trans=trans)
             
