@@ -223,52 +223,58 @@ class BackboneBuilder(nn.Module):
         )
         
         # 迭代构建后续残基
+        # 标准蛋白质Z-matrix构建顺序
         for i in range(1, N):
             phi_i = phi[:, i]
             psi_i = psi[:, i]
             omega_i = omega[:, i]
             
-            # 1. 构建N[i]：从 C[i-1]-N[i-1]-CA[i-1] 通过omega放置
-            # Z-matrix: (CA[i-1], C[i-1], N[i-1]) + omega → N[i]
-            N_coords[:, i] = place_atom_nerf(
-                CA_coords[:, i-1],   # p1
-                C_coords[:, i-1],    # p2  
-                N_coords[:, i-1] if i > 1 else C_coords[:, i-1],  # p3（第1次用C占位）
-                self.C_N_length,
-                self.CA_C_N_angle,
-                omega_i
-            )
+            # 1. N[i]: 从C[i-1]延伸
+            # 参考原子: (CA[i-1], C[i-1]) 
+            # 二面角omega定义: CA[i-1]-C[i-1]-N[i]-CA[i]
+            if i == 1:
+                # 第一次特殊处理
+                N_coords[:, i] = C_coords[:, i-1] + torch.tensor([self.C_N_length, 0, 0], device=device)
+            else:
+                N_coords[:, i] = place_atom_nerf(
+                    CA_coords[:, i-1],  # p1
+                    C_coords[:, i-1],   # p2（连接点）
+                    N_coords[:, i-1],   # p3（用于定义二面角）
+                    self.C_N_length,
+                    self.CA_C_N_angle,
+                    omega[:, i-1]  # 注意：omega[i-1]定义的是C[i-1]-N[i]键
+                )
             
-            # 2. 构建CA[i]：从 C[i-1]-N[i]-CA[i-1] 通过phi放置
-            # Z-matrix: (C[i-1], N[i], CA[i-1]) + phi → CA[i]
+            # 2. CA[i]: 从N[i]延伸
+            # 二面角phi定义: C[i-1]-N[i]-CA[i]-C[i]
             CA_coords[:, i] = place_atom_nerf(
-                C_coords[:, i-1],    # p1
-                N_coords[:, i],      # p2
-                CA_coords[:, i-1],   # p3
+                C_coords[:, i-1],   # p1
+                N_coords[:, i],     # p2（连接点）
+                C_coords[:, i-1] if i == 1 else CA_coords[:, i-1],  # p3（定义平面）
                 self.N_CA_length,
                 self.C_N_CA_angle,
                 phi_i
             )
             
-            # 3. 构建C[i]：从 N[i]-CA[i]-C[i-1] 通过psi放置
-            # Z-matrix: (N[i], CA[i], C[i-1]) + psi → C[i]
+            # 3. C[i]: 从CA[i]延伸  
+            # 二面角psi定义: N[i]-CA[i]-C[i]-N[i+1]
             C_coords[:, i] = place_atom_nerf(
-                N_coords[:, i],      # p1
-                CA_coords[:, i],     # p2
-                C_coords[:, i-1],    # p3
+                N_coords[:, i],     # p1
+                CA_coords[:, i],    # p2（连接点）
+                N_coords[:, i],     # p3（定义平面）
                 self.CA_C_length,
                 self.N_CA_C_angle,
                 psi_i
             )
             
-            # 4. 构建O[i]：从 CA[i]-C[i]-N[i] 放置
+            # 4. O[i]: 从C[i]延伸（固定位置）
             O_coords[:, i] = place_atom_nerf(
-                CA_coords[:, i],     # p1
-                C_coords[:, i],      # p2
-                N_coords[:, i],      # p3（占位）
+                N_coords[:, i],      # p1
+                CA_coords[:, i],     # p2
+                C_coords[:, i],      # p3（连接点）
                 self.C_O_length,
                 self.CA_C_O_angle,
-                torch.zeros_like(psi_i)  # O的位置相对固定
+                torch.tensor(0.0, device=device)  # 固定在平面上
             )
         
         return {
