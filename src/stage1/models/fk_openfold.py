@@ -134,29 +134,45 @@ class OpenFoldFK(nn.Module):
         """
         从8个刚体帧生成atom14坐标
         
-        Args:
-            all_frames: List[Rigid] 长度8
-            aatype: [B, N] 残基类型
-            
-        Returns:
-            atom14坐标和掩码
+        最小可工作版本：
+        - 只返回主链4原子（N, CA, C, O）
+        - 使用文献固定坐标
+        - 保证键长正确
         """
         B, N = aatype.shape
         device = aatype.device
         
-        # 占位：返回主链4原子（N, CA, C, O）
-        # 从backbone帧提取坐标
-        backbone_frame = all_frames[0]
+        backbone_frame = all_frames[0]  # 只用backbone帧
+        psi_frame = all_frames[3]  # psi帧（O在这里）
         
-        # 简化：只返回CA坐标（从backbone_frame.trans）
-        ca_coords = backbone_frame.get_trans()  # [B, N, 3]
+        # 主链4原子的文献坐标（以CA为原点的局部坐标）
+        # 来自rigid_group_atom_positions，所有残基的主链坐标很接近
         
-        # 构建atom14（占位：只填CA）
+        # 使用ALA的文献坐标作为默认（主链几何类似）
+        lit_N = torch.tensor([-0.525, 1.363, 0.000], device=device)   # N
+        lit_CA = torch.tensor([0.000, 0.000, 0.000], device=device)   # CA (原点)
+        lit_C = torch.tensor([1.526, 0.000, 0.000], device=device)    # C
+        lit_O_local = torch.tensor([0.627, 1.062, 0.000], device=device)  # O在psi帧
+        
+        # 应用backbone帧变换：local → global
+        # [B, N, 3]
+        N_global = backbone_frame.apply(lit_N.unsqueeze(0).unsqueeze(0).expand(B, N, -1))
+        CA_global = backbone_frame.apply(lit_CA.unsqueeze(0).unsqueeze(0).expand(B, N, -1))
+        C_global = backbone_frame.apply(lit_C.unsqueeze(0).unsqueeze(0).expand(B, N, -1))
+        
+        # O需要用psi帧
+        O_global = psi_frame.apply(lit_O_local.unsqueeze(0).unsqueeze(0).expand(B, N, -1))
+        
+        # 构建atom14
+        # Atom14索引: 0=N, 1=CA, 2=C, 3=O, 4=CB, ...
         atom14_pos = torch.zeros(B, N, 14, 3, device=device)
-        atom14_pos[:, :, 1] = ca_coords  # atom14索引1是CA
+        atom14_pos[:, :, 0] = N_global
+        atom14_pos[:, :, 1] = CA_global
+        atom14_pos[:, :, 2] = C_global
+        atom14_pos[:, :, 3] = O_global
         
         atom14_mask = torch.zeros(B, N, 14, device=device)
-        atom14_mask[:, :, 1] = 1.0  # 只有CA有效
+        atom14_mask[:, :, :4] = 1.0  # N, CA, C, O都有效
         
         return {
             'atom14_pos': atom14_pos,
