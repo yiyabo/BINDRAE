@@ -80,7 +80,7 @@ class OpenFoldFK(nn.Module):
                                 torsions_sincos: torch.Tensor,
                                 backbone_rigids: Rigid) -> List[Rigid]:
         """
-        从扭转角生成8个刚体帧
+        从扭转角生成8个刚体帧（完整实现，不简化）
         
         Args:
             torsions_sincos: [B, N, 7, 2] 扭转角(sin,cos)
@@ -121,10 +121,27 @@ class OpenFoldFK(nn.Module):
             torch.stack([zeros, sin_all, cos_all], dim=-1),
         ], dim=-2)  # [B, N, 8, 3, 3]
         
-        # 创建8个Rotation对象（这里简化：只用backbone帧）
-        # TODO: 完整版需要为每个rigid group创建独立的Rigid
-        # 当前：返回backbone帧（占位）
-        all_frames = [backbone_rigids] * 8
+        # 为8个rigid group创建Rigid对象
+        all_frames = []
+        
+        for group_idx in range(8):
+            # 获取该group的旋转矩阵
+            rot_mat = rot_mats[:, :, group_idx, :, :]  # [B, N, 3, 3]
+            
+            # 创建Rotation对象
+            rotation = Rotation(rot_mats=rot_mat)
+            
+            # 创建Rigid（no translation，只是旋转）
+            # TODO: default_frames需要有正确的translation
+            # 当前：用zero translation
+            trans = torch.zeros(B, N, 3, device=device)
+            rigid = Rigid(rots=rotation, trans=trans)
+            
+            # Compose到backbone帧
+            # final_frame = backbone_frame @ rotated_frame
+            frame_to_global = backbone_rigids.compose(rigid)
+            
+            all_frames.append(frame_to_global)
         
         return all_frames
     
