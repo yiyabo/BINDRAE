@@ -263,3 +263,100 @@ rigid_group_atom_positions = {
     ],
 }
 
+# Atom14名称映射（每个残基最多14个重原子）
+restype_name_to_atom14_names = {
+    "ALA": ["N", "CA", "C", "O", "CB", "", "", "", "", "", "", "", "", ""],
+    "ARG": ["N", "CA", "C", "O", "CB", "CG", "CD", "NE", "CZ", "NH1", "NH2", "", "", ""],
+    "ASN": ["N", "CA", "C", "O", "CB", "CG", "OD1", "ND2", "", "", "", "", "", ""],
+    "ASP": ["N", "CA", "C", "O", "CB", "CG", "OD1", "OD2", "", "", "", "", "", ""],
+    "CYS": ["N", "CA", "C", "O", "CB", "SG", "", "", "", "", "", "", "", ""],
+    "GLN": ["N", "CA", "C", "O", "CB", "CG", "CD", "OE1", "NE2", "", "", "", "", ""],
+    "GLU": ["N", "CA", "C", "O", "CB", "CG", "CD", "OE1", "OE2", "", "", "", "", ""],
+    "GLY": ["N", "CA", "C", "O", "", "", "", "", "", "", "", "", "", ""],
+    "HIS": ["N", "CA", "C", "O", "CB", "CG", "ND1", "CD2", "CE1", "NE2", "", "", "", ""],
+    "ILE": ["N", "CA", "C", "O", "CB", "CG1", "CG2", "CD1", "", "", "", "", "", ""],
+    "LEU": ["N", "CA", "C", "O", "CB", "CG", "CD1", "CD2", "", "", "", "", "", ""],
+    "LYS": ["N", "CA", "C", "O", "CB", "CG", "CD", "CE", "NZ", "", "", "", "", ""],
+    "MET": ["N", "CA", "C", "O", "CB", "CG", "SD", "CE", "", "", "", "", "", ""],
+    "PHE": ["N", "CA", "C", "O", "CB", "CG", "CD1", "CD2", "CE1", "CE2", "CZ", "", "", ""],
+    "PRO": ["N", "CA", "C", "O", "CB", "CG", "CD", "", "", "", "", "", "", ""],
+    "SER": ["N", "CA", "C", "O", "CB", "OG", "", "", "", "", "", "", "", ""],
+    "THR": ["N", "CA", "C", "O", "CB", "OG1", "CG2", "", "", "", "", "", "", ""],
+    "TRP": ["N", "CA", "C", "O", "CB", "CG", "CD1", "CD2", "NE1", "CE2", "CE3", "CZ2", "CZ3", "CH2"],
+    "TYR": ["N", "CA", "C", "O", "CB", "CG", "CD1", "CD2", "CE1", "CE2", "CZ", "OH", "", ""],
+    "VAL": ["N", "CA", "C", "O", "CB", "CG1", "CG2", "", "", "", "", "", "", ""],
+}
+
+# 残基类型顺序（对应索引0-19）
+restype_order = {
+    'A': 0, 'R': 1, 'N': 2, 'D': 3, 'C': 4,
+    'Q': 5, 'E': 6, 'G': 7, 'H': 8, 'I': 9,
+    'L': 10, 'K': 11, 'M': 12, 'F': 13, 'P': 14,
+    'S': 15, 'T': 16, 'W': 17, 'Y': 18, 'V': 19,
+}
+
+# 每个原子属于哪个rigid group
+# 0=backbone, 3=psi, 4=chi1, 5=chi2, 6=chi3, 7=chi4
+restype_atom14_to_rigid_group = {
+    "ALA": [0, 0, 0, 3, 0, -1, -1, -1, -1, -1, -1, -1, -1, -1],
+    "ARG": [0, 0, 0, 3, 0, 4, 5, 6, 7, 7, 7, -1, -1, -1],
+    "ASN": [0, 0, 0, 3, 0, 4, 5, 5, -1, -1, -1, -1, -1, -1],
+    "ASP": [0, 0, 0, 3, 0, 4, 5, 5, -1, -1, -1, -1, -1, -1],
+    "CYS": [0, 0, 0, 3, 0, 4, -1, -1, -1, -1, -1, -1, -1, -1],
+    "GLN": [0, 0, 0, 3, 0, 4, 5, 6, 6, -1, -1, -1, -1, -1],
+    "GLU": [0, 0, 0, 3, 0, 4, 5, 6, 6, -1, -1, -1, -1, -1],
+    "GLY": [0, 0, 0, 3, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
+    "HIS": [0, 0, 0, 3, 0, 4, 5, 5, 5, 5, -1, -1, -1, -1],
+    "ILE": [0, 0, 0, 3, 0, 4, 4, 5, -1, -1, -1, -1, -1, -1],
+    "LEU": [0, 0, 0, 3, 0, 4, 5, 5, -1, -1, -1, -1, -1, -1],
+    "LYS": [0, 0, 0, 3, 0, 4, 5, 6, 7, -1, -1, -1, -1, -1],
+    "MET": [0, 0, 0, 3, 0, 4, 5, 6, -1, -1, -1, -1, -1, -1],
+    "PHE": [0, 0, 0, 3, 0, 4, 5, 5, 5, 5, 5, -1, -1, -1],
+    "PRO": [0, 0, 0, 3, 0, 4, 5, -1, -1, -1, -1, -1, -1, -1],
+    "SER": [0, 0, 0, 3, 0, 4, -1, -1, -1, -1, -1, -1, -1, -1],
+    "THR": [0, 0, 0, 3, 0, 4, 4, -1, -1, -1, -1, -1, -1, -1],
+    "TRP": [0, 0, 0, 3, 0, 4, 5, 5, 5, 5, 5, 5, 5, 5],
+    "TYR": [0, 0, 0, 3, 0, 4, 5, 5, 5, 5, 5, 5, -1, -1],
+    "VAL": [0, 0, 0, 3, 0, 4, 4, -1, -1, -1, -1, -1, -1, -1],
+}
+
+def build_atom14_constants():
+    """
+    构建atom14常量张量
+    
+    Returns:
+        {
+            'restype_atom14_positions': [21, 14, 3] 每种残基的atom14局部坐标
+            'restype_atom14_to_group': [21, 14] 每个atom属于哪个rigid group
+            'restype_atom14_mask': [21, 14] 每个atom是否存在
+        }
+    """
+    import numpy as np
+    
+    restype_atom14_positions = np.zeros([21, 14, 3], dtype=np.float32)
+    restype_atom14_to_group = np.zeros([21, 14], dtype=np.int64)
+    restype_atom14_mask = np.zeros([21, 14], dtype=np.float32)
+    
+    # 填充20种氨基酸的数据
+    for restype_idx, (restype_letter, resname) in enumerate(restype_1to3.items()):
+        atom_list = restype_name_to_atom14_names[resname]
+        group_list = restype_atom14_to_rigid_group[resname]
+        
+        # 从rigid_group_atom_positions查找坐标
+        atom_pos_dict = {atom_name: pos for atom_name, _, pos in rigid_group_atom_positions[resname]}
+        
+        for atom14_idx, (atom_name, group_idx) in enumerate(zip(atom_list, group_list)):
+            if atom_name and group_idx >= 0:
+                restype_atom14_mask[restype_idx, atom14_idx] = 1.0
+                restype_atom14_to_group[restype_idx, atom14_idx] = group_idx
+                if atom_name in atom_pos_dict:
+                    restype_atom14_positions[restype_idx, atom14_idx] = atom_pos_dict[atom_name]
+    
+    # UNK残基（索引20）- 全0
+    
+    return {
+        'restype_atom14_positions': restype_atom14_positions,
+        'restype_atom14_to_group': restype_atom14_to_group,
+        'restype_atom14_mask': restype_atom14_mask,
+    }
+
