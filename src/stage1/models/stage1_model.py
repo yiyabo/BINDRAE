@@ -213,8 +213,8 @@ class Stage1Model(nn.Module):
         # 5. FlashIPA（几何分支，已包含配体信息）
         s_geo, rigids_updated = self.ipa_module(s_with_ligand, rigids, z_f1, z_f2, batch.node_mask)
         
-        # 6. TorsionHead
-        pred_torsions = self.torsion_head(s_cond)  # [B, N, 7, 2]
+        # 6. TorsionHead（使用IPA输出）
+        pred_torsions = self.torsion_head(s_geo)  # [B, N, 7, 2]
         
         # 7. FK重建全原子坐标
         # 将序列转换为aatype索引
@@ -224,7 +224,7 @@ class Stage1Model(nn.Module):
         
         return {
             'pred_torsions': pred_torsions,
-            's_final': s_cond,
+            's_final': s_geo,  # IPA输出（已含配体信息）
             'rigids_final': rigids_updated,
             'atom14_pos': atom14_result['atom14_pos'],      # [B, N, 14, 3]
             'atom14_mask': atom14_result['atom14_mask'],    # [B, N, 14]
