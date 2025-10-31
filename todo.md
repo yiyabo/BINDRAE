@@ -857,8 +857,12 @@ save_top_k = 3
 - **代码行数**: ~7000行
 - **模型参数**: 11.4M
 - **测试脚本**: 15个（全部通过）
-- **文档**: FlashIPA_USAGE.md, CLASH_ABLATION.md
-- **消融实验**: Clash方法对比（采样vs完整）
+- **文档**: 
+  - FlashIPA_USAGE.md（技术实现）
+  - FlashIPA_EXPLAINED.md（通俗解释）
+  - LIGAND_PROBES_EXPLAINED.md（配体探针原理）
+  - CLASH_ABLATION.md（消融实验）
+- **消融实验**: Clash方法对比（采样vs完整，χ1=71% vs 70%）
 
 ### 🎯 最终性能（实验验证）
 - **χ1准确率**: 71.1% > 目标70% ⭐
