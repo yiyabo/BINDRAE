@@ -122,8 +122,9 @@ class BackboneUpdateHead(nn.Module):
     
     def _init_weights(self):
         """权重初始化"""
-        # 最后一层小初始化
-        nn.init.zeros_(self.net[-1].weight)
+        # 最后一层初始化（需要让rigids有合理幅度的更新）
+        # std=0.1: 初期约0.1-1 Å的更新幅度，会被clip到≤1.5Å
+        nn.init.normal_(self.net[-1].weight, mean=0.0, std=0.1)
         nn.init.zeros_(self.net[-1].bias)
     
     def forward(self, s: torch.Tensor) -> torch.Tensor:

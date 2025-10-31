@@ -23,6 +23,16 @@ from .rigid_utils import (
     clip_rotation_matrix,
 )
 
+# 评估指标
+from .metrics import (
+    compute_pocket_irmsd,
+    compute_chi1_accuracy,
+    compute_clash_percentage,
+    compute_fape,
+    kabsch_align,
+    compute_rmsd,
+)
+
 __all__ = [
     # 配体工具
     'LigandTokenBuilder',
@@ -39,4 +49,11 @@ __all__ = [
     'add_rigid_noise',
     'build_backbone_frames',
     'clip_rotation_matrix',
+    # 评估指标
+    'compute_pocket_irmsd',
+    'compute_chi1_accuracy',
+    'compute_clash_percentage',
+    'compute_fape',
+    'kabsch_align',
+    'compute_rmsd',
 ]

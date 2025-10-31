@@ -21,9 +21,13 @@ import warnings
 warnings.filterwarnings('ignore')
 
 try:
-    from rdkit import Chem, RDConfig
+    from rdkit import Chem, RDConfig, RDLogger
     from rdkit.Chem import AllChem, Descriptors, ChemicalFeatures
     import os
+    
+    # 关闭RDKit所有警告（避免训练时刷屏）
+    RDLogger.DisableLog('rdApp.*')
+    
     RDKIT_AVAILABLE = True
 except ImportError:
     RDKIT_AVAILABLE = False
