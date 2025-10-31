@@ -1,5 +1,8 @@
 # FlashIPA 使用文档
 
+> 💡 **快速理解FlashIPA**：完整的通俗解释见 [`/docs/FlashIPA_EXPLAINED.md`](../../../docs/FlashIPA_EXPLAINED.md)  
+> 本文档侧重技术实现细节和API使用方法
+
 ## 概述
 
 本项目使用 **FlashIPA 原生实现**（EdgeEmbedder + InvariantPointAttention），通过适配器层提供简化接口。
