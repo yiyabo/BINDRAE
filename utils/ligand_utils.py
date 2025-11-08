@@ -170,17 +170,24 @@ class LigandTokenBuilder:
         if mol is None or not RDKIT_AVAILABLE:
             return info
         
-        # 提取原子信息（只处理前 n_atoms 个）
+        # 严格的数据一致性校验
         mol_n_atoms = mol.GetNumAtoms()
         if mol_n_atoms != n_atoms:
-            # 分子原子数与坐标不匹配，只取最小值
-            import warnings
-            warnings.warn(f"Molecule has {mol_n_atoms} atoms but coords have {n_atoms}. Using min={min(mol_n_atoms, n_atoms)}")
-            process_n = min(mol_n_atoms, n_atoms)
-        else:
-            process_n = n_atoms
-        
-        for i in range(process_n):
+            # 严重错误：分子和坐标数量不匹配
+            raise ValueError(
+                f"🚨 严重数据不一致！\n"
+                f"RDKit解析分子: {mol_n_atoms}个原子\n"
+                f"坐标文件: {n_atoms}个原子\n"
+                f"差值: {abs(mol_n_atoms - n_atoms)}个原子\n"
+                f"这表明数据预处理存在问题，请检查:\n"
+                f"1. SDF文件是否包含氢原子\n"
+                f"2. 坐标文件是否正确生成\n"
+                f"3. 分子标准化是否正确执行\n"
+                f"📍 数据来源: 请检查数据预处理脚本"
+            )
+
+        # 数据一致性验证通过，安全提取原子信息
+        for i in range(n_atoms):
             atom = mol.GetAtomWithIdx(i)
             info['elements'][i] = atom.GetSymbol()
             info['aromatic'][i] = atom.GetIsAromatic()
