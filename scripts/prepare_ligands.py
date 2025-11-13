@@ -59,8 +59,38 @@ class LigandProcessor:
             if mol is None:
                 return None
             
-            # 去除氢原子
-            mol = Chem.RemoveHs(mol, sanitize=False)
+            # ✅ 保留极性氢（O-H, N-H, S-H），只移除非极性氢（C-H）
+            # 极性氢是功能性关键，参与氢键形成，应该保留真实位置
+            # 这与蛋白质处理一致（蛋白质也保留极性氢）
+            # 
+            # RDKit参数说明：
+            # - implicitOnly=True: 只移除隐式氢（保留显式氢）
+            # - updateExplicitCount=False: 不更新显式氢计数
+            # 但这还不够，需要先添加极性氢，再选择性移除
+            
+            # 方案：先添加所有氢，再只移除非极性氢
+            mol = Chem.AddHs(mol, addCoords=True)  # 添加所有氢（带坐标）
+            
+            # 移除非极性氢（只保留 N-H, O-H, S-H）
+            atoms_to_remove = []
+            for atom in mol.GetAtoms():
+                if atom.GetSymbol() == 'H':
+                    # 检查氢连接的原子
+                    neighbors = atom.GetNeighbors()
+                    if len(neighbors) == 1:
+                        neighbor_symbol = neighbors[0].GetSymbol()
+                        # 只保留极性氢（N-H, O-H, S-H）
+                        if neighbor_symbol not in ['N', 'O', 'S']:
+                            atoms_to_remove.append(atom.GetIdx())
+            
+            # 批量移除非极性氢
+            if atoms_to_remove:
+                # 需要从后往前删除（避免索引变化）
+                atoms_to_remove.sort(reverse=True)
+                editable_mol = Chem.RWMol(mol)
+                for idx in atoms_to_remove:
+                    editable_mol.RemoveAtom(idx)
+                mol = editable_mol.GetMol()
             
             # 尝试标准化价态（使用部分标准化，容忍错误）
             try:
@@ -100,22 +130,25 @@ class LigandProcessor:
     
     def extract_heavy_atoms_coords(self, mol: Chem.Mol) -> np.ndarray:
         """
-        提取重原子坐标
+        提取重原子+极性氢的坐标
+        
+        ⚠️ 注意：此处"重原子"实际包含极性氢（O-H, N-H, S-H）
+        原因：极性氢是功能性关键，参与氢键形成，必须保留
         
         Args:
-            mol: RDKit 分子对象
+            mol: RDKit 分子对象（已通过RemoveHs移除非极性氢）
             
         Returns:
-            重原子坐标数组，形状 (N_atoms, 3)
+            坐标数组，形状 (N_atoms, 3) - 包含重原子+极性氢
         """
         conformer = mol.GetConformer()
         coords = []
         
         for atom in mol.GetAtoms():
-            # 只保留重原子（非氢）
-            if atom.GetAtomicNum() > 1:  # 氢的原子序数是1
-                pos = conformer.GetAtomPosition(atom.GetIdx())
-                coords.append([pos.x, pos.y, pos.z])
+            # RemoveHs已移除非极性氢，这里直接提取所有剩余原子
+            # 包括：重原子(C/N/O/S/P/...) + 极性氢(N-H/O-H/S-H)
+            pos = conformer.GetAtomPosition(atom.GetIdx())
+            coords.append([pos.x, pos.y, pos.z])
         
         return np.array(coords, dtype=np.float32)
     
@@ -181,22 +214,56 @@ class LigandProcessor:
             self.stats['failed_ids'].append(pdb_id)
             return False
         
+        # ✅ 严格验证一致性（关键！）
+        if mol.GetNumAtoms() != len(coords):
+            print(f"  ❌ {pdb_id}: 原子数不一致 (mol={mol.GetNumAtoms()}, coords={len(coords)})")
+            self.stats['failed'] += 1
+            self.stats['failed_ids'].append(pdb_id)
+            return False
+        
         # 获取属性
         props = self.get_ligand_properties(mol)
         
         # 保存结果
         output_prefix = self.features_dir / pdb_id
         
-        # 保存重原子坐标
+        # 保存坐标（重原子 + 极性氢）
         np.save(f"{output_prefix}_ligand_coords.npy", coords)
         
         # 保存属性
         np.save(f"{output_prefix}_ligand_props.npy", props)
         
-        # 可选: 保存规范化后的 SDF
-        writer = Chem.SDWriter(f"{output_prefix}_ligand_normalized.sdf")
+        # 保存规范化后的 SDF
+        sdf_output = f"{output_prefix}_ligand_normalized.sdf"
+        
+        # ✅ 直接写入 - mol 保留了极性氢（N-H, O-H, S-H），移除了非极性氢
+        writer = Chem.SDWriter(sdf_output)
         writer.write(mol)
         writer.close()
+        
+        # ✅ 立即验证SDF保存后的一致性（严格模式）
+        try:
+            test_mol = Chem.SDMolSupplier(sdf_output, removeHs=False, sanitize=False)[0]
+            if test_mol is None or test_mol.GetNumAtoms() != len(coords):
+                # SDF保存后验证失败 → 整个样本失败
+                import os
+                os.remove(sdf_output)
+                os.remove(f"{output_prefix}_ligand_coords.npy")
+                os.remove(f"{output_prefix}_ligand_props.npy")
+                print(f"  ❌ {pdb_id}: SDF保存后验证失败 (mol={test_mol.GetNumAtoms() if test_mol else 'None'}, coords={len(coords)})")
+                self.stats['failed'] += 1
+                self.stats['failed_ids'].append(pdb_id)
+                return False
+        except Exception as e:
+            # 验证过程失败 → 整个样本失败
+            import os
+            for file in [sdf_output, f"{output_prefix}_ligand_coords.npy", f"{output_prefix}_ligand_props.npy"]:
+                if os.path.exists(file):
+                    os.remove(file)
+            print(f"  ❌ {pdb_id}: SDF验证异常 - {e}")
+            self.stats['failed'] += 1
+            self.stats['failed_ids'].append(pdb_id)
+            return False
         
         self.stats['success'] += 1
         

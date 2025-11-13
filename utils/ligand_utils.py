@@ -2,16 +2,26 @@
 配体 Token 构建工具
 
 功能：
-1. 从 ligand_coords.npy 提取重原子坐标
+1. 从 ligand_coords.npy 提取坐标（重原子+极性氢）
 2. RDKit 检测关键原子类型 (HBD/HBA/芳香/带电)
-3. 生成方向探针 (≤2个/原子)
+3. 生成方向探针（仅为HBA）
 4. 重要性采样 (M≤128)
-5. 12维原子类型嵌入
+5. 13维原子类型嵌入
 
-设计决策：
-- 探针：基于邻近原子的法向量
-- 采样：优先保留关键原子(HBD/HBA/带电)
-- 类型编码：12维 one-hot (C/N/O/S/P/F/Cl/Br/I/芳香/带电+/-/other)
+设计决策（方案A：保留极性氢）：
+- ✅ 保留极性氢：N-H, O-H, S-H（功能性关键，参与氢键形成）
+- ✅ 移除非极性氢：C-H（方向性弱，信息冗余）
+- ✅ HBD策略：直接使用极性氢原子位置（完全准确）
+- ✅ HBA策略：生成孤对电子方向探针（计算近似）
+- ✅ 采样：优先保留关键原子(HBD/HBA/带电)
+- ✅ 类型编码：13维 one-hot (C/N/O/S/P/F/Cl/Br/I/H/芳香/带电+/-)
+
+科研理由：
+1. 氢键是最重要的相互作用（占60-70%），高度方向性
+2. HBD的方向性 = 氢原子的真实位置，保留极性氢提供完全准确的方向信息
+3. HBA的方向性 = 孤对电子方向，需要计算探针近似
+4. 与蛋白质处理一致（蛋白质也保留极性氢）
+5. 符合项目核心创新：显式编码相互作用方向性
 """
 
 import numpy as np
@@ -38,7 +48,7 @@ except ImportError:
 # 常量定义
 # ============================================================================
 
-# 原子类型编码 (12维)
+# 原子类型编码 (13维) - 添加了氢原子类型
 ATOM_TYPE_MAPPING = {
     'C': 0,
     'N': 1,
@@ -49,9 +59,10 @@ ATOM_TYPE_MAPPING = {
     'Cl': 6,
     'Br': 7,
     'I': 8,
-    'aromatic': 9,      # 芳香原子标记
-    'positive': 10,      # 带正电
-    'negative': 11,      # 带负电
+    'H': 9,          # 极性氢 (N-H, O-H, S-H)
+    'aromatic': 10,   # 芳香原子标记
+    'positive': 11,   # 带正电
+    'negative': 12,   # 带负电
 }
 
 # 方向探针配置
@@ -89,13 +100,13 @@ class LigandTokenBuilder:
         构建配体 tokens
         
         Args:
-            ligand_coords: 重原子坐标 (N_atoms, 3)
+            ligand_coords: 坐标 (N_atoms, 3) - 包含重原子+极性氢
             ligand_mol: RDKit 分子对象 (可选，用于类型检测)
             
         Returns:
             {
-                'coords': (M, 3) - token坐标 (重原子+探针)
-                'types': (M, 12) - 原子类型 one-hot
+                'coords': (M, 3) - token坐标 (原子+探针)
+                'types': (M, 13) - 原子类型 one-hot
                 'is_probe': (M,) - 是否为探针
                 'atom_indices': (M,) - 对应的原子索引 (-1表示探针)
                 'importance': (M,) - 重要性权重
@@ -213,10 +224,15 @@ class LigandTokenBuilder:
         """
         为关键原子生成方向探针
         
-        策略：
-        - HBD/HBA: 生成1-2个探针，方向指向孤对电子/氢
-        - 芳香环: 生成垂直于环平面的探针
-        - 其他: 不生成探针
+        策略（方案A：保留极性氢）：
+        - HBD（氢键供体）: **不生成探针**，直接使用极性氢原子位置
+        - HBA（氢键受体）: 生成1-2个探针，方向指向孤对电子
+        - 芳香环: 可选，生成垂直于环平面的探针
+        
+        理由：
+        - 极性氢（N-H, O-H, S-H）已经保留在坐标中
+        - 氢原子本身就是HBD的"探针"，位置完全准确
+        - HBA的孤对电子不可见，需要计算探针方向
         
         Returns:
             probe_coords: (N_probes, 3)
@@ -228,8 +244,9 @@ class LigandTokenBuilder:
         if mol is None or not RDKIT_AVAILABLE:
             return np.array(probe_coords), np.array(probe_atom_indices, dtype=np.int32)
         
-        # 为 HBD/HBA 生成探针
-        key_atoms = set(atom_info['hbd'] + atom_info['hba'])
+        # ✅ 只为 HBA（氢键受体）生成探针
+        # HBD（氢键供体）的氢原子已经在坐标中，不需要额外探针
+        key_atoms = set(atom_info['hba'])  # 只取 HBA，不包含 HBD
         
         for atom_idx in key_atoms:
             if atom_idx >= len(coords):
@@ -316,12 +333,18 @@ class LigandTokenBuilder:
         """
         重要性采样，保留最重要的 max_tokens 个
         
-        优先级：
-        1. HBD/HBA 原子及其探针
-        2. 带电原子
-        3. 芳香原子
-        4. 其他重原子
-        5. 其他探针
+        优先级（方案A：保留极性氢）：
+        1. 极性氢（H）- 真正的 HBD，最高优先级
+        2. HBD/HBA 重原子（N, O, S）及其探针
+        3. 带电原子
+        4. 芳香原子
+        5. 其他重原子
+        6. 其他探针
+        
+        注意：
+        - info['hbd'] 存的是重原子索引（N, O, S），不是氢原子
+        - 极性氢才是真正的 HBD，必须给予最高优先级，防止被采样丢弃
+        - HBA 探针（孤对电子方向）也很重要
         
         Returns:
             keep_indices: 保留的索引
@@ -334,28 +357,37 @@ class LigandTokenBuilder:
                 # 探针：继承对应原子的重要性
                 orig_atom_idx = atom_indices[i]
                 score = 0.0
-                if orig_atom_idx in atom_info['hbd'] or orig_atom_idx in atom_info['hba']:
-                    score = 3.0  # HBD/HBA探针
+                if orig_atom_idx in atom_info['hba']:  # 只有 HBA 才有探针
+                    score = 5.0  # HBA 探针（孤对电子方向）- 高优先级
                 elif abs(atom_info['charge'][orig_atom_idx]) > 0.1:
-                    score = 2.0  # 带电原子探针
+                    score = 3.0  # 带电原子探针
                 elif atom_info['aromatic'][orig_atom_idx]:
-                    score = 1.0  # 芳香原子探针
+                    score = 2.0  # 芳香原子探针
                 else:
-                    score = 0.5  # 普通探针
+                    score = 1.0  # 普通探针
             else:
-                # 重原子
+                # 原子（包括重原子和极性氢）
                 atom_idx = atom_indices[i]
+                element = atom_info['elements'][atom_idx]
                 score = 1.0  # 基础分
                 
-                if atom_idx in atom_info['hbd'] or atom_idx in atom_info['hba']:
-                    score += 5.0  # HBD/HBA
+                # ✅ 极性氢：最高优先级（真正的 HBD）
+                if element == 'H':
+                    score += 10.0  # 极性氢必须保留！
+                
+                # HBD/HBA 重原子（N, O, S）
+                elif atom_idx in atom_info['hbd'] or atom_idx in atom_info['hba']:
+                    score += 5.0  # HBD/HBA 重原子
+                
+                # 带电原子
                 if abs(atom_info['charge'][atom_idx]) > 0.1:
                     score += 3.0  # 带电
+                
+                # 芳香原子
                 if atom_info['aromatic'][atom_idx]:
                     score += 2.0  # 芳香
                 
-                # 元素类型加分
-                element = atom_info['elements'][atom_idx]
+                # 杂原子加分（除了氢）
                 if element in ['N', 'O', 'S', 'P']:
                     score += 1.0  # 杂原子
             
@@ -373,18 +405,20 @@ class LigandTokenBuilder:
                         is_probe: np.ndarray,
                         atom_info: Dict) -> np.ndarray:
         """
-        编码原子类型为 12 维 one-hot
+        编码原子类型为 13 维 one-hot
         
-        维度：[C, N, O, S, P, F, Cl, Br, I, 芳香, 正电, 负电]
+        维度：[C, N, O, S, P, F, Cl, Br, I, H, 芳香, 正电, 负电]
         
-        注意：芳香性是叠加属性，可以与元素类型同时为1
-            例如芳香碳：types[i, 0]=1 且 types[i, 9]=1
+        注意：
+        - 芳香性/电荷是叠加属性，可以与元素类型同时为1
+        - 例如芳香碳：types[i, 0]=1 且 types[i, 10]=1
+        - 极性氢：types[i, 9]=1（保留真实位置）
         
         Returns:
-            types: (M, 12)
+            types: (M, 13)
         """
         n_tokens = len(atom_indices)
-        types = np.zeros((n_tokens, 12), dtype=np.float32)
+        types = np.zeros((n_tokens, 13), dtype=np.float32)
         
         for i in range(n_tokens):
             atom_idx = atom_indices[i]
@@ -416,6 +450,8 @@ class LigandTokenBuilder:
         """
         计算重要性权重 (用于注意力加权)
         
+        方案A：极性氢和HBA探针都应该有高权重
+        
         Returns:
             importance: (M,) 值域 [0, 1]
         """
@@ -430,9 +466,17 @@ class LigandTokenBuilder:
                 continue
             
             score = 0.5  # 基础值
+            element = atom_info['elements'][atom_idx]
             
-            if atom_idx in atom_info['hbd'] or atom_idx in atom_info['hba']:
-                score += 0.3
+            # ✅ 极性氢：高权重（真正的 HBD）
+            if element == 'H':
+                score += 0.5  # 极性氢权重 = 1.0（最大值）
+            
+            # HBD/HBA 重原子
+            elif atom_idx in atom_info['hbd'] or atom_idx in atom_info['hba']:
+                score += 0.3  # HBD/HBA 重原子权重 = 0.8
+            
+            # 带电原子
             if abs(atom_info['charge'][atom_idx]) > 0.1:
                 score += 0.2
             
@@ -465,28 +509,42 @@ def build_ligand_tokens_from_file(ligand_coords_file: Path,
     # 加载分子 (如果提供了 SDF)
     mol = None
     if ligand_sdf_file is not None and ligand_sdf_file.exists() and RDKIT_AVAILABLE:
+        # 直接加载（预处理保留了极性氢，移除了非极性氢）
+        supplier = Chem.SDMolSupplier(str(ligand_sdf_file), removeHs=False, sanitize=False)
+        mol = supplier[0]
+        
+        if mol is None:
+            raise ValueError(
+                f"❌ 无法加载配体分子: {ligand_sdf_file}\n"
+                f"这表明SDF文件损坏或格式错误。\n"
+                f"请重新运行数据预处理: python scripts/prepare_ligands.py"
+            )
+        
+        # ✅ 严格验证原子数一致性（科研代码不允许不一致）
+        if mol.GetNumAtoms() != len(coords):
+            raise ValueError(
+                f"🚨 数据不一致错误！\n"
+                f"配体: {ligand_sdf_file.stem}\n"
+                f"SDF分子: {mol.GetNumAtoms()} 个原子\n"
+                f"坐标文件: {len(coords)} 个原子\n"
+                f"差异: {abs(mol.GetNumAtoms() - len(coords))} 个原子\n\n"
+                f"这是严重的数据预处理问题，不能继续训练！\n"
+                f"解决方案:\n"
+                f"1. 验证数据: python scripts/verify_ligand_consistency.py\n"
+                f"2. 重新预处理: python scripts/prepare_ligands.py\n"
+                f"3. 确保预处理时验证通过"
+            )
+        
+        # 初始化分子信息（必需，失败则报错）
         try:
-            # 先尝试保留氢原子，如果失败再去除
-            supplier = Chem.SDMolSupplier(str(ligand_sdf_file), removeHs=False, sanitize=False)
-            mol = supplier[0]
-            if mol is not None:
-                # 去除氢原子
-                mol = Chem.RemoveHs(mol, sanitize=False)
-                # 尝试标准化（忽略失败）
-                try:
-                    Chem.SanitizeMol(mol)
-                except:
-                    # 标准化失败，手动初始化必要信息
-                    try:
-                        mol.UpdatePropertyCache(strict=False)
-                        Chem.GetSymmSSSR(mol)  # 初始化环信息
-                    except:
-                        pass  # 如果还失败就放弃
+            mol.UpdatePropertyCache(strict=False)
+            Chem.GetSymmSSSR(mol)  # 初始化环信息
         except Exception as e:
-            # 记录错误但不中断
-            import warnings
-            warnings.warn(f"Failed to load molecule from {ligand_sdf_file}: {e}")
-            mol = None
+            raise ValueError(
+                f"❌ 配体分子初始化失败: {ligand_sdf_file.stem}\n"
+                f"错误: {e}\n"
+                f"这表明分子结构有问题，请检查SDF文件。"
+            )
     
     # 构建 tokens
     builder = LigandTokenBuilder(max_tokens=max_tokens)
@@ -505,7 +563,7 @@ def encode_ligand_batch(ligand_tokens_list: List[Dict[str, np.ndarray]],
     Returns:
         {
             'coords': (B, M, 3)
-            'types': (B, M, 12)
+            'types': (B, M, 13) - 包含氢原子类型
             'mask': (B, M) - padding mask
             'importance': (B, M)
         }
@@ -513,7 +571,7 @@ def encode_ligand_batch(ligand_tokens_list: List[Dict[str, np.ndarray]],
     batch_size = len(ligand_tokens_list)
     
     coords = np.zeros((batch_size, max_seq_len, 3), dtype=np.float32)
-    types = np.zeros((batch_size, max_seq_len, 12), dtype=np.float32)
+    types = np.zeros((batch_size, max_seq_len, 13), dtype=np.float32)
     mask = np.zeros((batch_size, max_seq_len), dtype=bool)
     importance = np.zeros((batch_size, max_seq_len), dtype=np.float32)
     
