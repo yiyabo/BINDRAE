@@ -33,7 +33,7 @@ if os.path.exists(flash_ipa_path) and flash_ipa_path not in sys.path:
     sys.path.insert(0, flash_ipa_path)
 
 from flash_ipa.rigid import Rigid, Rotation
-from utils.ligand_utils import build_ligand_tokens_from_file
+from utils.ligand_utils import build_ligand_tokens_from_file, LIGAND_TYPE_DIM
 
 
 # ============================================================================
@@ -306,7 +306,7 @@ def collate_ipa_batch(samples: List[Dict]) -> IPABatch:
     node_mask_batch = np.zeros((batch_size, max_n_res), dtype=bool)
     
     lig_points_batch = np.zeros((batch_size, max_lig_tokens, 3), dtype=np.float32)
-    lig_types_batch = np.zeros((batch_size, max_lig_tokens, 12), dtype=np.float32)  # 12维
+    lig_types_batch = np.zeros((batch_size, max_lig_tokens, LIGAND_TYPE_DIM), dtype=np.float32)  # 12维
     lig_mask_batch = np.zeros((batch_size, max_lig_tokens), dtype=bool)
     
     torsion_angles_batch = np.zeros((batch_size, max_n_res, 7), dtype=np.float32)

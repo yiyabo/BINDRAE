@@ -63,6 +63,17 @@ ATOM_TYPE_MAPPING = {
     'negative': 11,   # 带负电
 }
 
+LIGAND_TYPE_DIM = 20
+EXTRA_LIG_FEATURE_OFFSET = len(ATOM_TYPE_MAPPING)
+IDX_IN_RING = EXTRA_LIG_FEATURE_OFFSET + 0
+IDX_RING_SMALL = EXTRA_LIG_FEATURE_OFFSET + 1
+IDX_RING_MEDIUM = EXTRA_LIG_FEATURE_OFFSET + 2
+IDX_RING_LARGE = EXTRA_LIG_FEATURE_OFFSET + 3
+IDX_DEGREE_1 = EXTRA_LIG_FEATURE_OFFSET + 4
+IDX_DEGREE_2 = EXTRA_LIG_FEATURE_OFFSET + 5
+IDX_DEGREE_3PLUS = EXTRA_LIG_FEATURE_OFFSET + 6
+IDX_HETERO_NEIGHBOR = EXTRA_LIG_FEATURE_OFFSET + 7
+
 # 方向探针配置
 MAX_PROBES_PER_ATOM = 2  # 每个原子最多2个探针
 PROBE_DISTANCE = 1.5     # 探针距离原子的距离 (Å)
@@ -174,6 +185,10 @@ class LigandTokenBuilder:
             'charge': np.zeros(n_atoms, dtype=np.float32),
             'hbd': [],
             'hba': [],
+            'in_ring': np.zeros(n_atoms, dtype=bool),
+            'ring_size': np.zeros(n_atoms, dtype=np.int32),
+            'degree': np.zeros(n_atoms, dtype=np.int32),
+            'has_hetero_neighbor': np.zeros(n_atoms, dtype=bool),
         }
         
         if mol is None or not RDKIT_AVAILABLE:
@@ -201,6 +216,20 @@ class LigandTokenBuilder:
             info['elements'][i] = atom.GetSymbol()
             info['aromatic'][i] = atom.GetIsAromatic()
             info['charge'][i] = atom.GetFormalCharge()
+            info['degree'][i] = atom.GetDegree()
+            info['has_hetero_neighbor'][i] = any(
+                neighbor.GetSymbol() not in ['C', 'H'] for neighbor in atom.GetNeighbors()
+            )
+
+        ring_info = mol.GetRingInfo()
+        atom_rings = ring_info.AtomRings()
+        for ring in atom_rings:
+            ring_len = len(ring)
+            for idx in ring:
+                if idx < n_atoms:
+                    info['in_ring'][idx] = True
+                    if info['ring_size'][idx] == 0 or ring_len < info['ring_size'][idx]:
+                        info['ring_size'][idx] = ring_len
         
         # 检测 HBD/HBA (使用 RDKit Feature Factory)
         if self.feature_factory is not None:
@@ -405,7 +434,7 @@ class LigandTokenBuilder:
             types: (M, 12)
         """
         n_tokens = len(atom_indices)
-        types = np.zeros((n_tokens, 12), dtype=np.float32)
+        types = np.zeros((n_tokens, LIGAND_TYPE_DIM), dtype=np.float32)
         
         for i in range(n_tokens):
             atom_idx = atom_indices[i]
@@ -428,6 +457,27 @@ class LigandTokenBuilder:
                 types[i, ATOM_TYPE_MAPPING['positive']] = 1.0
             elif charge < -0.1:
                 types[i, ATOM_TYPE_MAPPING['negative']] = 1.0
+
+            if atom_info['in_ring'][atom_idx]:
+                types[i, IDX_IN_RING] = 1.0
+                ring_size = int(atom_info['ring_size'][atom_idx])
+                if ring_size > 0 and ring_size <= 4:
+                    types[i, IDX_RING_SMALL] = 1.0
+                elif ring_size == 5 or ring_size == 6:
+                    types[i, IDX_RING_MEDIUM] = 1.0
+                elif ring_size >= 7:
+                    types[i, IDX_RING_LARGE] = 1.0
+
+            degree = int(atom_info['degree'][atom_idx])
+            if degree == 1:
+                types[i, IDX_DEGREE_1] = 1.0
+            elif degree == 2:
+                types[i, IDX_DEGREE_2] = 1.0
+            elif degree >= 3:
+                types[i, IDX_DEGREE_3PLUS] = 1.0
+
+            if atom_info['has_hetero_neighbor'][atom_idx]:
+                types[i, IDX_HETERO_NEIGHBOR] = 1.0
         
         return types
     
@@ -553,7 +603,7 @@ def encode_ligand_batch(ligand_tokens_list: List[Dict[str, np.ndarray]],
     batch_size = len(ligand_tokens_list)
     
     coords = np.zeros((batch_size, max_seq_len, 3), dtype=np.float32)
-    types = np.zeros((batch_size, max_seq_len, 12), dtype=np.float32)
+    types = np.zeros((batch_size, max_seq_len, LIGAND_TYPE_DIM), dtype=np.float32)
     mask = np.zeros((batch_size, max_seq_len), dtype=bool)
     importance = np.zeros((batch_size, max_seq_len), dtype=np.float32)
     

@@ -17,6 +17,7 @@ import torch.nn.functional as F
 from typing import Optional, Tuple
 from dataclasses import dataclass
 
+LIGAND_TYPE_DIM = 20
 
 # ============================================================================
 # 配置类
@@ -65,7 +66,7 @@ class LigandTokenEmbedding(nn.Module):
         
         # 嵌入网络: 15维 (3+12) → d_lig维
         self.embed = nn.Sequential(
-            nn.Linear(15, d_lig),
+            nn.Linear(3 + LIGAND_TYPE_DIM, d_lig),
             nn.LayerNorm(d_lig),
             nn.GELU(),
             nn.Dropout(dropout),
