@@ -350,13 +350,13 @@ class LigandTokenBuilder:
                 orig_atom_idx = atom_indices[i]
                 score = 0.0
                 if orig_atom_idx in atom_info['hbd'] or orig_atom_idx in atom_info['hba']:
-                    score = 5.0  # HBD/HBA 探针 - 高优先级
+                    score = 3.0  # HBD/HBA 探针（恢复原始权重）
                 elif abs(atom_info['charge'][orig_atom_idx]) > 0.1:
-                    score = 3.0  # 带电原子探针
+                    score = 2.0  # 带电原子探针（恢复原始权重）
                 elif atom_info['aromatic'][orig_atom_idx]:
-                    score = 2.0  # 芳香原子探针
+                    score = 1.0  # 芳香原子探针（恢复原始权重）
                 else:
-                    score = 1.0  # 普通探针
+                    score = 0.5  # 普通探针
             else:
                 # 重原子
                 atom_idx = atom_indices[i]
