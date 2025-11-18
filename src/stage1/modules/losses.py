@@ -128,6 +128,61 @@ def torsion_loss(pred_angles: torch.Tensor,
     return loss
 
 
+def chi1_rotamer_loss(logits: torch.Tensor,
+                      true_chi1: torch.Tensor,
+                      chi1_mask: torch.Tensor,
+                      w_res: Optional[torch.Tensor] = None,
+                      eps: float = 1e-8) -> torch.Tensor:
+    """χ1 rotamer 三分类损失
+    
+    Args:
+        logits: [B, N, 3] χ1 rotamer logits
+        true_chi1: [B, N] 真实χ1角度（弧度，范围约[-π, π]）
+        chi1_mask: [B, N] χ1是否有效的掩码
+        w_res: [B, N] 残基权重（可选，通常为口袋权重warmup后结果）
+        eps: 数值稳定性
+    
+    Returns:
+        loss: scalar tensor
+    """
+    B, N, C = logits.shape
+    assert C == 3, "chi1_rotamer_loss: logits 最后一维必须为3 (g-/t/g+)"
+
+    # 将角度wrap到[-π, π)
+    angle = ((true_chi1 + math.pi) % (2 * math.pi)) - math.pi
+
+    # 构造离散标签：g- / t / g+
+    with torch.no_grad():
+        labels = torch.zeros_like(angle, dtype=torch.long)
+        mask_valid = chi1_mask.bool()
+
+        # g-: angle < -π/3
+        labels[mask_valid & (angle < -math.pi / 3)] = 0
+        # t: [-π/3, π/3)
+        t_region = mask_valid & (angle >= -math.pi / 3) & (angle < math.pi / 3)
+        labels[t_region] = 1
+        # g+: angle >= π/3
+        labels[mask_valid & (angle >= math.pi / 3)] = 2
+
+    # 仅在有效χ1位置计算损失
+    valid = chi1_mask.bool()
+    if valid.sum() == 0:
+        return logits.new_tensor(0.0)
+
+    logits_flat = logits[valid]      # [K, 3]
+    labels_flat = labels[valid]      # [K]
+
+    if w_res is not None:
+        weights_flat = w_res[valid]  # [K]
+        loss_per = F.cross_entropy(logits_flat, labels_flat, reduction='none')  # [K]
+        weighted = loss_per * weights_flat
+        loss = weighted.sum() / (weights_flat.sum() + eps)
+    else:
+        loss = F.cross_entropy(logits_flat, labels_flat, reduction='mean')
+
+    return loss
+
+
 # ============================================================================
 # 距离损失
 # ============================================================================

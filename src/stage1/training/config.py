@@ -32,6 +32,7 @@ class TrainingConfig:
     w_torsion: float = 1.0
     w_dist: float = 0.1
     w_clash: float = 0.1
+    w_rotamer: float = 0.0
     
     # Warmup
     pocket_warmup_steps: int = 2000  # 口袋权重warmup

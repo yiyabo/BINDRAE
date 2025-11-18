@@ -42,6 +42,10 @@ def parse_args():
     # 早停
     parser.add_argument('--patience', type=int, default=20,
                        help='早停patience')
+
+    # χ1 rotamer 辅助损失
+    parser.add_argument('--rotamer_loss_weight', type=float, default=0.0,
+                       help='χ1 rotamer loss 权重')
     
     # 保存
     parser.add_argument('--save_dir', type=str, default='checkpoints/stage1',
@@ -79,6 +83,7 @@ def main():
         device=args.device,
         mixed_precision=not args.no_mixed_precision,
         resume_from=args.resume_from,
+        w_rotamer=args.rotamer_loss_weight,
     )
     
     print(f"\n{'='*80}")

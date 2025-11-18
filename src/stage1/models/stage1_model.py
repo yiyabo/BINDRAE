@@ -26,7 +26,7 @@ from flash_ipa.rigid import Rigid, Rotation
 from .adapter import ESMAdapter
 from .ipa import FlashIPAModule, FlashIPAModuleConfig
 from .ligand_condition import LigandConditioner, LigandConditionerConfig
-from .torsion_head import TorsionHead
+from .torsion_head import TorsionHead, Chi1RotamerHead
 from .fk_openfold import OpenFoldFK, create_openfold_fk
 from ..modules.edge_embed import EdgeEmbedderAdapter, ProjectEdgeConfig
 from ..data.residue_constants import restype_order
@@ -134,6 +134,12 @@ class Stage1Model(nn.Module):
             c_hidden=config.torsion_hidden,
             dropout=config.dropout
         )
+        # χ1 rotamer 分类头
+        self.chi1_head = Chi1RotamerHead(
+            c_s=config.c_s,
+            c_hidden=config.torsion_hidden,
+            dropout=config.dropout
+        )
         
         # 6. FK模块（扭转角→全原子坐标）
         self.fk_module = create_openfold_fk()
@@ -215,6 +221,7 @@ class Stage1Model(nn.Module):
         
         # 6. TorsionHead（使用IPA输出）
         pred_torsions = self.torsion_head(s_geo)  # [B, N, 7, 2]
+        chi1_logits = self.chi1_head(s_geo)       # [B, N, 3]
         
         # 7. FK重建全原子坐标
         # 将序列转换为aatype索引
@@ -224,6 +231,7 @@ class Stage1Model(nn.Module):
         
         return {
             'pred_torsions': pred_torsions,
+            'chi1_logits': chi1_logits,
             's_final': s_geo,  # IPA输出（已含配体信息）
             'rigids_final': rigids_updated,
             'atom14_pos': atom14_result['atom14_pos'],      # [B, N, 14, 3]

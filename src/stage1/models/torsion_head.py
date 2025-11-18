@@ -85,6 +85,23 @@ class TorsionHead(nn.Module):
         return angles
 
 
+class Chi1RotamerHead(nn.Module):
+    def __init__(self, c_s: int = 384, c_hidden: int = 128, dropout: float = 0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(c_s),
+            nn.Linear(c_s, c_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(c_hidden, 3)
+        )
+        nn.init.normal_(self.net[-1].weight, mean=0.0, std=0.01)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, s: torch.Tensor) -> torch.Tensor:
+        return self.net(s)
+
+
 def create_torsion_head(c_s: int = 384,
                        c_hidden: int = 128,
                        dropout: float = 0.1) -> TorsionHead:

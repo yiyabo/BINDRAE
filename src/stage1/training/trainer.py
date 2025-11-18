@@ -17,7 +17,7 @@ from tqdm import tqdm
 from .config import TrainingConfig
 from ..models import Stage1Model, Stage1ModelConfig
 from ..datasets import create_ipa_dataloader
-from ..modules.losses import fape_loss, torsion_loss, distance_loss, clash_penalty
+from ..modules.losses import fape_loss, torsion_loss, distance_loss, clash_penalty, chi1_rotamer_loss
 from utils.metrics import compute_pocket_irmsd, compute_chi1_accuracy, compute_fape
 
 
@@ -140,6 +140,18 @@ class Stage1Trainer:
             batch.torsion_mask,
             w_res_warmed
         )
+
+        # 1b. χ1 rotamer 辅助损失
+        chi1_logits = outputs.get('chi1_logits', None)
+        if chi1_logits is not None and self.config.w_rotamer > 0:
+            loss_rot = chi1_rotamer_loss(
+                chi1_logits,                      # [B, N, 3]
+                batch.torsion_angles[:, :, 3],    # [B, N]
+                batch.torsion_mask[:, :, 3],      # [B, N]
+                w_res_warmed
+            )
+        else:
+            loss_rot = torch.tensor(0.0, device=self.device)
         
         # 2. 提取FK重建的坐标
         atom14_pos = outputs['atom14_pos']  # [B, N, 14, 3]
@@ -224,6 +236,7 @@ class Stage1Trainer:
         # 组合损失
         total_loss = (
             self.config.w_torsion * loss_tor +
+            self.config.w_rotamer * loss_rot +
             self.config.w_dist * loss_dist +
             self.config.w_clash * loss_clash +
             self.config.w_fape * loss_fape
@@ -232,6 +245,7 @@ class Stage1Trainer:
         return {
             'total': total_loss,
             'torsion': loss_tor,
+            'rotamer': loss_rot,
             'distance': loss_dist,
             'clash': loss_clash,
             'fape': loss_fape,
@@ -303,6 +317,7 @@ class Stage1Trainer:
         epoch_losses = {
             'total': 0.0,
             'torsion': 0.0,
+            'rotamer': 0.0,
             'distance': 0.0,
             'clash': 0.0,
             'fape': 0.0,
