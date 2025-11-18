@@ -331,13 +331,7 @@ class IPABlock(nn.Module):
                 rigids: Rigid,
                 z_factor_1: torch.Tensor,
                 z_factor_2: torch.Tensor,
-                mask: torch.Tensor,
-                ligand_conditioner: Optional[nn.Module] = None,
-                lig_points: Optional[torch.Tensor] = None,
-                lig_types: Optional[torch.Tensor] = None,
-                protein_mask: Optional[torch.Tensor] = None,
-                ligand_mask: Optional[torch.Tensor] = None,
-                current_step: Optional[int] = None) -> Tuple[torch.Tensor, Rigid]:
+                mask: torch.Tensor) -> Tuple[torch.Tensor, Rigid]:
         """
         单层IPA前向传播
         
@@ -426,7 +420,13 @@ class FlashIPAModule(nn.Module):
                 rigids: Rigid,
                 z_factor_1: torch.Tensor,
                 z_factor_2: torch.Tensor,
-                mask: torch.Tensor) -> Tuple[torch.Tensor, Rigid]:
+                mask: torch.Tensor,
+                ligand_conditioner: Optional[nn.Module] = None,
+                lig_points: Optional[torch.Tensor] = None,
+                lig_types: Optional[torch.Tensor] = None,
+                protein_mask: Optional[torch.Tensor] = None,
+                ligand_mask: Optional[torch.Tensor] = None,
+                current_step: Optional[int] = None) -> Tuple[torch.Tensor, Rigid]:
         """
         多层IPA前向传播
         
