@@ -59,38 +59,13 @@ class LigandProcessor:
             if mol is None:
                 return None
             
-            # ✅ 保留极性氢（O-H, N-H, S-H），只移除非极性氢（C-H）
-            # 极性氢是功能性关键，参与氢键形成，应该保留真实位置
-            # 这与蛋白质处理一致（蛋白质也保留极性氢）
+            # 方案 B：移除所有氢原子，为 HBD 重原子生成探针
             # 
-            # RDKit参数说明：
-            # - implicitOnly=True: 只移除隐式氢（保留显式氢）
-            # - updateExplicitCount=False: 不更新显式氢计数
-            # 但这还不够，需要先添加极性氢，再选择性移除
-            
-            # 方案：先添加所有氢，再只移除非极性氢
-            mol = Chem.AddHs(mol, addCoords=True)  # 添加所有氢（带坐标）
-            
-            # 移除非极性氢（只保留 N-H, O-H, S-H）
-            atoms_to_remove = []
-            for atom in mol.GetAtoms():
-                if atom.GetSymbol() == 'H':
-                    # 检查氢连接的原子
-                    neighbors = atom.GetNeighbors()
-                    if len(neighbors) == 1:
-                        neighbor_symbol = neighbors[0].GetSymbol()
-                        # 只保留极性氢（N-H, O-H, S-H）
-                        if neighbor_symbol not in ['N', 'O', 'S']:
-                            atoms_to_remove.append(atom.GetIdx())
-            
-            # 批量移除非极性氢
-            if atoms_to_remove:
-                # 需要从后往前删除（避免索引变化）
-                atoms_to_remove.sort(reverse=True)
-                editable_mol = Chem.RWMol(mol)
-                for idx in atoms_to_remove:
-                    editable_mol.RemoveAtom(idx)
-                mol = editable_mol.GetMol()
+            # 理由：
+            # - AddHs 生成的氢坐标基于几何规则，可能不准确
+            # - 不如用探针表示 HBD 方向（类似 HBA 处理）
+            # - 探针方向基于邻近原子几何，可能更可靠
+            mol = Chem.RemoveAllHs(mol)
             
             # 尝试标准化价态（使用部分标准化，容忍错误）
             try:
@@ -130,23 +105,21 @@ class LigandProcessor:
     
     def extract_heavy_atoms_coords(self, mol: Chem.Mol) -> np.ndarray:
         """
-        提取重原子+极性氢的坐标
+        提取重原子坐标（不包含氢）
         
-        ⚠️ 注意：此处"重原子"实际包含极性氢（O-H, N-H, S-H）
-        原因：极性氢是功能性关键，参与氢键形成，必须保留
+        方案 B：只保留重原子，HBD 方向用探针表示
         
         Args:
-            mol: RDKit 分子对象（已通过RemoveHs移除非极性氢）
+            mol: RDKit 分子对象（已移除所有氢）
             
         Returns:
-            坐标数组，形状 (N_atoms, 3) - 包含重原子+极性氢
+            坐标数组，形状 (N_atoms, 3) - 只包含重原子
         """
         conformer = mol.GetConformer()
         coords = []
         
         for atom in mol.GetAtoms():
-            # RemoveHs已移除非极性氢，这里直接提取所有剩余原子
-            # 包括：重原子(C/N/O/S/P/...) + 极性氢(N-H/O-H/S-H)
+            # RemoveAllHs 已移除所有氢，这里只有重原子
             pos = conformer.GetAtomPosition(atom.GetIdx())
             coords.append([pos.x, pos.y, pos.z])
         
@@ -227,7 +200,7 @@ class LigandProcessor:
         # 保存结果
         output_prefix = self.features_dir / pdb_id
         
-        # 保存坐标（重原子 + 极性氢）
+        # 保存坐标（只有重原子）
         np.save(f"{output_prefix}_ligand_coords.npy", coords)
         
         # 保存属性
@@ -236,7 +209,7 @@ class LigandProcessor:
         # 保存规范化后的 SDF
         sdf_output = f"{output_prefix}_ligand_normalized.sdf"
         
-        # ✅ 直接写入 - mol 保留了极性氢（N-H, O-H, S-H），移除了非极性氢
+        # ✅ 直接写入 - mol 已移除所有氢原子
         writer = Chem.SDWriter(sdf_output)
         writer.write(mol)
         writer.close()

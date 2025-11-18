@@ -55,8 +55,8 @@ class IPABatch:
     node_mask: torch.Tensor     # [B, N] 节点掩码
     
     # 配体
-    lig_points: torch.Tensor    # [B, M, 3] 配体坐标（重原子+极性氢+探针）
-    lig_types: torch.Tensor     # [B, M, 13] 配体类型编码（包含H类型）
+    lig_points: torch.Tensor    # [B, M, 3] 配体坐标（重原子+探针）
+    lig_types: torch.Tensor     # [B, M, 12] 配体类型编码
     lig_mask: torch.Tensor      # [B, M] 配体掩码
     
     # Ground Truth
@@ -265,7 +265,7 @@ class CASF2016IPADataset(Dataset):
             'C': C_coords,                 # [N, 3]
             'sequence': sequence_str,      # 氨基酸序列（单字母代码）
             'lig_points': lig_tokens['coords'],   # [M, 3]
-            'lig_types': lig_tokens['types'],     # [M, 13] 包含H类型
+            'lig_types': lig_tokens['types'],     # [M, 12]
             'torsion_angles': torsion_angles,     # [N, 7]
             'torsion_mask': torsion_mask,         # [N, 7]
             'w_res': w_res,                # [N]
@@ -306,7 +306,7 @@ def collate_ipa_batch(samples: List[Dict]) -> IPABatch:
     node_mask_batch = np.zeros((batch_size, max_n_res), dtype=bool)
     
     lig_points_batch = np.zeros((batch_size, max_lig_tokens, 3), dtype=np.float32)
-    lig_types_batch = np.zeros((batch_size, max_lig_tokens, 13), dtype=np.float32)  # 13维：包含H类型
+    lig_types_batch = np.zeros((batch_size, max_lig_tokens, 12), dtype=np.float32)  # 12维
     lig_mask_batch = np.zeros((batch_size, max_lig_tokens), dtype=bool)
     
     torsion_angles_batch = np.zeros((batch_size, max_n_res, 7), dtype=np.float32)

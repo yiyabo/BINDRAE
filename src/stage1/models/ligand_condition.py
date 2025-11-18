@@ -49,7 +49,7 @@ class LigandTokenEmbedding(nn.Module):
     """
     配体Token嵌入层
     
-    输入: concat([xyz(3), types(13)]) = 16维（包含H类型）
+    输入: concat([xyz(3), types(12)]) = 15维
     输出: d_lig维嵌入
     """
     
@@ -63,9 +63,9 @@ class LigandTokenEmbedding(nn.Module):
         
         self.d_lig = d_lig
         
-        # 嵌入网络: 16维 (3+13) → d_lig维
+        # 嵌入网络: 15维 (3+12) → d_lig维
         self.embed = nn.Sequential(
-            nn.Linear(16, d_lig),
+            nn.Linear(15, d_lig),
             nn.LayerNorm(d_lig),
             nn.GELU(),
             nn.Dropout(dropout),
@@ -79,14 +79,14 @@ class LigandTokenEmbedding(nn.Module):
         配体Token嵌入
         
         Args:
-            lig_points: [B, M, 3] 配体坐标（重原子+极性氢+探针）
-            lig_types: [B, M, 13] 配体类型（包含H类型）
+            lig_points: [B, M, 3] 配体坐标（重原子+探针）
+            lig_types: [B, M, 12] 配体类型
             
         Returns:
             lig_embed: [B, M, d_lig] 配体嵌入
         """
         # 拼接坐标和类型
-        lig_features = torch.cat([lig_points, lig_types], dim=-1)  # [B, M, 16] (3+13)
+        lig_features = torch.cat([lig_points, lig_types], dim=-1)  # [B, M, 15] (3+12)
         
         # 嵌入
         lig_embed = self.embed(lig_features)  # [B, M, d_lig]
@@ -350,7 +350,7 @@ class LigandConditioner(nn.Module):
         Args:
             protein_features: [B, N, c_s] 蛋白节点表示
             lig_points: [B, M, 3] 配体坐标
-            lig_types: [B, M, 13] 配体类型（包含H类型）
+            lig_types: [B, M, 12] 配体类型
             protein_mask: [B, N] 蛋白掩码
             ligand_mask: [B, M] 配体掩码
             gate_lambda: 门控系数（可选，优先于current_step）
