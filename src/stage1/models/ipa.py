@@ -331,7 +331,13 @@ class IPABlock(nn.Module):
                 rigids: Rigid,
                 z_factor_1: torch.Tensor,
                 z_factor_2: torch.Tensor,
-                mask: torch.Tensor) -> Tuple[torch.Tensor, Rigid]:
+                mask: torch.Tensor,
+                ligand_conditioner: Optional[nn.Module] = None,
+                lig_points: Optional[torch.Tensor] = None,
+                lig_types: Optional[torch.Tensor] = None,
+                protein_mask: Optional[torch.Tensor] = None,
+                ligand_mask: Optional[torch.Tensor] = None,
+                current_step: Optional[int] = None) -> Tuple[torch.Tensor, Rigid]:
         """
         单层IPA前向传播
         
@@ -438,6 +444,15 @@ class FlashIPAModule(nn.Module):
         # 逐层更新
         for i, block in enumerate(self.ipa_blocks):
             s, rigids = block(s, rigids, z_factor_1, z_factor_2, mask)
+            if ligand_conditioner is not None:
+                s = ligand_conditioner(
+                    s,
+                    lig_points,
+                    lig_types,
+                    protein_mask,
+                    ligand_mask,
+                    current_step=current_step,
+                )
         
         # 最终归一化
         s = self.final_norm(s)

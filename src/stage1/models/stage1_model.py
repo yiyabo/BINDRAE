@@ -216,8 +216,20 @@ class Stage1Model(nn.Module):
         z_f1 = edge_outputs['z_f1']
         z_f2 = edge_outputs['z_f2']
         
-        # 5. FlashIPA（几何分支，已包含配体信息）
-        s_geo, rigids_updated = self.ipa_module(s_with_ligand, rigids, z_f1, z_f2, batch.node_mask)
+        # 5. FlashIPA（几何分支，已包含配体信息，并在每层后进行配体条件化）
+        s_geo, rigids_updated = self.ipa_module(
+            s_with_ligand,
+            rigids,
+            z_f1,
+            z_f2,
+            batch.node_mask,
+            ligand_conditioner=self.ligand_conditioner,
+            lig_points=batch.lig_points,
+            lig_types=batch.lig_types,
+            protein_mask=batch.node_mask,
+            ligand_mask=batch.lig_mask,
+            current_step=current_step,
+        )
         
         # 6. TorsionHead（使用IPA输出）
         pred_torsions = self.torsion_head(s_geo)  # [B, N, 7, 2]
