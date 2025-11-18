@@ -371,13 +371,13 @@ class LigandTokenBuilder:
                 element = atom_info['elements'][atom_idx]
                 score = 1.0  # 基础分
                 
-                # ✅ 极性氢：最高优先级（真正的 HBD）
+                # ✅ 极性氢：与 HBD/HBA 重原子同等重要
                 if element == 'H':
-                    score += 10.0  # 极性氢必须保留！
+                    score += 3.0  # 极性氢（降低权重，避免过度主导）
                 
                 # HBD/HBA 重原子（N, O, S）
                 elif atom_idx in atom_info['hbd'] or atom_idx in atom_info['hba']:
-                    score += 5.0  # HBD/HBA 重原子
+                    score += 5.0  # HBD/HBA 重原子（保持较高权重）
                 
                 # 带电原子
                 if abs(atom_info['charge'][atom_idx]) > 0.1:
@@ -468,13 +468,13 @@ class LigandTokenBuilder:
             score = 0.5  # 基础值
             element = atom_info['elements'][atom_idx]
             
-            # ✅ 极性氢：高权重（真正的 HBD）
+            # ✅ 极性氢：中等权重（避免过度主导）
             if element == 'H':
-                score += 0.5  # 极性氢权重 = 1.0（最大值）
+                score += 0.2  # 极性氢权重 = 0.7（降低权重）
             
             # HBD/HBA 重原子
             elif atom_idx in atom_info['hbd'] or atom_idx in atom_info['hba']:
-                score += 0.3  # HBD/HBA 重原子权重 = 0.8
+                score += 0.3  # HBD/HBA 重原子权重 = 0.8（保持较高）
             
             # 带电原子
             if abs(atom_info['charge'][atom_idx]) > 0.1:
