@@ -12,13 +12,14 @@ from torch.cuda.amp import autocast, GradScaler
 from pathlib import Path
 from typing import Dict, Optional
 import time
+import math
 from tqdm import tqdm
 
 from .config import TrainingConfig
 from ..models import Stage1Model, Stage1ModelConfig
 from ..datasets import create_ipa_dataloader
 from ..modules.losses import fape_loss, torsion_loss, distance_loss, clash_penalty, chi1_rotamer_loss
-from utils.metrics import compute_pocket_irmsd, compute_chi1_accuracy, compute_fape
+from utils.metrics import compute_pocket_irmsd, compute_chi1_accuracy, compute_fape, compute_clash_percentage
 
 
 class Stage1Trainer:
@@ -325,8 +326,8 @@ class Stage1Trainer:
         
         pbar = tqdm(self.train_loader, 
                    desc=f'Epoch {self.current_epoch:3d}',
-                   ncols=100,  # 固定宽度，避免换行
-                   leave=True)  # 保留进度条
+                   ncols=120,
+                   leave=True)
         
         for batch_idx, batch in enumerate(pbar):
             # 训练步
@@ -342,6 +343,8 @@ class Stage1Trainer:
                 'tor': f"{step_losses['torsion']:.3f}",
                 'fape': f"{step_losses['fape']:.3f}",
                 'dist': f"{step_losses['distance']:.3f}",
+                'rot': f"{step_losses['rotamer']:.3f}",
+                'clash': f"{step_losses['clash']:.3f}",
                 'lr': f"{self.optimizer.param_groups[0]['lr']:.1e}",
             }, refresh=True)
         
@@ -359,16 +362,24 @@ class Stage1Trainer:
         val_losses = {
             'total': 0.0,
             'torsion': 0.0,
+            'rotamer': 0.0,
+            'distance': 0.0,
+            'clash': 0.0,
+            'fape': 0.0,
         }
         
         val_metrics = {
             'chi1_acc': 0.0,
+            'chi1_rot_acc': 0.0,
         }
+        pocket_irmsd_sum = 0.0
+        clash_pct_sum = 0.0
+        n_structures = 0
         
         pbar = tqdm(self.val_loader, 
                    desc='  Validating',
-                   ncols=100,
-                   leave=False)  # 验证完成后清除进度条
+                   ncols=120,
+                   leave=False)
         
         for batch in pbar:
             batch = self._batch_to_device(batch)
@@ -379,6 +390,10 @@ class Stage1Trainer:
             # 累积损失
             val_losses['total'] += losses['total'].item()
             val_losses['torsion'] += losses['torsion'].item()
+            val_losses['rotamer'] += losses['rotamer'].item()
+            val_losses['distance'] += losses['distance'].item()
+            val_losses['clash'] += losses['clash'].item()
+            val_losses['fape'] += losses['fape'].item()
             
             # 计算指标（chi1准确率）
             pred_torsions = torch.atan2(
@@ -386,20 +401,63 @@ class Stage1Trainer:
                 outputs['pred_torsions'][..., 1]
             )
             # 只取chi1 (索引3)
-            from utils.metrics import compute_chi1_accuracy
-            import numpy as np
             chi1_acc = compute_chi1_accuracy(
-                pred_torsions[:, :, 3].cpu().numpy().flatten(),
-                batch.torsion_angles[:, :, 3].cpu().numpy().flatten(),
-                batch.torsion_mask[:, :, 3].cpu().numpy().flatten()
+                pred_torsions[:, :, 3].flatten(),
+                batch.torsion_angles[:, :, 3].flatten(),
+                batch.torsion_mask[:, :, 3].flatten()
             )
-            if not np.isnan(chi1_acc):
-                val_metrics['chi1_acc'] += chi1_acc
+            val_metrics['chi1_acc'] += chi1_acc
+
+            chi1_logits = outputs.get('chi1_logits', None)
+            if chi1_logits is not None:
+                true_chi1 = batch.torsion_angles[:, :, 3]
+                chi1_mask = batch.torsion_mask[:, :, 3].bool()
+                if chi1_mask.any():
+                    angle = ((true_chi1 + math.pi) % (2 * math.pi)) - math.pi
+                    labels = torch.zeros_like(true_chi1, dtype=torch.long)
+                    labels[chi1_mask & (angle < -math.pi / 3)] = 0
+                    t_region = chi1_mask & (angle >= -math.pi / 3) & (angle < math.pi / 3)
+                    labels[t_region] = 1
+                    labels[chi1_mask & (angle >= math.pi / 3)] = 2
+                    preds = chi1_logits.argmax(dim=-1)
+                    correct = (preds == labels) & chi1_mask
+                    acc_rot = correct.sum().float() / chi1_mask.sum().float()
+                    val_metrics['chi1_rot_acc'] += acc_rot.item()
+
+            B = batch.Ca.shape[0]
+            for i in range(B):
+                pocket_mask = (batch.w_res[i] > 0.5)
+                if pocket_mask.any():
+                    irmsd = compute_pocket_irmsd(
+                        outputs['atom14_pos'][i, :, 1],
+                        batch.Ca[i],
+                        pocket_mask
+                    )
+                    if not math.isnan(irmsd):
+                        pocket_irmsd_sum += irmsd
+                valid_atom_mask = outputs['atom14_mask'][i].bool().view(-1)
+                coords_i = outputs['atom14_pos'][i].view(-1, 3)[valid_atom_mask]
+                if coords_i.shape[0] > 1:
+                    clash_pct = compute_clash_percentage(coords_i)
+                    clash_pct_sum += clash_pct
+                n_structures += 1
+
+            pbar.set_postfix({
+                'v_loss': f"{losses['total'].item():.3f}",
+                'chi1': f"{chi1_acc:5.1%}",
+            }, refresh=False)
         
         # 平均
         n_batches = len(self.val_loader)
         val_losses = {k: v / n_batches for k, v in val_losses.items()}
-        val_metrics = {k: v / n_batches for k, v in val_metrics.items()}
+        val_metrics['chi1_acc'] = val_metrics['chi1_acc'] / n_batches
+        val_metrics['chi1_rot_acc'] = val_metrics['chi1_rot_acc'] / max(n_batches, 1)
+        if n_structures > 0:
+            val_metrics['pocket_irmsd'] = pocket_irmsd_sum / n_structures
+            val_metrics['clash_pct'] = clash_pct_sum / n_structures
+        else:
+            val_metrics['pocket_irmsd'] = float('nan')
+            val_metrics['clash_pct'] = float('nan')
         
         # 合并返回
         results = {**val_losses, **val_metrics}
@@ -437,14 +495,20 @@ class Stage1Trainer:
                          f"Loss: {train_losses['total']:.4f} "
                          f"(T:{train_losses['torsion']:.2f} "
                          f"F:{train_losses['fape']:.2f} "
-                         f"D:{train_losses['distance']:.2f})")
+                         f"D:{train_losses['distance']:.2f} "
+                         f"C:{train_losses['clash']:.2f} "
+                         f"R:{train_losses['rotamer']:.2f})")
             
             # 验证
             if epoch % self.config.val_interval == 0:
                 val_results = self.validate()
                 
                 val_info = (f" | Val Loss: {val_results['total']:.4f} "
-                           f"χ1:{val_results['chi1_acc']:5.1%}")
+                           f"χ1:{val_results['chi1_acc']:5.1%} "
+                           f"Rot:{val_results['chi1_rot_acc']:5.1%} "
+                           f"FAPE:{val_results['fape']:.3f} "
+                           f"iRMSD:{val_results['pocket_irmsd']:.2f} "
+                           f"Clash:{val_results['clash_pct']*100:.1f}%")
                 
                 # 早停检查
                 current_metric = val_results['total']
