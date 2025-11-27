@@ -275,8 +275,7 @@ L_{\text{FM}}
    - backbone FAPE（使用 N/Cα/C 帧），对口袋加权；
 
 \[
-L_{\text{endpoint}} = \lambda_\theta \cdot \mathrm{Loss}_\theta(\theta_\Theta(1), \theta_1)
-+ \lambda_{\text{FAPE}} \cdot \mathrm{FAPE}(x_\Theta(1), x_1).
+L_{\text{endpoint}} = \lambda_\theta \cdot \mathrm{Loss}_\theta(\theta_\Theta(1), \theta_1) + \lambda_{\text{FAPE}} \cdot \mathrm{FAPE}(x_\Theta(1), x_1).
 \]
 
 端点一致性无需每步都计算，可隔一定步数或在训练后期启用，以控制计算量。
@@ -363,16 +362,9 @@ L_{\text{prior}} = \mathbb{E}_{t > t_\text{mid}} \big[ w_{\mathrm{res}} \cdot d_
 
 综合上述组件：
 
-\[
-L = L_{\text{FM}}
-  + \lambda_{\text{end}} L_{\text{endpoint}}
-  + \lambda_{\text{geom}} \big(
-      L_{\text{smooth}}
-    + L_{\text{clash}}
-    + L_{\text{contact}}
-    + L_{\text{prior}}
-    \big),
-\]
+$$
+L = L_{\text{FM}} + \lambda_{\text{end}} L_{\text{endpoint}} + \lambda_{\text{geom}} \big( L_{\text{smooth}} + L_{\text{clash}} + L_{\text{contact}} + L_{\text{prior}} \big)
+$$
 
 - 所有 residue‑level 项都可以再乘以 \(w_{\mathrm{res}}\) 或其幂，以强化 pocket 区域；
 - 所有 residue‑level 项可以使用组合权重 \(w_i = w_{\mathrm{res},i}^\alpha \cdot r_i\)，其中 \(r_i\) 来自 Stage‑1 χ1 offline 误差分析（例如依据《Stage‑1 工作总结与 χ1 误差分析》或 `chi1_error_analysis.py` / `chi1_error_posthoc.py` 统计得到的置信度），对高误差长尾残基略减权；
