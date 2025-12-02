@@ -40,4 +40,4 @@ wandb/
 tmp
 # 环境变量
 .env
-.env.local
+.env.localtodo_stage2.md

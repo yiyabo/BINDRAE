@@ -17,7 +17,7 @@ python scripts/extract_pockets.py
 # 4. 扭转角提取
 python scripts/extract_torsions.py
 
-# 5. ESM-2 缓存
+# 5. ESM 缓存
 python scripts/cache_esm2.py
 
 # 6. 数据集划分
@@ -251,11 +251,11 @@ splits/
 有效样本: 265 (98.1%)
 
 问题分类:
-⚠️  配体原子过少 (<5): 3 个
-❌ 无效坐标: 1 个
-⚠️  口袋过小 (<5残基): 1 个
+配体原子过少 (<5): 3 个
+无效坐标: 1 个
+口袋过小 (<5残基): 1 个
 
-✅ 数据质量验证通过！
+数据质量验证通过！
 ```
 
 ---

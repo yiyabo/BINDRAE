@@ -1,13 +1,11 @@
 # BINDRAE Stage‑2 理论与实现指导
 
-> 面向“最高标准”的设计，不做降级或兼容性妥协。
->
+
 > 本文在 `Stage2.md` 的算法蓝图基础上，从**理论视角**和**实现规范**两个层面重新组织 Stage‑2 方案，目标是：
 >
 > - 在混合状态空间（SE(3) 骨架刚体 + torsion 角）中，构造一个**配体条件化、口袋门控**的 apo→holo 桥流；
 > - 明确参考桥（reference bridge）、Flow Matching / Bridge Flow 的数学形式；
 > - 系统性地把 Stage‑1 的几何先验（FK / FAPE / clash / pocket contact / Stage‑1 holo prior）提升到**整条路径**上作为正则；
-> - 给出不降级的工程落地方向。
 
 ---
 
@@ -31,7 +29,7 @@
 
 ### 1.2 严格设计原则
 
-1. **不做降级到“只看坐标”或“只看 torsion”**：
+1. **不“只看坐标”或“只看 torsion”**：
    - 最终形式在混合状态空间 \(\mathcal{M} = \mathcal{F} \times \Theta\) 上建模：
      - \(\mathcal{F} = \mathrm{SE(3)}^N\)：每个残基一个 N/Cα/C 刚体帧；
      - \(\Theta = (S^1)^K\)：所有定义 torsion 自由度（φ, ψ, ω, χ1–4）。
