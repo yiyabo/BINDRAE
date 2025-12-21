@@ -461,7 +461,7 @@ g_i(t)=\sigma\left(\mathrm{MLP}_g\left([h_i(t);\ e_t;\ w_i^{\mathrm{pocket}};\ M
 $$
 并对输出速度强制门控：
 $$
-\xi_i = g_i(t)\,\xi_i^{\mathrm{raw}},\qquad
+\xi_i = g_i(t)\,\xi_i^{\mathrm{raw}}\qquad
 \dot\chi_i = g_i(t)\,\dot\chi_i^{\mathrm{raw}}.
 $$
 
