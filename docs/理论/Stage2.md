@@ -5,7 +5,7 @@
 1. 我们到底选什么空间来学 apo→holo（显式坐标 vs torsion vs latent）
 2. 数据准备：apo/holo 对怎么组织、特征怎么对齐
 3. Stage2 模型的**状态表示 + 条件输入**
-4. 具体的算法：**配体条件化的 torsion Flow Matching / “桥流”**
+4. 具体的算法：**配体条件化的 Bridge Flow（SE(3)+χ）/ “桥流”**
 5. 训练时的损失设计（包括路径上的几何正则、单调口袋接触等）
 6. 推理 / 采样流程（如何从 apo 出发生成整条轨迹）
 7. 和现有工作（RAE / ProteinZen / SBALIGN / DiSCO）的对比，说明咱们哪里不一样
@@ -16,8 +16,8 @@
 
 我先用一句话概括我要给你的 Stage2：
 
-> **在“torsion 角 + ESM + 配体”的条件空间里，用 *pairwise flow matching* 学一个从 apo torsion → holo torsion 的速度场，
-> 速度场只在“口袋相关的自由度”上大幅非零，
+> **在“backbone frames (SE(3)^N) + sidechain χ torsions + ESM + 配体”的条件空间里，用 *pairwise CFM/PCFM* 学一个从 apo → holo 的时间连续向量场（同时作用于 \(F(t)\) 与 \(\chi(t)\)），
+> 向量场只在“口袋相关的自由度”上大幅非零，
 > 并且在训练时用 Stage1 的 FK + 几何 loss 对整条路径做 FAPE / clash / 接触单调性正则。**
 
 这个东西你可以理解成：
@@ -25,7 +25,7 @@
 * 概念上靠近 ProteinZen 的“在潜空间 + SE(3) 上做 Flow Matching”
 * 但我们：
 
-  * 不去折腾全 SE(3) backbone，而是直接在 **torsion manifold（周期空间）** 上做 flow；
+  * 不在全原子坐标上做 flow，而是在 **per‑residue backbone frames（SE(3)^N）** 上做等变更新，同时只对侧链 **χ torsion（周期空间）** 建模（去冗余）；
   * 明确做的是 **配体条件化的 apo→holo 路径**，而不是无条件生成；
   * 把 Stage1 的 FK + clash/FAPE 这些几何约束“抬到整条路径上”，而不是只约束终点。
 
@@ -45,9 +45,10 @@
 * ProteinZen：骨架帧在 SE(3) 上做 flow，细节在 latent 里做 flow。
 * FoldFlow-2：在 SE(3)-equivariant 空间里对 backbone 做 flow matching。
 
-我们就走一个“**纯 torsion 流 + 几何解码器 (Stage1 FK)**”的路线：
+我们就走一个“**混合状态流（SE(3)+χ） + 几何解码器 (Stage1 FK)**”的路线：
 
-* Stage2 的状态变量 = 角度向量 θ（7×N）；
+* **主线**状态变量 \(x(t)=(F(t),\chi(t))\)：\(F\in\mathrm{SE(3)}^N\)，\(\chi\) 仅包含 χ1–χ4（φ/ψ/ω 不作为可积分显式状态，用于评估/辅助监督或从 \(F(t)\) 派生）；
+* **官方 baseline/消融**：torsion‑only（仅角变量，包含 χ 或包含 full‑torsion φ/ψ/ω/χ）用于稳定性对照与消融；
 * Stage1 提供：
 
   * FK 解码器；
@@ -82,7 +83,13 @@
      * `θ_holo ∈ R^{N×7}`
    * 同时记录 `bb_mask, chi_mask`（作为 Stage2 的有效性掩码）。
 
-3. **配体表示**
+3. **backbone 帧（rigids）**
+
+   * 从 apo/holo 的 N/Cα/C 构造每残基 backbone frame（例如 OpenFold/FlashIPA 风格的 `Rigid`）：
+     * `F_apo ∈ SE(3)^N`
+     * `F_holo ∈ SE(3)^N`
+
+4. **配体表示**
 
    * 完全复用 Stage1 的 ligand 处理：
 
@@ -90,12 +97,13 @@
      * HBD/HBA/芳香/带电原子 → 方向探针；
      * 20D 类型/拓扑特征。
 
-4. **口袋权重 w_res**
+5. **口袋权重 w_res**
 
-   * 仍然基于 **holo 结构 + 配体** 来定义：距离、图膨胀、RBF soft weight。
-   * 对 apo/holo 都用同一组 `w_res`（因为是“这个配体的绑定 pocket”）。
+   * 用一个可复现的几何规则定义（残基–配体距离 + 图膨胀 + RBF soft weight 等）。
+   * **推荐默认：训练/推理一致** ——统一基于 **apo backbone + ligand pose（在 apo 坐标系）** 计算 `w_res`；若训练数据同时有 holo，可额外记录 `w_res^holo` 做分析/消融。
+   * 更稳健的可选项是并集权重：`w_res = max(w_res^apo, w_res^holo)`；推理时可替换为 `max(w_res^apo, w_res^stage1)`（Stage‑1 预测 pseudo‑holo 后再计算）。
 
-5. **ESM 特征**
+6. **ESM 特征**
 
    * 一次性跑序列 → ESM‑2 per-res embeddings；缓存成 `esm.pt`（你已有）。
 
@@ -107,6 +115,8 @@
   "theta_holo": [N, 7],
   "bb_mask":    [N, 3],
   "chi_mask":   [N, 4],
+  "rigids_apo": "Rigid[N] / SE(3)^N",
+  "rigids_holo":"Rigid[N] / SE(3)^N",
   "esm_res":    [N, 1280],
   "lig_points": [M, 3],
   "lig_types":  [M, 20],
@@ -126,13 +136,16 @@
 
 对任意时间 t 的状态，我们用：
 
-* `θ_t ∈ R^{N×7}`：每个残基 7 个 torsion；
-* 表示方式：用 `(sin, cos)` 展开 → `x_t ∈ R^{N×7×2}`，避免角度 wrap 问题（你 Stage1 已经这么做了）。
+* **主线显式状态**：
+  * `F_t ∈ SE(3)^N`：每残基一个 backbone 刚体帧；
+  * `χ_t ∈ R^{N×4}`：每残基 χ1–χ4（通过 `chi_mask` 决定哪些 χ_k 有效）；
+  * χ 表示方式：用 `(sin, cos)` 展开，避免角度 wrap 问题（你 Stage1 已经这么做了）。
+* **官方 baseline/消融**：也可用 torsion‑only `θ_t ∈ R^{N×7}`（φ/ψ/ω/χ1–χ4）作为角变量状态，便于做稳定性对照与消融。
 
 mask：
 
-* `bb_mask` 仅作用在 φ/ψ/ω；
-* `chi_mask` 仅作用在 χ1–4；
+* 主线默认仅使用 `chi_mask`；
+* full‑torsion baseline 才使用 `bb_mask`（φ/ψ/ω）与 `chi_mask` 的组合；
 * 训练时只对 mask=1 的自由度做 flow loss。
 
 ### 3.2 条件输入 cond
@@ -158,7 +171,7 @@ mask：
 
 ---
 
-## 4. 核心算法：配体条件化 torsion Flow Matching
+## 4. 核心算法：配体条件化 Bridge Flow（SE(3)+χ）
 
 这部分就是我们真正的 **Stage2 算法**。我会先给出总体形式，再给细节。
 
@@ -174,18 +187,24 @@ SBALIGN / DiSCO 则是在 SB 框架下，在蛋白/分子构象空间里学“�
 
 我们借鉴的是这类 **pairwise 条件 Flow Matching** 的技术路线，但：
 
-* 把状态空间换成 torsion（周期 manifold）；
+* backbone 用 per‑residue SE(3) frames 建模（等变、可解释）；
+* 侧链角变量默认只建模 χ（周期 manifold，去冗余）；
 * 条件里塞的是 ESM + ligand + pocket；
 * 并且在路径上加了你 Stage1 的几何 loss 作为 regularizer。
 
-### 4.2 定义“桥路径” θ_t（apo→holo）
+### 4.2 定义参考桥路径 χ_t / F_t（apo→holo）
 
-对每个样本，我们有 θ_apo, θ_holo。我们定义一个 deterministic path（先不加噪声）：
+对每个样本：
+
+* 侧链 χ：用周期空间上的 wrap‑aware 插值/噪声桥（如下）；
+* backbone frames \(F\)：用 SE(3) 上的 geodesic +（可选）Lie algebra Brownian 扰动（实现细节建议参考 `Stage2理论与指导.md`）。
+
+下面先写 χ 的 deterministic path（先不加噪声）：
 
 1. 先对角做最短差值（考虑 wrap）：
 
 ```python
-Δθ = wrap_to_pi(θ_holo - θ_apo)  # 映射到 (-π, π]
+Δχ = wrap_to_pi(χ_holo - χ_apo)  # 映射到 (-π, π]
 ```
 
 2. 选择一个 scalar schedule γ(t)，比如简单的 γ(t)=t 或 smoothstep：
@@ -199,40 +218,40 @@ SBALIGN / DiSCO 则是在 SB 框架下，在蛋白/分子构象空间里学“�
 3. 定义桥路径：
 
 ```python
-θ_t = θ_apo + γ(t) * Δθ  # 每个角线性插 / smooth 插
+χ_t = χ_apo + γ(t) * Δχ  # 每个 χ 角线性插 / smooth 插
 ```
 
 4. 解析真速度（target velocity）：
 
 ```python
-v*(θ_t, t) = dθ_t/dt = γ'(t) * Δθ
-# 若γ(t)=t，则 v* = Δθ（与 t 无关）
+v*(χ_t, t) = dχ_t/dt = γ'(t) * Δχ
+# 若γ(t)=t，则 v* = Δχ（与 t 无关）
 ```
 
-这里最大的好处：**v* 不依赖 θ_t，只依赖 Δθ**，所以 target 很干净；
+这里最大的好处：**v* 不依赖 χ_t，只依赖 Δχ**，所以 target 很干净；
 在 PCFM 的框架里，这就是 textbook 的 pair-coupled velocity。
 
 你可以后面再叠加一个小的 Gaussian 噪声项，把它推向 SB，那是后话。
 
-### 4.3 Stage2 模型：Ligand-conditioned TorsionFlowNet
+### 4.3 Stage2 模型：Ligand-conditioned FlowNet（SE(3)+χ）
 
 #### 4.3.1 输入组装
 
 对每个时间 t 和样本：
 
-1. **角度编码**
+1. **角度编码（χ‑only）**
 
-   * `X_t = [sin θ_t, cos θ_t] ∈ R^{N×14}`；
+   * `X_t = [sin χ_t, cos χ_t] ∈ R^{N×8}`；
 
 2. **残基层 token 初始输入**
 
 ```python
 h_i^0 = concat(
   Adapter(esm_i),     # [c_s]
-  X_t[i],             # [14]
+  X_t[i],             # [8]
   w_res[i],           # [1]
   time_embed(t)       # [d_t]
-)  # → R^{c_s+14+1+d_t}
+)  # → R^{c_s+8+1+d_t}
 ```
 
 3. **配体 token L_tok**
@@ -246,7 +265,7 @@ h_i^0 = concat(
 
 #### 4.3.2 网络结构（建议）
 
-我们定义一个专用的 **TorsionFlowNet**：
+我们定义一个专用的 **FlowNet**（或沿用 `TorsionFlowNet` 命名，但主线包含 rigid head）：
 
 * Backbone：
 
@@ -257,22 +276,23 @@ h_i^0 = concat(
 
 * 输出头：
 
-  * 对每个残基输出 7 个角的速度：`u_ϕ(i) ∈ R^{7}`；
-  * 实际上，我们可以输出在角度空间（Δθ/dt），也可以输出在 sin/cos 空间的导数，但简单起见就直接对角度（wrap 后）建模。
+  * **主线（χ‑only）**：对每个残基输出 χ 速度：`u_ϕ^χ(i) ∈ R^{4}`（由 `chi_mask` 决定哪些 χ_k 有效）；
+  * 同时输出 backbone frame 的速度：`u_ϕ^F(i) = (ω_i, v_i) ∈ R^3 × R^3`（body‑frame twist，用于更新 \(F(t)\)）；
+  * baseline/ablation 才输出 full‑torsion：`u_ϕ^\theta(i) ∈ R^{7}`（φ/ψ/ω/χ1..4）。
 
-你可以想象这是“把 Stage1 的 LigandConditioner + 一部分 Transformer trunk 拿来当 encoder”，但这里不更新刚体、不做 FK，只输出 dθ/dt。
+你可以想象这是“把 Stage1 的 LigandConditioner + 一部分 Transformer trunk 拿来当 encoder”，并在其顶部接两个 head：`dF/dt` 与 `dχ/dt`。注意：Enc_trunk 内部可能使用临时 rigids 做几何建模，但**不回写**显式状态 \(F(t)\)（state rigids 只由向量场积分更新），避免双重更新不一致。
 
 #### 4.3.3 Flow Matching loss
 
 对每个样本、时间 t、残基 i、角 k：
 
 ```python
-L_flow = E_{(p,t)} [ Σ_{i,k} mask_{i,k} * w_res[i]^α * || u_ϕ(i,k; θ_t, cond, t) - v*(i,k) ||^2 ]
+L_flow = E_{(p,t)} [ Σ_{i,k} mask_{i,k} * w_res[i]^α * || u_ϕ(i,k; (F_t, χ_t), cond, t) - v*(i,k) ||^2 ]
 ```
 
-* `mask_{i,k}` 来自 bb_mask/chi_mask；
+* 主线 `mask_{i,k}` 只来自 `chi_mask`（full‑torsion baseline 才使用 bb_mask/chi_mask 组合）；
 * `w_res[i]^α` 作为 pocket 加权（建议 α≈1 或 2），**加强口袋自由度的监督**；
-* v*(i,k)=Δθ(i,k) * γ'(t) 是我们上面定义的真速度。
+* v*(i,k)=Δχ(i,k) * γ'(t) 是我们上面定义的真速度（χ 部分）。
 
 ---
 
@@ -287,7 +307,7 @@ SBALIGN / DiSCO 里就特别强调要加能量/几何约束来 regularize path�
 
 在训练 Stage2 时，我们在若干个中间时间点 t_k（比如 3–5 个）上：
 
-1. 用当前 θ_t_k 通过 **FK + aatype** 解码出 atom14 坐标（直接用你的 Stage1 FK 模块，不需要整个 Stage1 trunk）；
+1. 用当前状态 \(x(t_k)=(F(t_k), \chi(t_k))\) 通过 **FK + aatype** 解码出 atom14 坐标（直接复用 Stage1 FK 模块；主链 torsion φ/ψ/ω 如需使用可从 \(F(t_k)\) 派生或在 baseline 中固定）；
 
 2. 和对应的“目标几何”比：
 
@@ -305,10 +325,11 @@ SBALIGN / DiSCO 里就特别强调要加能量/几何约束来 regularize path�
 3. 整体几何正则：
 
 ```python
+coords_tk = FK(F_tk, χ_tk, aatype)  # atom14 coords at time t_k
 L_geom = Σ_k [
-  λ_fape * FAPE_backbone(θ_tk, target_k) 
-  + λ_clash * clash(θ_tk)
-  + λ_cont * contact_loss(θ_tk, ligand, t_k)
+  λ_fape * FAPE_backbone(coords_tk, target_k) 
+  + λ_clash * clash(coords_tk)
+  + λ_cont * contact_loss(coords_tk, ligand, t_k)
 ]
 ```
 
@@ -379,11 +400,12 @@ L_total = L_flow
 
    * 用同样的 `extract_torsions.py` 提出 `θ_apo`；
    * 用 holo 的 ligand pose（或者你的 docking pose）构造 ligand tokens；
-   * 计算 `w_res`（从 holo 参考结构或 docking 参考）。
+   * 计算 `w_res`（推荐从 apo backbone + ligand pose 在 apo 坐标系下得到；必要时可用 Stage‑1 预测 pseudo‑holo 衍生 `w_res^stage1` 再取并集）。
 
-2. 初始状态：
+2. 初始状态（主线）：
 
-   * `θ(0) = θ_apo`；
+   * `F(0) = F_apo`；
+   * `χ(0) = χ_apo`；
    * cond = {Adapter(ESM), Ligand tokens, w_res}。
 
 3. 数值积分解 ODE：
@@ -391,8 +413,9 @@ L_total = L_flow
 ```python
 for step = 0..T-1:
     t = step / T
-    v = u_ϕ(θ(t), t, cond)        # [N,7]
-    θ(t+Δt) = wrap_to_pi(θ(t) + Δt * v)
+    ω, v_trans, v_chi = u_ϕ(F(t), χ(t), t, cond)  # SE(3)^N + [N,4]
+    F(t+Δt) = update_rigid_right(F(t), ω, v_trans)
+    χ(t+Δt) = wrap_to_pi(χ(t) + Δt * v_chi)
 ```
 
 * 使用简单的 Euler 或 Heun / RK4；
@@ -405,8 +428,8 @@ for step = 0..T-1:
 
 5. 输出：
 
-* 全路径：`{θ(t), coords(t)}`，可视化成整条 apo→holo 动态；
-* 终点 holo’：`θ(1)` 与 Stage1 生成的结构。
+* 全路径：`{F(t), χ(t), coords(t)}`，可视化成整条 apo→holo 动态；
+* 终点 holo’：`(F(1), χ(1))` 以及解码后的坐标。
 
 ---
 
@@ -463,7 +486,7 @@ SBALIGN：在对齐的 apo/holo 结构对上，用 Schrödinger Bridge 建立连
 * 你**只需要补**：
 
   1. 数据侧：一个 apo/holo dataset prepare 脚本（其实结构跟你现在 `dataprcess.md` 的 pipeline 很像，只是多了 apo 支路）。
-  2. 新的 `Stage2Dataset`，返回 θ_apo / θ_holo / ESM / ligand / w_res；
+  2. 新的 `Stage2Dataset`，返回 `rigids_apo/holo` + `torsion_apo/holo`（θ_apo/θ_holo，主线用 χ slice）+ ESM / ligand / w_res；
   3. `TorsionFlowNet` 模型实现（可以借 Stage1 的 LigandConditioner + Transformer block）；
   4. Flow Matching 的训练 loop + 几何 regularizer（调用你现有 loss 模块）。
 
@@ -504,7 +527,7 @@ Stage‑2 in BINDRAE is designed as a **ligand‑conditioned, pocket‑gated bri
   * Frozen ESM‑2 per‑residue embeddings (same as Stage‑1).
   * Apo and holo backbone coordinates (N, Cα, C) and per‑residue torsions (φ, ψ, ω, χ1–χ4).
   * Ligand tokens: 3D coordinates of heavy atoms + **direction probes** + 20‑D type/topology features (element, aromaticity, ring/degree buckets, hetero‑neighbor counts, etc.).
-  * Pocket weights `w_res` derived from the holo complex (residue–ligand distance + graph expansion + RBF soft weighting).
+  * Pocket weights `w_res` computed by a reproducible geometric rule (residue–ligand distance + graph expansion + RBF/Logistic soft weighting); recommended default is **apo backbone + ligand pose expressed in the apo frame** for train/inference consistency (optionally union with holo‑based weights when available).
 
 * **Outputs**
 
@@ -550,7 +573,7 @@ For each triplet:
      * 20‑D ligand type/topology feature vector per token.
 5. **Pocket weights**
 
-   * Compute `w_res[N]` from holo + ligand, using the exact same distance‑based + graph‑expansion + RBF weighting used in Stage‑1.
+   * Compute `w_res[N]` using the same distance‑based + graph‑expansion + soft weighting used in Stage‑1, but recommended default is **apo + ligand pose (apo frame)** for train/inference consistency; when holo is available you may additionally compute `w_res^holo` for analysis or take a union.
 6. **ESM features**
 
    * Cache ESM‑2 per‑residue embeddings once per sequence (shared by apo and holo).
@@ -571,24 +594,26 @@ Each Stage‑2 training sample is packaged into a `Stage2Batch` (analogous to `I
 
 ### 3. State Representation
 
-Stage‑2 operates on a **hybrid state** combining rigid backbone frames and torsion angles:
+Stage‑2 operates on a **hybrid state** combining rigid backbone frames and sidechain torsion angles (χ):
 
 * **Rigid frames**:
   For residue (i), a rotation (R_i(t) \in SO(3)) and translation (t_i(t) \in \mathbb{R}^3), representing an N/Cα/C frame (same convention as Stage‑1 FK).
-* **Torsion angles**:
-  Per residue 7‑tuple (\theta_i(t) = (\phi, \psi, \omega, \chi_1,\dots,\chi_4)).
-  Internally represented as `(sin, cos)` pairs to avoid angle wrap issues, consistent with Stage‑1.
+* **Sidechain torsion angles (mainline)**:
+  Per residue (\chi_i(t) = (\chi_1,\dots,\chi_4)), masked by `chi_mask`.
+  Backbone torsions (\phi,\psi,\omega) are **not** treated as explicit time‑evolving state variables in the recommended mainline (they can be derived from `rigids(t)` or kept as auxiliary supervision / bookkeeping).
+  Internally, torsions are represented as `(sin, cos)` pairs to avoid angle wrap issues, consistent with Stage‑1.
+  (For baseline/ablation, you may also model the full 7‑tuple torsions.)
 
 The full state at time (t) is:
 
 [
-x(t) = { \text{rigids}(t), \ \theta(t) }
+x(t) = { \text{rigids}(t), \ \chi(t) }
 ]
 
 With endpoints:
 
-* (x(0)) from `(rigids_apo, torsion_apo)`
-* (x(1)) from `(rigids_holo, torsion_holo)`
+* (x(0)) from `(rigids_apo, chi_apo)` where `chi_apo` is the χ‑slice of `torsion_apo`
+* (x(1)) from `(rigids_holo, chi_holo)` where `chi_holo` is the χ‑slice of `torsion_holo`
 
 ---
 
@@ -598,7 +623,7 @@ Stage‑2 learns a **time‑dependent vector field**:
 
 [
 v_\Theta(x,t \mid \text{seq}, \text{lig}, w_{\text{res}})
-= \left{ \frac{d}{dt}\text{rigids}(t), \ \frac{d}{dt}\theta(t) \right}
+= \left\{ \frac{d}{dt}\text{rigids}_{\text{state}}(t), \ \frac{d}{dt}\chi(t) \right\}
 ]
 
 such that integrating this field from apo state at (t=0) yields the holo state at (t=1).
@@ -609,7 +634,8 @@ For a given state (x(t)):
 
 1. **Decode coordinates via FK**
 
-   * Use the same OpenFold‑style FK module as Stage‑1 to reconstruct atom14 coordinates from `rigids(t)` + `torsions(t)` + `aatype`.
+   * **Mainline**: reconstruct atom14 coordinates from `rigids_state(t)` + `chi(t)` (+ `aatype`), where backbone torsions (φ/ψ/ω) are **not** explicit time‑evolving state variables (they can be derived from `rigids_state(t)` when needed, or kept fixed as a baseline).
+   * **Baseline/ablation**: optionally use full torsions `θ(t)=(φ,ψ,ω,χ1..4)` and decode from `rigids_state(t)` + `θ(t)`.
 2. **Edge features (EdgeEmbedder)**
 
    * Build residue–residue pair features from current Cα coordinates (RBF distances, etc.), using the Stage‑1 `EdgeEmbedder`.
@@ -622,7 +648,8 @@ For a given state (x(t)):
    * Apply protein–ligand cross‑attention + FiLM modulation to residue features **before and between** FlashIPA layers (same schedule as Stage‑1).
 5. **FlashIPA stack**
 
-   * Run a small stack (e.g. 3 layers) of FlashIPA to obtain **ligand‑aware geometric features** `h_i(t)` and refined rigid frames (optional).
+   * Run a small stack (e.g. 3 layers) of FlashIPA to obtain **ligand‑aware geometric features** `h_i(t)`.
+   * FlashIPA may internally update a set of encoder rigids (`rigids_enc`) for attention geometry, but these are **not written back** to the explicit state `rigids_state(t)` (single-source-of-truth for state evolution).
 
 In other words, Stage‑2 reuses the Stage‑1 “geometry trunk” (ESM Adapter + EdgeEmbedder + LigandConditioner + FlashIPA) as an encoder of intermediate states along the apo→holo path.
 
@@ -637,7 +664,7 @@ g_i(t) = \sigma\big( \mathrm{MLP}([h_i(t), w_{\text{res},i}, \mathrm{time_embed}
 * `g_i(t) ∈ (0,1)` indicates how much residue (i) is allowed to move at time (t).
 * Pocket residues (high `w_res`) tend to have `g_i` closer to 1, non‑pocket residues closer to 0.
 
-This gate scales the predicted velocities for both rigid frames and torsions, effectively making the vector field **pocket‑gated**.
+This gate scales the predicted velocities for both rigid frames and χ torsions, effectively making the vector field **pocket‑gated**.
 
 #### 4.3 Velocity heads
 
@@ -645,9 +672,12 @@ Two heads are attached on top of `h_i(t)`:
 
 1. **Torsion velocity head**
 
-   * Input: `h_i(t)`, encoded torsions `θ_i(t)` (sin/cos), `w_res[i]`, time embedding.
-   * Output: angular velocities `dθ_i/dt ∈ ℝ⁷`.
-   * Loss is computed using wrap‑aware metrics (e.g. `1 − cos(Δθ)`), as in Stage‑1 torsion loss.
+   * **Mainline (χ‑only)**:
+     * Input: `h_i(t)`, encoded χ torsions `χ_i(t)` (sin/cos), `w_res[i]`, time embedding.
+     * Output: angular velocities `dχ_i/dt ∈ ℝ⁴` (masked by `chi_mask`).
+     * Loss is computed using wrap‑aware metrics (e.g. `1 − cos(Δχ)`), consistent with Stage‑1 torsion loss.
+   * **Baseline/ablation (full torsion)**:
+     * Output: `dθ_i/dt ∈ ℝ⁷` for (φ,ψ,ω,χ1..4).
 
 2. **Rigid frame velocity head**
 
@@ -669,14 +699,15 @@ Stage‑2 is trained with a combination of **conditional flow matching** and **g
 
 For each apo–holo pair ((x_0, x_1)), a simple **reference bridge** is defined:
 
-* **Torsions**
+* **Sidechain χ torsions (mainline)**
 
-  * Compute wrapped difference: `Δθ = wrap_to_pi(θ_holo − θ_apo)`.
+  * Compute wrapped difference: `Δχ = wrap_to_pi(χ_holo − χ_apo)`.
   * Reference trajectory:
     [
-    θ^{\text{ref}}_t = θ_0 + γ(t) Δθ + σ(t) ξ,\quad ξ \sim \mathcal{N}(0,I)
+    χ^{\text{ref}}_t = χ_0 + γ(t) Δχ + σ(t) ξ,\quad ξ \sim \mathcal{N}(0,I)
     ]
     where `γ(t)` is a smooth schedule (e.g. linear or smoothstep) and `σ(t)` a Brownian bridge‑style noise schedule vanishing at endpoints.
+  * (Baseline/ablation) You may also define the bridge on full torsions `θ=(φ,ψ,ω,χ)`; in that case replace χ by θ throughout.
 * **Rigid frames (SE(3))**
 
   * For each residue, define a geodesic on SE(3) from `rigids_apo` to `rigids_holo`, optionally adding small equivariant Brownian noise as in Schrödinger‑bridge‑style bridges.
@@ -707,7 +738,8 @@ To ensure that integrating the learned vector field from `x_0` indeed reaches `x
   numerically from `t=0` to `t=1` starting at `x_0` to obtain `x_Θ(1)`.
 * Apply:
 
-  * A torsion‑level L2 loss on `(θ_Θ(1), θ_holo)`.
+  * **Mainline**: a χ‑level L2 / wrap‑aware loss on `(χ_Θ(1), χ_holo)` (masked by `chi_mask`).
+  * (Baseline/ablation) a torsion‑level loss on full `(θ_Θ(1), θ_holo)` for `(φ,ψ,ω,χ)` if you choose to model full torsions.
   * A backbone FAPE loss between decoded coordinates from `x_Θ(1)` and true holo coordinates.
 
 This term can be computed less frequently (e.g. every few steps) to control cost.
@@ -728,14 +760,22 @@ For a set of intermediate times ({t_k}), states `x(t_k)` are decoded via FK to a
    * Penalize large violations of approximate monotonic increase in `C(t)` as `t` approaches 1, encouraging physically interpretable “binding” paths.
 4. **Stage‑1 prior alignment (late‑time)**
 
-   * For time steps `t > t_mid` (e.g. >0.5), add a soft penalty that encourages `θ(t)` to approach the ligand‑conditioned holo torsions predicted by the trained Stage‑1 decoder (acting as a fixed holo prior).
+   * For time steps `t > t_mid` (e.g. >0.5), add a soft penalty that encourages `χ(t)` to approach the ligand‑conditioned holo‑like χ torsions predicted by the trained Stage‑1 decoder (acting as a fixed holo prior).
+   * (Optional, for large backbone motion) also add a weak late‑time prior on `rigids_state(t)` towards a coarse endpoint (e.g. Stage‑1 predicted frames or an NMA/ENM‑based endpoint initialization).
+5. **Background stability (recommended default)**
+
+   * Add a velocity‑magnitude penalty on non‑pocket residues to suppress far‑field drift:
+     \[
+     L_{\text{bg}}=\sum_i (1-w_{\text{res},i})^\beta \left(\|\dot t_i\|^2+\|\dot\omega_i\|^2+\|\dot\chi_i\|^2\right).
+     \]
+   * This makes the “pocket‑focused motion” assumption explicit and matches the recommended mainline spec in `Stage2理论与指导.md`.
 
 #### 5.4 Total loss
 
 The total Stage‑2 loss is a weighted sum:
 
 [
-L = L_{\text{FM}} + \lambda_{\text{end}} L_{\text{endpoint}}
+L = L_{\text{FM}} + \lambda_{\text{end}} L_{\text{endpoint}} + \lambda_{\text{bg}} L_{\text{bg}}
 
 * \lambda_{\text{geom}}(L_{\text{smooth}} + L_{\text{clash}} + L_{\text{contact}} + L_{\text{prior}})
   ]
@@ -769,8 +809,8 @@ In scenarios where only apo + ligand are available:
 1. Use Stage‑1 as a **ligand‑conditioned holo prior**:
 
    * Input: apo backbone + ESM + ligand tokens.
-   * Output: a plausible holo‑like torsion `θ_stage1`.
-2. Set `x_1` to `(rigids from apo + θ_stage1)` or fully refine with Stage‑1’s FK/IPA if desired.
+   * Output: a plausible holo‑like sidechain torsion `χ_stage1` (and optionally a refined backbone frame field `rigids_stage1`).
+2. Set `x_1` to `(rigids_apo + χ_stage1)` by default, or use `(rigids_stage1 + χ_stage1)` when available / when targeting large backbone motion.
 3. Run Stage‑2 LC‑BridgeFlow between `x_0` (true apo) and this prior‑based `x_1` to obtain a plausible apo→holo path.
 
 ---
@@ -906,7 +946,7 @@ TorsionFlowNet 表示刚才方法说明里的 `v_Θ(x,t|cond)`。这只是一个
 class TorsionFlowNet(torch.nn.Module):
     """
     Ligand-conditioned, pocket-gated hybrid bridge flow:
-    predicts d(torsion)/dt and d(rigids)/dt for a given state x(t).
+    mainline predicts d(chi)/dt and d(rigids)/dt for a given state x(t).
     """
 
     def __init__(self,
@@ -948,11 +988,11 @@ class TorsionFlowNet(torch.nn.Module):
             torch.nn.Linear(c_s, 1),
         )
 
-        # 8) Torsion velocity head: [c_s + 7*2 + 1 + d_time] -> [7]
-        self.torsion_head = torch.nn.Sequential(
-            torch.nn.Linear(c_s + 14 + 1 + 64, c_s),
+        # 8) χ velocity head: [c_s + 4*2 + 1 + d_time] -> [4]
+        self.chi_head = torch.nn.Sequential(
+            torch.nn.Linear(c_s + 8 + 1 + 64, c_s),
             torch.nn.SiLU(),
-            torch.nn.Linear(c_s, 7),
+            torch.nn.Linear(c_s, 4),
         )
 
         # 9) Rigid velocity head: [c_s + 1 + d_time] -> [3 + 3] (rot + trans)
@@ -964,7 +1004,7 @@ class TorsionFlowNet(torch.nn.Module):
 
     def forward(self,
                 # state at time t
-                torsion: torch.FloatTensor,   # [B, N, 7] angles in radians
+                chi: torch.FloatTensor,       # [B, N, 4] angles in radians (χ1..χ4, masked by chi_mask)
                 rigids: object,               # Rigid[B, N] or [B, N, 4, 4]
                 # static conditioning
                 esm: torch.FloatTensor,       # [B, N, d_esm]
@@ -979,14 +1019,14 @@ class TorsionFlowNet(torch.nn.Module):
         """
         Returns:
             {
-                "d_torsion": [B, N, 7],     # angular velocities
+                "d_chi": [B, N, 4],         # χ angular velocities
                 "d_rigid_rot": [B, N, 3],   # axis-angle velocities
                 "d_rigid_trans": [B, N, 3], # translation velocities
                 "gate": [B, N, 1]           # pocket gate (0..1)
             }
         """
 
-        B, N, _ = torsion.shape
+        B, N, _ = chi.shape
 
         # 1) time embedding
         t_emb = self.time_embed(t)          # [B, d_time]
@@ -995,10 +1035,16 @@ class TorsionFlowNet(torch.nn.Module):
         # 2) ESM adapter
         s0 = self.esm_adapter(esm)          # [B, N, c_s]
 
-        # 3) decode coords from (rigids, torsion) via FK (OpenFold FK)
+        # 3) decode coords from (rigids_state, chi) via FK (OpenFold FK)
+        # Build full torsions [B,N,7] = [phi,psi,omega (derived or fixed), chi1..4]
+        torsion_full = assemble_torsion_full(
+            rigids=rigids,
+            chi=chi,
+            # backbone torsions can be derived from rigids or taken from apo as a baseline
+        )
         coords_atom14 = fk_from_torsion_and_rigid(
             rigids=rigids,
-            torsion=torsion,
+            torsion=torsion_full,
             aatype=aatype,
         )  # e.g. [B, N, 14, 3]
 
@@ -1012,11 +1058,11 @@ class TorsionFlowNet(torch.nn.Module):
 
         # 6) Ligand-conditioned features via FlashIPA stack
         s = s0
-        rigids_geo = rigids
+        rigids_enc = rigids  # encoder-only rigids; do NOT overwrite state rigids
         for ipa_layer in self.ipa_stack.layers:
             # ligand conditioning before each IPA
             s = self.ligand_conditioner(s, lig_tok, lig_mask)
-            s, rigids_geo = ipa_layer(s, rigids_geo, z_f1, z_f2)
+            s, rigids_enc = ipa_layer(s, rigids_enc, z_f1, z_f2)
 
         h = s  # [B, N, c_s]
 
@@ -1024,14 +1070,14 @@ class TorsionFlowNet(torch.nn.Module):
         gate_input = torch.cat([h, w_res.unsqueeze(-1), t_emb], dim=-1)  # [B,N,c_s+1+d_time]
         gate = torch.sigmoid(self.gate_mlp(gate_input))                  # [B,N,1]
 
-        # 8) torsion velocity
-        # encode torsions as sin/cos
-        sin_cos = torch.stack([torch.sin(torsion), torch.cos(torsion)], dim=-1)  # [B,N,7,2]
-        sin_cos = sin_cos.view(B, N, 14)  # flatten last two dims
+        # 8) χ velocity
+        # encode χ as sin/cos
+        sin_cos = torch.stack([torch.sin(chi), torch.cos(chi)], dim=-1)  # [B,N,4,2]
+        sin_cos = sin_cos.view(B, N, 8)  # flatten last two dims
 
-        tor_input = torch.cat([h, sin_cos, w_res.unsqueeze(-1), t_emb], dim=-1)
-        d_torsion = self.torsion_head(tor_input)           # [B,N,7]
-        d_torsion = d_torsion * gate.squeeze(-1)           # pocket-gated
+        chi_input = torch.cat([h, sin_cos, w_res.unsqueeze(-1), t_emb], dim=-1)
+        d_chi = self.chi_head(chi_input)                    # [B,N,4]
+        d_chi = d_chi * gate.squeeze(-1).unsqueeze(-1)      # pocket-gated
 
         # 9) rigid velocity
         rigid_input = torch.cat([h, w_res.unsqueeze(-1), t_emb], dim=-1)
@@ -1041,7 +1087,7 @@ class TorsionFlowNet(torch.nn.Module):
         d_trans = d_trans * gate.squeeze(-1)
 
         return {
-            "d_torsion": d_torsion,
+            "d_chi": d_chi,
             "d_rigid_rot": d_rot,
             "d_rigid_trans": d_trans,
             "gate": gate,
@@ -1077,45 +1123,46 @@ class Stage2Trainer:
     def sample_reference_bridge(self, batch: Stage2Batch, t: torch.FloatTensor):
         """
         Build reference states x_ref(t) and velocities u_ref(t)
-        for both torsions and rigids, given apo/holo endpoints.
+        for both chi and rigids, given apo/holo endpoints.
 
         Inputs:
             batch: Stage2Batch
             t: [B] sampled in (0,1)
 
         Returns:
-            torsion_ref: [B,N,7]
+            chi_ref: [B,N,4]
             rigids_ref:  Rigid[B,N]
-            d_torsion_ref: [B,N,7]
+            d_chi_ref: [B,N,4]
             d_rigid_rot_ref: [B,N,3]
             d_rigid_trans_ref: [B,N,3]
         """
         # 1) unpack endpoints
-        theta0 = batch.torsion_apo.to(self.device)   # [B,N,7]
-        theta1 = batch.torsion_holo.to(self.device)
+        # torsion_apo/holo stores full (phi, psi, omega, chi1..4); mainline uses chi slice
+        chi0 = batch.torsion_apo[..., 3:7].to(self.device)   # [B,N,4]
+        chi1 = batch.torsion_holo[..., 3:7].to(self.device)  # [B,N,4]
         R0 = batch.rigids_apo    # Rigid[B,N] or [B,N,4,4]
         R1 = batch.rigids_holo
 
-        # 2) torsion reference
+        # 2) chi reference
         # wrap angle difference to (-pi,pi]
-        delta_theta = wrap_to_pi(theta1 - theta0)
+        delta_chi = wrap_to_pi(chi1 - chi0)
 
         # gamma(t) schedule (e.g. linear)
         gamma = t.view(-1, 1, 1)  # [B,1,1]
-        theta_ref = theta0 + gamma * delta_theta      # [B,N,7]
+        chi_ref = chi0 + gamma * delta_chi            # [B,N,4]
 
         # additive noise (optional)
         # sigma(t) ~ lambda * sqrt(t(1-t))
         # ...
 
         # derivative wrt t
-        d_theta_ref = delta_theta   # if gamma(t)=t
+        d_chi_ref = delta_chi       # if gamma(t)=t
 
         # 3) rigid reference (geodesic on SE(3))
         rigids_ref, d_rot_ref, d_trans_ref = \
             se3_geodesic_bridge(R0, R1, t)  # shapes [B,N] and [B,N,3], [B,N,3]
 
-        return theta_ref, rigids_ref, d_theta_ref, d_rot_ref, d_trans_ref
+        return chi_ref, rigids_ref, d_chi_ref, d_rot_ref, d_trans_ref
 
     def training_step(self, batch: Stage2Batch) -> torch.Tensor:
         batch = move_batch_to_device(batch, self.device)
@@ -1126,12 +1173,12 @@ class Stage2Trainer:
         t = torch.rand(B, device=self.device)
 
         # 2) reference bridge states & velocities
-        (theta_ref, rigids_ref,
-         d_theta_ref, d_rot_ref, d_trans_ref) = self.sample_reference_bridge(batch, t)
+        (chi_ref, rigids_ref,
+         d_chi_ref, d_rot_ref, d_trans_ref) = self.sample_reference_bridge(batch, t)
 
         # 3) forward pass: predict velocities at x_ref(t)
         out = self.model(
-            torsion=theta_ref,           # [B,N,7]
+            chi=chi_ref,                # [B,N,4]
             rigids=rigids_ref,
             esm=batch.esm,               # [B,N,d_esm]
             aatype=batch.aatype,         # [B,N]
@@ -1142,33 +1189,32 @@ class Stage2Trainer:
             t=t,                         # [B]
         )
 
-        d_theta_pred = out["d_torsion"]      # [B,N,7]
+        d_chi_pred = out["d_chi"]            # [B,N,4]
         d_rot_pred   = out["d_rigid_rot"]    # [B,N,3]
         d_trans_pred = out["d_rigid_trans"]  # [B,N,3]
 
-        # 4) Flow Matching loss (torsion + rigid), pocket-weighted
+        # 4) Flow Matching loss (chi + rigid), pocket-weighted
         w_res = batch.w_res.unsqueeze(-1)    # [B,N,1]
-        bb_mask = batch.bb_mask[..., 0]      # [B,N] use a simple mask
-        chi_mask = batch.chi_mask.any(dim=-1)# [B,N]
-        tor_mask = torch.cat([bb_mask, chi_mask], dim=-1)  # [B,N,7]
+        chi_mask = batch.chi_mask.to(self.device).float()  # [B,N,4]
 
-        fm_torsion = ((d_theta_pred - d_theta_ref) ** 2) * w_res * tor_mask.unsqueeze(-1)
-        L_fm_torsion = fm_torsion.sum() / (tor_mask.sum() + 1e-8)
+        fm_chi = ((d_chi_pred - d_chi_ref) ** 2) * w_res * chi_mask
+        L_fm_chi = fm_chi.sum() / (chi_mask.sum() + 1e-8)
 
         fm_rot = ((d_rot_pred - d_rot_ref) ** 2) * w_res
         fm_trans = ((d_trans_pred - d_trans_ref) ** 2) * w_res
         L_fm_rigid = (fm_rot.sum() + fm_trans.sum()) / (w_res.sum() + 1e-8)
 
-        L_FM = self.w["fm_torsion"] * L_fm_torsion + self.w["fm_rigid"] * L_fm_rigid
+        L_FM = self.w["fm_chi"] * L_fm_chi + self.w["fm_rigid"] * L_fm_rigid
 
         # 5) geometry/path regularization at one or more time points
-        # Decode coords from (rigids_ref, theta_ref) via FK
-        coords_ref = self.fk(rigids_ref, theta_ref, batch.aatype)  # [B,N,14,3]
+        # Decode coords from (rigids_ref, chi_ref) via FK
+        torsion_full = assemble_torsion_full(rigids=rigids_ref, chi=chi_ref)
+        coords_ref = self.fk(rigids_ref, torsion_full, batch.aatype)  # [B,N,14,3]
 
         # Compute FAPE smoothness, clash, contact monotonicity, Stage-1 prior regularization...
         L_geom = compute_geometry_losses(
             coords_ref=coords_ref,
-            torsion_ref=theta_ref,
+            chi_ref=chi_ref,
             batch=batch,
             t=t,
         )
@@ -1192,3 +1238,102 @@ class Stage2Trainer:
 ---
 
 如果你愿意，下一步我们可以针对你实际代码结构，把这些伪代码拆成真模块（比如 `src/stage2/models/torsion_flow.py`, `src/stage2/datasets/dataset_bridge.py`, `src/stage2/training/trainer.py`），直接给出更完整的 skeleton。
+
+---
+
+## 附录：顶会/顶刊审稿人 Checklist（用于论文叙事与实验打穿）
+
+> 目的：把“方法闭环”进一步升级成“论文级不可替代贡献 + 可复现实验铁证 + 风险点提前堵死”的执行清单。
+> 口径以本文主线 `x(t)=(F(t),χ(t))` 为准（full‑torsion 7D 仅作为 baseline/ablation）。
+
+### 1) 贡献（必须钉成 2–3 条不可替代陈述）
+
+审稿人最常见质疑是“工程拼装”。你需要把贡献写成可验收的 claim（并对应实验表格）：
+
+1. **Path-level biophysical constraints as training-time control**：不是只优化终点，而是把 `clash/contact/smoothness` 提升为路径级可控先验，并量化路径质量指标（而非只报终点误差）。
+2. **Pocket-gated vector field + background stability (`L_bg`)**：`gate` 负责“哪里允许动”，`L_bg` 负责“哪里必须别乱动”，并证明两者缺一不可（因果消融）。
+3. **Apo+ligand-only inference as a first-class mode**：把真实使用场景写进系统闭环（Stage‑1 生成 pseudo‑holo endpoint，Stage‑2 生成通路），而不是只在“已知 holo”里自洽。
+
+> 写论文时建议用“我们解锁了一个以前做不到的任务/指标”的表述，而不是“更优雅”。
+
+### 2) 数据与划分（决定可接受性的硬门槛）
+
+顶会很常见的拒稿理由：数据构建不透明/不严谨 → 结果不可复现或存在泄漏。建议在方法/附录中强制给出：
+
+- **去冗余 split（至少 protein split）**：按序列同源（如 30%/40% identity）做 train/val/test；数据量允许的话，再加 ligand scaffold split（或至少作为补充分析）。
+- **apo/holo pair 质量过滤**：缺失残基、链不一致、对齐失败、配体不一致/过度类似物导致的伪配对要筛掉；否则桥流在学 label noise。
+- **分桶评估**：按 apo→holo backbone 变化程度（例如 RMSD / domain motion 指标）分 `small` vs `large` bucket，并分别报告终点+路径指标。
+
+### 3) 路径的含义（提前收敛 claim，避免被问死）
+
+你要主动写清楚：
+
+- **不宣称真实动力学时间**；宣称的是“在几何与接触先验约束下的可解释构象通路（geometrically & sterically plausible transition pathway）”。
+- 所有 claim 必须落在可度量指标上：平均 clash%、contact 单调性违例比例、路径平滑度（FAPE/Cα smoothness）、终点误差（pocket iRMSD/FAPE 等）。
+
+### 4) 最容易翻车的点（必须提前堵）
+
+#### A. 口径一致性（主线 vs baseline）
+
+- 主线固定：`(F,χ)`（χ‑only 4D，mask 控制）。
+- full‑torsion 7D 只能作为 ablation（appendix），不要在主线实现/接口里混成两套“主线”。
+
+#### B. Gate 的因果性（避免被喷成 heuristic）
+
+必须做最直接的因果消融矩阵（并同时报终点+路径指标）：
+
+1. `gate ≡ 1`（无 gate）
+2. `gate = gate(w_res)`（不看 h_i(t)）
+3. `gate = gate(h_i(t))`（不看 w_res）
+4. `gate + L_bg` vs `gate-only`
+
+并报告：`gate` 是否真的学到“口袋运动学”，而不是把 loss 权重硬编码了一遍。
+
+#### C. 已知 bound pose 假设（把限制变成亮点）
+
+如果任务定位为“已知 pose 的结构解释/路径生成”，请写清楚；同时建议补一个 **pose 噪声敏感性曲线**：
+
+- 对 ligand pose 注入不同 RMSD 的扰动（或用 docked pose），报告终点与路径指标怎么掉；
+- 展示 `gate + L_bg + path regs` 对 pose noise 更稳/更可控。
+
+### 5) 顶会级实验包（按优先级）
+
+#### P0（不做基本会被拒）：核心对照 + 消融矩阵
+
+至少四个 baseline（并报终点 + 路径指标）：
+
+1. **Linear interpolation**（rigid geodesic + χ circular interpolation）
+2. **Stage‑1 直接预测 holo**（只有终点，无路径）
+3. **Stage‑2 (FM only)**（无几何正则/无 prior）
+4. **Stage‑2 (FM + path regs + gate + L_bg + late prior)**（全量主方法）
+
+关键消融（建议做成表格矩阵）：
+
+- 去掉 `L_contact`（你把它定义成重要 novel prior，就必须单独打）
+- 去掉 `L_prior`（late-time Stage‑1 prior）
+- 关掉 rigid head（只动 χ）vs 全开
+- χ‑only vs 7D torsion（appendix）
+
+#### P1（增强说服力）：小变构 vs 大变构分桶
+
+- 分桶后分别报告提升/退化；
+- NMA‑guided gating 建议只在 `large` bucket 启用，并做闭环（`w_eff`/loss reweighting + time‑decay）验证。
+
+#### P2（Nature 更吃）：2–3 个 case study
+
+- 画 `C(t)`、clash 曲线、关键残基 χ1 翻转时刻；
+- 给结构帧序列可视化，讲“机制解释价值”（而不是数值游戏）。
+
+### 6) 复现稳定性（默认配置要写进主方法，不要只放附录）
+
+建议把“稳定性最小闭环配置”写成默认：
+
+- ODE 积分：Heun/RK4（优先于纯 Euler）
+- 路径正则时间点数：`K≈3–5`（clash 子采样方案 A），endpoint consistency 稀疏启用
+- 旋转 log/exp 数值稳定、mask/padding/atom14 处理一致性（否则路径级 clash 会被放大）
+
+### 7) Rebuttal 预案（审稿人常问三连）
+
+1. **“你是不是工程拼装？”** → 用第 1 节三条 contribution + 对应消融表格回答
+2. **“数据是否泄漏/挑样本？”** → 用第 2 节 split/过滤规则与统计表回答
+3. **“路径有什么物理意义？”** → 用第 3 节 claim 收敛 + 路径指标曲线回答

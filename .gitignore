@@ -5,6 +5,10 @@
 # 数据目录（太大，使用 GitHub Release 分发）
 data/
 
+# RP 图表/产物
+RP/
+docs/RP/
+
 # Python 编译文件
 *.pyc
 __pycache__/
