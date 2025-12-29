@@ -2,7 +2,7 @@
 Stage-1 完整模型
 
 架构：
-ESM-2(冻结) → Adapter → IPA → LigandCond → TorsionHead
+ESM-2(冻结) → Adapter → IPA → LigandCond → ChiHead
 
 Author: BINDRAE Team
 Date: 2025-10-28
@@ -26,7 +26,7 @@ from flash_ipa.rigid import Rigid, Rotation
 from .adapter import ESMAdapter
 from .ipa import FlashIPAModule, FlashIPAModuleConfig
 from .ligand_condition import LigandConditioner, LigandConditionerConfig
-from .torsion_head import TorsionHead, Chi1RotamerHead
+from .torsion_head import TorsionHead
 from .fk_openfold import OpenFoldFK, create_openfold_fk
 from ..modules.edge_embed import EdgeEmbedderAdapter, ProjectEdgeConfig
 from ..data.residue_constants import restype_order
@@ -60,8 +60,9 @@ class Stage1ModelConfig:
     num_heads_cross: int = 8
     warmup_steps: int = 2000
     
-    # TorsionHead
+    # Chi Head
     torsion_hidden: int = 128
+    chi_angles: int = 4
     
     # 通用
     dropout: float = 0.1
@@ -76,7 +77,7 @@ class Stage1Model(nn.Module):
     Stage-1 完整模型
     
     流程：
-    ESM → Adapter → EdgeEmbed → IPA → LigandCond → TorsionHead
+    ESM → Adapter → EdgeEmbed → IPA → LigandCond → ChiHead
     """
     
     def __init__(self, config: Stage1ModelConfig):
@@ -128,17 +129,12 @@ class Stage1Model(nn.Module):
         )
         self.ligand_conditioner = LigandConditioner(ligand_config)
         
-        # 5. TorsionHead
-        self.torsion_head = TorsionHead(
+        # 5. Chi Head (only chi1-4)
+        self.chi_head = TorsionHead(
             c_s=config.c_s,
             c_hidden=config.torsion_hidden,
-            dropout=config.dropout
-        )
-        # χ1 rotamer 分类头
-        self.chi1_head = Chi1RotamerHead(
-            c_s=config.c_s,
-            c_hidden=config.torsion_hidden,
-            dropout=config.dropout
+            dropout=config.dropout,
+            n_angles=config.chi_angles
         )
         
         # 6. FK模块（扭转角→全原子坐标）
@@ -172,18 +168,18 @@ class Stage1Model(nn.Module):
         return aatype
     
     def forward(self,
-                batch: 'IPABatch',
+                batch: 'Stage1Batch',
                 current_step: int = 0) -> Dict[str, torch.Tensor]:
         """
         前向传播
         
         Args:
-            batch: IPABatch数据
+            batch: Stage1Batch数据
             current_step: 当前训练步数（用于warmup）
             
         Returns:
             {
-                'pred_torsions': [B, N, 7, 2] 预测的扭转角(sin,cos)
+                'pred_chi': [B, N, 4, 2] 预测的chi(sin, cos)
                 's_final': [B, N, c_s] 最终节点表示
                 'rigids_final': Rigid对象
             }
@@ -194,11 +190,10 @@ class Stage1Model(nn.Module):
         # 1. ESM Adapter
         s = self.esm_adapter(batch.esm)  # [B, N, 384]
         
-        # 2. 创建初始Rigid帧（从N, Ca, C）
-        # 简化：用单位旋转 + Ca作为平移
-        rot_identity = torch.eye(3, device=device).unsqueeze(0).unsqueeze(0).expand(B, N, -1, -1)
-        rotation = Rotation(rot_mats=rot_identity)
-        rigids = Rigid(rots=rotation, trans=batch.Ca)
+        # 2. 创建初始Rigid帧（从apo的N, CA, C）
+        rigids = self._build_rigids_from_backbone(
+            batch.N_apo, batch.Ca_apo, batch.C_apo, batch.node_mask
+        )
         
         # 3. LigandConditioner（在IPA前注入，符合理论）
         # 理论：配体信息应该影响IPA的几何建模（docs/理论 第15-26行）
@@ -212,7 +207,7 @@ class Stage1Model(nn.Module):
         )
         
         # 4. EdgeEmbedder
-        edge_outputs = self.edge_embedder(s_with_ligand, batch.Ca, batch.node_mask)
+        edge_outputs = self.edge_embedder(s_with_ligand, batch.Ca_apo, batch.node_mask)
         z_f1 = edge_outputs['z_f1']
         z_f2 = edge_outputs['z_f2']
         
@@ -232,23 +227,64 @@ class Stage1Model(nn.Module):
         )
         
         # 6. TorsionHead（使用IPA输出）
-        pred_torsions = self.torsion_head(s_geo)  # [B, N, 7, 2]
-        chi1_logits = self.chi1_head(s_geo)       # [B, N, 3]
+        pred_chi = self.chi_head(s_geo)  # [B, N, 4, 2]
         
         # 7. FK重建全原子坐标
         # 将序列转换为aatype索引
         aatype = self._sequence_to_aatype(batch.sequences, N, device)
-        
-        atom14_result = self.fk_module(pred_torsions, rigids_updated, aatype)
+
+        # 组装完整torsions: 使用apo的phi/psi/omega，预测chi
+        torsion_apo = batch.torsion_apo  # [B, N, 7] (phi/psi/omega/chi1-4)
+        torsion_apo = torsion_apo.to(device)
+        phi_psi_omega = torsion_apo[:, :, :3]
+        phi_psi_omega_sincos = torch.stack(
+            [torch.sin(phi_psi_omega), torch.cos(phi_psi_omega)], dim=-1
+        )  # [B, N, 3, 2]
+        torsions_sincos = torch.cat([phi_psi_omega_sincos, pred_chi], dim=2)  # [B,N,7,2]
+
+        atom14_result = self.fk_module(torsions_sincos, rigids_updated, aatype)
         
         return {
-            'pred_torsions': pred_torsions,
-            'chi1_logits': chi1_logits,
+            'pred_chi': pred_chi,
             's_final': s_geo,  # IPA输出（已含配体信息）
             'rigids_final': rigids_updated,
             'atom14_pos': atom14_result['atom14_pos'],      # [B, N, 14, 3]
             'atom14_mask': atom14_result['atom14_mask'],    # [B, N, 14]
         }
+
+    def _build_rigids_from_backbone(self,
+                                    N: torch.Tensor,
+                                    Ca: torch.Tensor,
+                                    C: torch.Tensor,
+                                    mask: torch.Tensor,
+                                    eps: float = 1e-8) -> Rigid:
+        """Build per-residue backbone frames from N/CA/C."""
+        # e1: CA -> C
+        e1 = C - Ca
+        e1 = e1 / (torch.norm(e1, dim=-1, keepdim=True) + eps)
+
+        # u: CA -> N
+        u = N - Ca
+        # e2: u orthogonalized to e1
+        proj = (u * e1).sum(dim=-1, keepdim=True) * e1
+        e2 = u - proj
+        e2 = e2 / (torch.norm(e2, dim=-1, keepdim=True) + eps)
+
+        # e3: right-handed
+        e3 = torch.cross(e1, e2, dim=-1)
+
+        R = torch.stack([e1, e2, e3], dim=-1)  # [B, N, 3, 3]
+        t = Ca
+
+        # For padded residues, set identity rotation and zero translation
+        if mask is not None:
+            mask = mask.unsqueeze(-1).unsqueeze(-1)
+            eye = torch.eye(3, device=R.device).view(1, 1, 3, 3)
+            R = torch.where(mask, R, eye)
+            t = torch.where(mask.squeeze(-1), t, torch.zeros_like(t))
+
+        rotation = Rotation(rot_mats=R)
+        return Rigid(rots=rotation, trans=t)
 
 
 def create_stage1_model(config: Optional[Stage1ModelConfig] = None) -> Stage1Model:
@@ -265,4 +301,3 @@ def create_stage1_model(config: Optional[Stage1ModelConfig] = None) -> Stage1Mod
         config = Stage1ModelConfig()
     
     return Stage1Model(config)
-

@@ -1,18 +1,17 @@
 """
-Stage-1 数据集模块
+Stage-1 dataset module (apo/holo/ligand triplets).
 """
 
-from .dataset_ipa import (
-    IPABatch,
-    CASF2016IPADataset,
-    collate_ipa_batch,
-    create_ipa_dataloader,
+from .dataset_stage1 import (
+    Stage1Batch,
+    ApoHoloTripletDataset,
+    collate_stage1_batch,
+    create_stage1_dataloader,
 )
 
 __all__ = [
-    'IPABatch',
-    'CASF2016IPADataset',
-    'collate_ipa_batch',
-    'create_ipa_dataloader',
+    'Stage1Batch',
+    'ApoHoloTripletDataset',
+    'collate_stage1_batch',
+    'create_stage1_dataloader',
 ]
-

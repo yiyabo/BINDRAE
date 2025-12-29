@@ -180,7 +180,7 @@ mask：
 Flow Matching（FM / CFM / PCFM）现在非常成熟了：
 
 * 给定起点分布 p₀（apo）和终点分布 p₁（holo），
-* 你指定一个“桥”路径 x_t（比如线性插值 + 噪声），
+* 你指定一个“桥”路径 x_t（这里采用 smoothstep 插值的 deterministic bridge），
 * 然后学一个 velocity field u_ϕ(x,t) 来逼近真速度 v*(x,t) = d/dt x_t。
 
 SBALIGN / DiSCO 则是在 SB 框架下，在蛋白/分子构象空间里学“带 prior 的桥”，本质上也是在学一个 time-dependent drift。
@@ -196,10 +196,10 @@ SBALIGN / DiSCO 则是在 SB 框架下，在蛋白/分子构象空间里学“�
 
 对每个样本：
 
-* 侧链 χ：用周期空间上的 wrap‑aware 插值/噪声桥（如下）；
-* backbone frames \(F\)：用 SE(3) 上的 geodesic +（可选）Lie algebra Brownian 扰动（实现细节建议参考 `Stage2理论与指导.md`）。
+* 侧链 χ：用周期空间上的 wrap‑aware 插值桥（deterministic）；
+* backbone frames \(F\)：用 SE(3) 上的 geodesic（实现细节参考 `Stage2理论与指导.md`）。
 
-下面先写 χ 的 deterministic path（先不加噪声）：
+下面给出 χ 的 deterministic path：
 
 1. 先对角做最短差值（考虑 wrap）：
 
@@ -207,31 +207,29 @@ SBALIGN / DiSCO 则是在 SB 框架下，在蛋白/分子构象空间里学“�
 Δχ = wrap_to_pi(χ_holo - χ_apo)  # 映射到 (-π, π]
 ```
 
-2. 选择一个 scalar schedule γ(t)，比如简单的 γ(t)=t 或 smoothstep：
+2. 选择平滑插值 schedule γ(t)（默认 smoothstep）：
 
 ```python
-γ(t) = t              # 简单线性
-或
-γ(t) = 3 t^2 - 2 t^3  # 在端点附近放缓
+γ(t) = 3 t^2 - 2 t^3
+γ'(t) = 6 t - 6 t^2
 ```
 
 3. 定义桥路径：
 
 ```python
-χ_t = χ_apo + γ(t) * Δχ  # 每个 χ 角线性插 / smooth 插
+χ_t = χ_apo + γ(t) * Δχ  # smoothstep 插值
 ```
 
 4. 解析真速度（target velocity）：
 
 ```python
 v*(χ_t, t) = dχ_t/dt = γ'(t) * Δχ
-# 若γ(t)=t，则 v* = Δχ（与 t 无关）
 ```
 
 这里最大的好处：**v* 不依赖 χ_t，只依赖 Δχ**，所以 target 很干净；
 在 PCFM 的框架里，这就是 textbook 的 pair-coupled velocity。
 
-你可以后面再叠加一个小的 Gaussian 噪声项，把它推向 SB，那是后话。
+当前实现为 deterministic bridge（不加噪声）。
 
 ### 4.3 Stage2 模型：Ligand-conditioned FlowNet（SE(3)+χ）
 
@@ -408,17 +406,24 @@ L_total = L_flow
    * `χ(0) = χ_apo`；
    * cond = {Adapter(ESM), Ligand tokens, w_res}。
 
-3. 数值积分解 ODE：
+3. 数值积分解 ODE（Heun / 二阶 RK）：
 
 ```python
 for step = 0..T-1:
     t = step / T
-    ω, v_trans, v_chi = u_ϕ(F(t), χ(t), t, cond)  # SE(3)^N + [N,4]
-    F(t+Δt) = update_rigid_right(F(t), ω, v_trans)
-    χ(t+Δt) = wrap_to_pi(χ(t) + Δt * v_chi)
+    ω, v_trans, v_chi = u_ϕ(F(t), χ(t), t, cond)
+
+    # 预测步（Euler）
+    F_pred = update_rigid_right(F(t), ω, v_trans, Δt)
+    χ_pred = wrap_to_pi(χ(t) + Δt * v_chi)
+
+    # 校正步（Heun）
+    ω2, v_trans2, v_chi2 = u_ϕ(F_pred, χ_pred, t+Δt, cond)
+    F(t+Δt) = update_rigid_right(F(t), 0.5*(ω+ω2), 0.5*(v_trans+v_trans2), Δt)
+    χ(t+Δt) = wrap_to_pi(χ(t) + 0.5*Δt*(v_chi+v_chi2))
 ```
 
-* 使用简单的 Euler 或 Heun / RK4；
+* 默认使用 Heun（二阶 RK）；
 * Δt = 1/T，比如 T=20~40。
 
 4. 路径解码：
@@ -704,13 +709,13 @@ For each apo–holo pair ((x_0, x_1)), a simple **reference bridge** is defined:
   * Compute wrapped difference: `Δχ = wrap_to_pi(χ_holo − χ_apo)`.
   * Reference trajectory:
     [
-    χ^{\text{ref}}_t = χ_0 + γ(t) Δχ + σ(t) ξ,\quad ξ \sim \mathcal{N}(0,I)
+    χ^{\text{ref}}_t = χ_0 + γ(t) Δχ,\quad \gamma(t)=3t^2-2t^3
     ]
-    where `γ(t)` is a smooth schedule (e.g. linear or smoothstep) and `σ(t)` a Brownian bridge‑style noise schedule vanishing at endpoints.
+    (deterministic bridge, no noise).
   * (Baseline/ablation) You may also define the bridge on full torsions `θ=(φ,ψ,ω,χ)`; in that case replace χ by θ throughout.
 * **Rigid frames (SE(3))**
 
-  * For each residue, define a geodesic on SE(3) from `rigids_apo` to `rigids_holo`, optionally adding small equivariant Brownian noise as in Schrödinger‑bridge‑style bridges.
+  * For each residue, define a geodesic on SE(3) from `rigids_apo` to `rigids_holo` (deterministic).
 
 The corresponding reference velocities (u^{\text{ref}}_t) (for torsions and frames) can be computed analytically from these interpolation formulas.
 
@@ -799,8 +804,6 @@ Given `(P_apo, P_holo, L)`:
 
 from `t=0` to `t=1` (e.g. with an ODE solver or fixed‑step integrator).
 3. Decode `x(t)` at discrete steps to atom14 structures via FK, obtaining a continuous apo→holo trajectory.
-
-Multiple stochastic variants can be obtained by adding small noise to initial conditions or by using an SDE analog of the learned vector field.
 
 #### 6.2 Apo + ligand only (using Stage‑1 holo prior)
 
@@ -1100,7 +1103,7 @@ class TorsionFlowNet(torch.nn.Module):
 
 Trainer 负责：
 
-* 采样时间 `t` 和噪声 `ξ`；
+* 采样时间 `t`；
 * 构建参考桥 `x_ref(t)` 和参考速度 `u_ref(t)`；
 * 调用 `TorsionFlowNet` 得到预测速度；
 * 用 Flow Matching + 几何正则组合总 loss 并反向。
@@ -1147,16 +1150,13 @@ class Stage2Trainer:
         # wrap angle difference to (-pi,pi]
         delta_chi = wrap_to_pi(chi1 - chi0)
 
-        # gamma(t) schedule (e.g. linear)
-        gamma = t.view(-1, 1, 1)  # [B,1,1]
+        # gamma(t) schedule (smoothstep)
+        gamma = (3 * t**2 - 2 * t**3).view(-1, 1, 1)  # [B,1,1]
         chi_ref = chi0 + gamma * delta_chi            # [B,N,4]
 
-        # additive noise (optional)
-        # sigma(t) ~ lambda * sqrt(t(1-t))
-        # ...
-
         # derivative wrt t
-        d_chi_ref = delta_chi       # if gamma(t)=t
+        dgamma = (6 * t - 6 * t**2).view(-1, 1, 1)
+        d_chi_ref = dgamma * delta_chi
 
         # 3) rigid reference (geodesic on SE(3))
         rigids_ref, d_rot_ref, d_trans_ref = \
@@ -1328,7 +1328,7 @@ class Stage2Trainer:
 
 建议把“稳定性最小闭环配置”写成默认：
 
-- ODE 积分：Heun/RK4（优先于纯 Euler）
+- ODE 积分：**Heun（二阶 RK）**
 - 路径正则时间点数：`K≈3–5`（clash 子采样方案 A），endpoint consistency 稀疏启用
 - 旋转 log/exp 数值稳定、mask/padding/atom14 处理一致性（否则路径级 clash 会被放大）
 

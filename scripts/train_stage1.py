@@ -26,7 +26,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Stage-1 训练')
     
     # 数据
-    parser.add_argument('--data_dir', type=str, default='data/casf2016',
+    parser.add_argument('--data_dir', type=str, default='data/apo_holo_triplets',
                        help='数据目录')
     parser.add_argument('--batch_size', type=int, default=4,
                        help='批大小')
@@ -43,10 +43,6 @@ def parse_args():
     parser.add_argument('--patience', type=int, default=20,
                        help='早停patience')
 
-    # χ1 rotamer 辅助损失
-    parser.add_argument('--rotamer_loss_weight', type=float, default=0.0,
-                       help='χ1 rotamer loss 权重')
-    
     # 保存
     parser.add_argument('--save_dir', type=str, default='checkpoints/stage1',
                        help='Checkpoint保存目录')
@@ -83,7 +79,6 @@ def main():
         device=args.device,
         mixed_precision=not args.no_mixed_precision,
         resume_from=args.resume_from,
-        w_rotamer=args.rotamer_loss_weight,
     )
     
     print(f"\n{'='*80}")
@@ -108,4 +103,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

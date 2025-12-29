@@ -17,21 +17,25 @@ class TorsionHead(nn.Module):
     扭转角预测头
     
     输入: [B, N, c_s] 节点表示
-    输出: [B, N, 7, 2] 扭转角的(sin, cos)
-           7个角度: phi, psi, omega, chi1, chi2, chi3, chi4
+    输出: [B, N, n_angles, 2] 扭转角的(sin, cos)
     """
     
-    def __init__(self, c_s: int = 384, c_hidden: int = 128, dropout: float = 0.1):
+    def __init__(self,
+                 c_s: int = 384,
+                 c_hidden: int = 128,
+                 dropout: float = 0.1,
+                 n_angles: int = 7):
         """
         Args:
             c_s: 输入维度
             c_hidden: 隐藏层维度
             dropout: Dropout概率
+            n_angles: 角度数量（默认7: phi/psi/omega/chi1-4）
         """
         super().__init__()
         
         self.c_s = c_s
-        self.n_angles = 7  # phi, psi, omega, chi1-4
+        self.n_angles = n_angles
         
         # 预测网络
         self.net = nn.Sequential(
@@ -39,7 +43,7 @@ class TorsionHead(nn.Module):
             nn.Linear(c_s, c_hidden),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(c_hidden, self.n_angles * 2)  # 7个角度 × 2(sin, cos)
+            nn.Linear(c_hidden, self.n_angles * 2)  # n_angles × 2(sin, cos)
         )
         
         # 小随机初始化（不能用zeros，会导致预测恒为0）
@@ -61,7 +65,7 @@ class TorsionHead(nn.Module):
         # 预测
         out = self.net(s)  # [B, N, 14]
         
-        # 重塑为 [B, N, 7, 2]
+        # 重塑为 [B, N, n_angles, 2]
         angles_sincos = out.view(B, N, self.n_angles, 2)
         
         # L2归一化（确保sin²+cos²=1）
@@ -103,8 +107,9 @@ class Chi1RotamerHead(nn.Module):
 
 
 def create_torsion_head(c_s: int = 384,
-                       c_hidden: int = 128,
-                       dropout: float = 0.1) -> TorsionHead:
+                        c_hidden: int = 128,
+                        dropout: float = 0.1,
+                        n_angles: int = 7) -> TorsionHead:
     """
     创建扭转角预测头
     
@@ -116,5 +121,4 @@ def create_torsion_head(c_s: int = 384,
     Returns:
         TorsionHead实例
     """
-    return TorsionHead(c_s, c_hidden, dropout)
-
+    return TorsionHead(c_s, c_hidden, dropout, n_angles=n_angles)

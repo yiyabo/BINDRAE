@@ -27,7 +27,7 @@ from src.stage1.training import TrainingConfig, Stage1Trainer
 
 # 创建简化配置（只跑2个step）
 config = TrainingConfig(
-    data_dir='data/casf2016',
+    data_dir='data/apo_holo_triplets',
     batch_size=2,
     max_epochs=1,  # 只跑1个epoch
     num_workers=0,
@@ -48,9 +48,8 @@ for i, batch in enumerate(trainer.train_loader):
     print(f"\nStep {i+1}/2:")
     losses = trainer.train_step(batch)
     print(f"  - Total loss: {losses['total']:.4f}")
-    print(f"  - Torsion: {losses['torsion']:.4f}")
+    print(f"  - Chi: {losses['chi']:.4f}")
     print(f"  - FAPE: {losses['fape']:.6f}")
-    print(f"  - Distance: {losses['distance']:.6f}")
     print(f"  - Clash: {losses['clash']:.6f}")
     print(f"  - LR: {trainer.optimizer.param_groups[0]['lr']:.2e}")
 
@@ -61,4 +60,3 @@ echo ""
 echo "============================================================================"
 echo -e "${GREEN}✅ 测试通过！训练循环工作正常${NC}"
 echo "============================================================================"
-

@@ -1,5 +1,9 @@
 # BINDRAE Stage-1 Pipeline (Ligand-Conditioned Holo Decoder)
 
+> ⚠️ **Legacy notice (CASF holo-only)**  
+> This document describes the *previous* Stage‑1 pipeline trained on CASF‑2016 holo complexes (**holo backbone + bound ligand → holo reconstruction**).  
+> The current Stage‑1/Stage‑2 spec is defined in `Readme.md` and `docs/理论/Stage2理论与指导.md`. The old Stage‑1 implementation is kept under `legacy/stage1/` for reference only.
+
 ## 1. High-level Overview
 
 Stage-1 in BINDRAE is designed as a **ligand-conditioned protein conformation decoder**:

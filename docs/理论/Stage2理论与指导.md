@@ -27,6 +27,8 @@
 - 给定配体和序列，该过程是一个**条件桥（conditional bridge）**，近似满足 Schrödinger bridge / bridge flow 的性质；
 - 任意时间点 \(t\) 的状态 \(x(t)\) 经 Stage‑1 的 FK 解码后，几何上（FAPE / clash / pocket contact）均保持物理合理。
 
+> 任务边界（必须写清楚）：本文主线假设 **bound pose 已知**，定位为 *known‑pose induced‑fit / 构象路径生成*，不将 docking/pose 搜索作为主线贡献。建议在实验中报告 **pose 噪声敏感性曲线**（对 pose 注入 RMSD 扰动或使用 docked pose）以明确适用边界与鲁棒性。
+
 ### 1.2 严格设计原则
 
 1. **主线采用“去冗余”的混合状态（不在全原子坐标上做 flow）**：
@@ -109,7 +111,7 @@
 
 - 构造一个时间连续 Markov 过程 \((X_t)_{t\in[0,1]}\)，满足：
   - \(X_0 \sim p_0, \ X_1 \sim p_1\)（或尽可能接近）；
-  - 在动力学上“简单”（例如漂移 + 小噪声），
+  - 在动力学上“简单”（漂移驱动的确定性过程），
   - 同时保持几何 / 生物物理约束。
 
 这就是 Schrödinger bridge / bridge flow 问题的条件版本：
@@ -122,16 +124,16 @@
 直接求 SB 的解析解非常困难，因此采用 **Conditional Flow Matching (CFM) / Pairwise CFM / PCFM** 的范式：
 
 1. 构造一个参考桥 \(X_t^{\text{ref}}\)：
-   - 通常是简单插值 + Brownian 噪声的过程；
+   - 采用简单插值的 deterministic 过程；
 2. 构造对应解析速度场 \(u_t^{\text{ref}}(x)\)；
 3. 通过最小化：
    \[
-   \mathbb{E}_{x_0,x_1,t,\xi} \big[ \lVert v_\Theta(X_t^{\text{ref}}, t) - u_t^{\text{ref}}(X_t^{\text{ref}}) \rVert^2 \big]
+   \mathbb{E}_{x_0,x_1,t} \big[ \lVert v_\Theta(X_t^{\text{ref}}, t) - u_t^{\text{ref}}(X_t^{\text{ref}}) \rVert^2 \big]
    \]
    来学习一个“更简单、参数化”的向量场 \(v_\Theta\)，近似参考桥的漂移；
 4. 在推理时，只积分 \(v_\Theta\) 即可。
 
-> 实现层面上，参考桥 \(X_t^{\text{ref}}\) 本身是一个带噪的随机过程，而 \(v_\Theta\) 参数化的是其**期望漂移**：训练时在随机参考桥样本上做 Flow Matching，推理阶段默认解确定性 ODE \(\tfrac{dx}{dt} = v_\Theta(x,t)\)。如需显式随机路径，可在积分时叠加小噪声或扩展为 SDE 形式。
+> 实现层面上，参考桥 \(X_t^{\text{ref}}\) 采用 deterministic 插值过程，训练与推理均在确定性 ODE \(\tfrac{dx}{dt} = v_\Theta(x,t)\) 上进行。
 
 Stage‑2 中，我们在混合空间 \(\mathcal{M}\) 上构造参考桥，并在此基础上做 CFM。
 
@@ -139,7 +141,7 @@ Stage‑2 中，我们在混合空间 \(\mathcal{M}\) 上构造参考桥，并�
 
 ## 4. 参考桥的构造（刚体 + torsion）
 
-### 4.1 χ torsion 参考桥：周期空间上的 Brownian bridge
+### 4.1 χ torsion 参考桥：周期空间上的 deterministic bridge
 
 给定端点侧链 torsion 向量 \(\chi_0, \chi_1 \in (S^1)^{K_\chi}\)：
 
@@ -148,31 +150,24 @@ Stage‑2 中，我们在混合空间 \(\mathcal{M}\) 上构造参考桥，并�
    \Delta\chi = \mathrm{wrap\_to\_\pi}(\chi_1 - \chi_0) \in (-\pi, \pi]^{K_\chi}.
    \]
 
-2. 选取平滑插值函数 \(\gamma(t)\)、噪声尺度 \(\sigma(t)\)：
-   - 示例：
-     \[
-     \gamma(t) = t, \quad \sigma(t) = \lambda \sqrt{t(1-t)},
-     \]
-     其中 \(\lambda\) 控制噪声强度；
-   - 或使用 smoothstep：\(\gamma(t) = 3t^2 - 2t^3\)，在端点更平滑。
+2. 选取平滑插值函数 \(\gamma(t)\)（默认 smoothstep）：
+   \[
+   \gamma(t) = 3t^2 - 2t^3, \qquad \gamma'(t)=6t-6t^2.
+   \]
 
 3. 定义参考桥：
    \[
-   \chi_t^{\text{ref}} = \chi_0 + \gamma(t) \, \Delta\chi + \sigma(t) \, \xi, \quad \xi \sim \mathcal{N}(0, I_{K_\chi}),
+   \chi_t^{\text{ref}} = \chi_0 + \gamma(t) \, \Delta\chi,
    \]
    然后对每个分量再做一次 \(\mathrm{wrap\_to\_\pi}\) 映射回 \((-\pi, \pi]\)。
 
 4. 解析速度（在欧氏近似下）：
    \[
    u_t^{\text{ref}}(\chi_t^{\text{ref}}) = \frac{d}{dt}\chi_t^{\text{ref}}
-   = \gamma'(t)\,\Delta\chi + \sigma'(t)\,\xi.
+   = \gamma'(t)\,\Delta\chi.
    \]
 
-> 注：在实现中，可以有两种层级：
-> - **无噪声 PCFM**：\(\sigma(t)\equiv 0\)，目标更干净；
-> - **带噪桥流**：\(\sigma(t)\neq0\)，理论上更接近 SB。本文默认以带噪形式为“最高标准”设定。
-
-### 4.2 刚体 SE(3) 参考桥：帧间 geodesic + Brownian 扰动
+### 4.2 刚体 SE(3) 参考桥：帧间 geodesic
 
 对每个残基 i：
 
@@ -195,16 +190,10 @@ Stage‑2 中，我们在混合空间 \(\mathcal{M}\) 上构造参考桥，并�
      t_i^{\text{ref}}(t) = t_{0,i} + \gamma(t) (t_{1,i} - t_{0,i}).
      \]
 
-3. 若考虑噪声，可在 Lie algebra 上加入 Brownian 扰动：
-   \[
-   R_i^{\text{ref}}(t) = \exp(\gamma(t)\, \Omega_i + \sigma_R(t)\,\xi_{R,i}) R_{0,i},
-   \]
-   平移类似加 \(\sigma_T(t)\,\xi_{T,i}\)。
-
-4. 对刚体帧的参考速度可在 Lie algebra 中解析：
+3. 对刚体帧的参考速度可在 Lie algebra 中解析：
    - 旋转速度 \(\omega_i(t) \in \mathbb{R}^3\)：
      \[
-     \omega_i^{\text{ref}}(t) = \gamma'(t)\, \Omega_i + \sigma_R'(t)\,\xi_{R,i},
+     \omega_i^{\text{ref}}(t) = \gamma'(t)\, \Omega_i,
      \]
    - 平移速度 \(v_i^{\text{ref}}(t) = \frac{d}{dt}t_i^{\text{ref}}(t)\)。
 
@@ -251,6 +240,8 @@ X_t^{\text{ref}} = (F^{\text{ref}}(t), \chi^{\text{ref}}(t)),
 5. 通过 χ‑torsion head & rigid head 输出 \(\dot\chi_\Theta, \dot F_\Theta\)，再乘以 \(g_i(t)\)。
 
 > 在 Stage‑2 中，我们将 ESM Adapter + EdgeEmbedder + LigandConditioner + FlashIPA 视为一个几何 encoder（记为 Enc_trunk），其内部对刚体帧的更新仅作为 encoder 的辅助状态，不回写到全局状态 \(F(t)\)。全局 \(F(t)\) 的演化**只由**向量场 \(\dot F_\Theta(x,t)\) 控制，以避免“state rigids”与“encoder 内部 rigids”双重更新导致的不一致。这一点与 Stage‑1 文档中将 FlashIPA 视作几何主干、而非显式状态更新器的设定保持一致。
+
+**实现口径（主线不做硬冻结）**：不对残基集合做硬阈值 mask/冻结。网络对所有残基输出速度分量，门控 \(g_i(t)\) 对速度做连续缩放；并用 \(L_{\text{bg}}\) 对低 \(w\)（或 \(w^{\mathrm{eff}}\)）区域显式惩罚残余速度。该“软子空间约束”避免硬 mask 的边界伪影，并允许铰链/结构域发生协同刚体运动。
 
 ### 5.2 Flow Matching 损失（带口袋加权）
 
@@ -350,7 +341,31 @@ L_{\text{clash}} = \sum_{k} \mathbb{E}\big[ \mathrm{ClashPenalty}(x(t_k)) \big].
 
 这保证路径上不会出现大量严重自穿插，即便端点是合理的。
 
-### 6.3 口袋接触软单调性（L_contact）
+### 6.3 肽键几何护栏（L_pep，推荐默认开启）
+
+仅靠 FAPE/clash/smoothness 仍可能出现“端点合理但中间肽键几何轻微漂移”。为保证链连接一致性，建议在路径上加入最小的肽键几何护栏（对连续残基对 \(i,i{+}1\)）：
+
+- **C–N 键长**（必需）：
+  \[
+  d_i^{CN}(t)=\|\mathbf x_{C,i}(t)-\mathbf x_{N,i+1}(t)\|_2,\qquad
+  L_{\text{pep\_bond}}=\sum_k\sum_i \big(d_i^{CN}(t_k)-d_0^{CN}\big)^2.
+  \]
+- **键角**（可选但推荐）：
+  \[
+  L_{\text{pep\_angle}}=\sum_k\sum_i
+  \Big(
+  \big(\angle(C\alpha_i,C_i,N_{i+1})-\theta_0^{C\alpha C N}\big)^2+
+  \big(\angle(C_i,N_{i+1},C\alpha_{i+1})-\theta_0^{C N C\alpha}\big)^2
+  \Big).
+  \]
+
+总项：
+\[
+L_{\text{pep}}=L_{\text{pep\_bond}}+\lambda_{\text{ang}}L_{\text{pep\_angle}},
+\]
+其中 \((d_0^{CN},\theta_0)\) 可取 Stage‑1/模板中的理想肽键几何常数。
+
+### 6.4 口袋接触软单调性（L_contact）
 
 定义口袋残基集合：\(\mathcal{P} = \{ i : w_{\mathrm{res},i} > \tau \}\)。
 
@@ -371,7 +386,7 @@ L_{\text{contact}} = \sum_{k=0}^{K-1} \max\big(0, C(t_k) - C(t_{k+1}) - \varepsi
 
 这一项是 Stage‑2 的一个**重要 novel 设计点**，利用 ligand‑conditioned pocket 先验对整条路径的方向性加约束。
 
-### 6.4 Stage‑1 holo prior 对齐（L_prior）
+### 6.5 Stage‑1 holo prior 对齐（L_prior）
 
 利用 Stage‑1 训练好的 holo decoder，将其作为 Stage‑2 在后半段的先验：
 
@@ -400,7 +415,7 @@ L_{\text{prior}} = \mathbb{E}_{t > t_\text{mid}} \big[ w_{\mathrm{res}} \cdot d_
 综合上述组件：
 
 $$
-L = L_{\text{FM}} + \lambda_{\text{end}} L_{\text{endpoint}} + \lambda_{\text{bg}} L_{\text{bg}} + \lambda_{\text{geom}} \big( L_{\text{smooth}} + L_{\text{clash}} + L_{\text{contact}} + L_{\text{prior}} \big)
+L = L_{\text{FM}} + \lambda_{\text{end}} L_{\text{endpoint}} + \lambda_{\text{bg}} L_{\text{bg}} + \lambda_{\text{geom}} \big( L_{\text{smooth}} + L_{\text{clash}} + L_{\text{pep}} + L_{\text{contact}} + L_{\text{prior}} \big)
 $$
 
 - 所有 residue‑level 项都可以再乘以 \(w_{\mathrm{res}}\) 或其幂，以强化 pocket 区域；
@@ -413,13 +428,13 @@ $$
 对一个 batch 的 apo–holo–ligand 三元组：
 
 1. 样本转为 `Stage2Batch`：包含 \(\chi_0, \chi_1, F_0, F_1, ESM, L_{\text{tok}}, w_{\mathrm{res}}\) 等（φ/ψ/ω 可作为数据字段保留，但不作为显式状态）；
-2. 采样时间 \(t \sim \mathcal{U}(0,1)\)，采样噪声 \(\xi\)；
+2. 采样时间 \(t \sim \mathcal{U}(0,1)\)；
 3. 构造参考桥 \(X_t^{\text{ref}}, u_t^{\text{ref}}\)（torsion + SE(3)）；
 4. 通过 `TorsionFlowNet` 计算 \(v_\Theta(X_t^{\text{ref}}, t)\)；
 5. 计算 \(L_{\text{FM}}\)；
 6. 在若干 \(t_k\)（可以与 t 相同或独立采样）上：
    - 从 \(x_0\) 或当前状态出发，积分到 \(t_k\) 得到 \(x_\Theta(t_k)\)；
-   - 对 \(x_\Theta(t_k)\) 解码 FK，计算 \(L_{\text{smooth}}, L_{\text{clash}}, L_{\text{contact}}, L_{\text{prior}}\)；仅在训练早期可选在 \(X_t^{\text{ref}}\) 上近似这些几何项，作为 warmup。
+   - 对 \(x_\Theta(t_k)\) 解码 FK，计算 \(L_{\text{smooth}}, L_{\text{clash}}, L_{\text{pep}}, L_{\text{contact}}, L_{\text{prior}}\)；仅在训练早期可选在 \(X_t^{\text{ref}}\) 上近似这些几何项，作为 warmup。
 7. （可选）周期性计算 \(L_{\text{endpoint}}\)；
 8. 聚合为 \(L\) 并反向传播更新 \(v_\Theta\) 参数。
 
@@ -434,7 +449,7 @@ $$
   \[
     \frac{dx}{dt} = v_\Theta(x(t), t), \quad x(0) = x_0,
   \]
-  使用 ODE 求解器或固定步长积分（Euler / Heun / RK4）；
+  使用固定步长的 **Heun（二阶 RK）** 积分；
 - 在多个 t 处解码路径 \(x(t)\)，可视化 apo→holo 结构变化，并评估：
   - 与真实 holo 的终点误差（torsion/FAPE/pocket iRMSD）；
   - 路径上的 clash% 与 contact 单调性。
@@ -446,7 +461,7 @@ $$
 - 构造 pseudo‑holo 端点 \(x_1'=(F_1', \chi_1')\) 的几种推荐方式：
   - **局部诱导契合（默认，适用于小变构）**：\(F_1' = F_0\)，\(\chi_1' = \chi_{\text{stage1}}\)。此时 Stage‑2 主要生成 χ/局部口袋自由度的连续路径；
   - **包含 backbone 变化（面向大变构）**：若 Stage‑1 能给出 \(F_{\text{stage1}}\)，可取 \(F_1' = F_{\text{stage1}}\)；或用轻量 refinement/粗粒度先验（例如 NMA/ENM 的低频模态）给出一个 \(F_1'\) 的可行初值；
-  - **折中方案（更稳健）**：仅对高 \(w^{\mathrm{eff}}\) 区域允许 \(F_1'\neq F_0\)，其余区域保持更强稳定（配合第 5.4 节的 \(L_{\text{bg}}\)）。
+  - **折中方案（更稳健）**：构造 \(F_1'\) 时让高 \(w^{\mathrm{eff}}\) 区域承担主要的帧变化，其余区域保持接近 \(F_0\)（并由 pocket gate + \(L_{\text{bg}}\) 自动收缩/稳定）。
 - 在 \(x_0\) 与 \(x_1'\) 之间运行同一 Stage‑2 桥流，得到一条“依托 Stage‑1 先验”的 apo→holo 轨迹。
 
 > 说明：若在推理中固定 \(F_1'=F_0\)，Stage‑2 将无法表达显著的 backbone/domain motion；因此若目标覆盖“大构象变化”，需要显式提供/生成一个非平凡的 \(F_1'\)（或将问题重新定位为“口袋局部构象通路”）。
@@ -464,6 +479,8 @@ $$
   - 局部 FAPE / Cα RMSD 的平滑度；
 - 统计分析：
   - 分 pocket / 非 pocket、按氨基酸类型统计路径误差和自由度参与度。
+- 鲁棒性（主线必做）：
+  - **pose 噪声敏感性曲线**：对 ligand bound pose 注入不同 RMSD 的扰动（或使用 docked pose），报告终点与路径指标（clash/contact/smooth/endpoint）的退化曲线，以明确“known pose 主线”的适用边界。
 
 ---
 
@@ -513,14 +530,14 @@ $$
      - 调用 Stage‑1 的 FK 和 loss 组件。
 
 2. **数值稳定性**：
-   - 时间积分优先使用 Heun / RK4 而非纯 Euler；
+   - 时间积分使用 **Heun（二阶 RK）**；
    - 控制步数 T（如 20–40）与 batch size 的平衡；
    - 对刚体旋转的更新使用指数/对数映射，参考 Stage‑1 / FlashIPA 中对 SO(3) 的实现：在旋转角接近 0 时使用安全近似（如泰勒展开或对角度做 clamp），避免数值不稳定和漂移出 SO(3)。
 
 3. **资源与调度**：
    - 几何正则（特别是 clash）成本较高，路径上的时间点数量建议 \(K\approx3\text{–}5\)，并在每个 \(t_k\) 上使用与 Stage‑1 相同的随机 chunk 采样方案 A（例如每条样本约 512 个原子对）；
    - endpoint consistency 可隔若干 step 再启用，以节省 ODE 积分开销；
-   - 噪声日程建议：实现上可先采用 \(\sigma(t)\equiv0\) 的 deterministic PCFM 作为默认配置，保证训练与数值积分稳定；在此基础上，如需更强多样性或更接近 Schrödinger bridge 设定，可逐步引入小幅 \(\sigma(t)\)。
+   - 噪声日程：当前实现采用 \(\sigma(t)\equiv0\) 的 deterministic PCFM，以保证训练与数值积分稳定。
 
 4. **实验规划**：
    - 在完整混合空间与完整正则框架下，仍可通过“先低 epoch、小数据子集”探索合适的权重与步数，
@@ -605,13 +622,13 @@ w_i^{\mathrm{eff}}=\max\Bigl(w_{\mathrm{res},i},\ \lambda\cdot \mathrm{norm}(M_i
 
 如果 reference bridge 太“线性插值味”，FM 会把模型拉向插值器；而路径正则再把它往物理方向掰，权重稍不对就会拧巴（不稳/不提升）。
 
-> 对策：尽早把 torsion 的 circular interpolation、旋转的 SO(3) geodesic/SLERP、噪声日程写清并实现；先从 deterministic PCFM 站稳，再逐步引入噪声桥。
+> 对策：把 torsion 的 circular interpolation 与旋转的 SO(3) geodesic/SLERP 写清并实现，保证参考桥与几何正则一致。
 
 #### 风险 4：系统复杂度高，训练稳定性会是硬仗
 
 旋转 log/exp 数值、mask/缺失残基、atom14 与 clash 子采样等，都会在“桥流 + 路径正则”下被放大。
 
-> 对策：把“稳定性优先”的最小闭环配置写成默认配置（Heun/RK4、K≈3–5 时间点正则、endpoint consistency 稀疏启用）。
+> 对策：把“稳定性优先”的最小闭环配置写成默认配置（Heun、K≈3–5 时间点正则、endpoint consistency 稀疏启用）。
 
 #### 风险 5：应用假设“配体 bound pose 已知”限制场景
 

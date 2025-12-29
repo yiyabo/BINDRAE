@@ -47,14 +47,14 @@ def analyze_chi1_errors(trainer: Stage1Trainer,
             outputs = model(batch, trainer.global_step)
 
             # 预测和真实 chi1（弧度）
-            pred_torsions = torch.atan2(
-                outputs['pred_torsions'][..., 0],
-                outputs['pred_torsions'][..., 1]
-            )  # [B, N, 7]
+            pred_chi = torch.atan2(
+                outputs['pred_chi'][..., 0],
+                outputs['pred_chi'][..., 1]
+            )  # [B, N, 4]
 
-            pred_chi1 = pred_torsions[:, :, 3]
-            true_chi1 = batch.torsion_angles[:, :, 3]
-            chi1_mask = batch.torsion_mask[:, :, 3].bool()
+            pred_chi1 = pred_chi[:, :, 0]
+            true_chi1 = batch.chi_holo[:, :, 0]
+            chi1_mask = batch.chi_mask[:, :, 0].bool()
 
             # 误差（度）
             diff = wrap_angle_diff(pred_chi1, true_chi1)

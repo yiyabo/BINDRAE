@@ -28,7 +28,7 @@ from src.stage1.training import TrainingConfig, Stage1Trainer
 
 # 创建测试配置
 config = TrainingConfig(
-    data_dir='data/casf2016',
+    data_dir='data/apo_holo_triplets',
     batch_size=2,          # 小batch size加快测试
     max_epochs=2,          # 只跑2个epoch
     num_workers=0,
@@ -67,4 +67,3 @@ echo ""
 echo "============================================================================"
 echo -e "${GREEN}✅ 完整测试通过！${NC}"
 echo "============================================================================"
-

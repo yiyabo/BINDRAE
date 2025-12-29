@@ -1,5 +1,5 @@
 #!/bin/bash
-# IPA数据加载器测试脚本
+# Stage-1 数据加载器测试脚本
 
 set -e
 
@@ -10,7 +10,7 @@ PROJECT_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$PROJECT_ROOT"
 
 echo "============================================================================"
-echo "              IPA 数据加载器测试"
+echo "              Stage-1 数据加载器测试"
 echo "============================================================================"
 echo ""
 
@@ -23,16 +23,16 @@ from pathlib import Path
 project_root = Path.cwd()
 sys.path.insert(0, str(project_root))
 
-from src.stage1.datasets import create_ipa_dataloader
+from src.stage1.datasets import create_stage1_dataloader
 
 print("\n测试配置:")
-print(f"  - 数据集: CASF-2016")
+print(f"  - 数据集: Stage-1 triplets")
 print(f"  - Split: train")
 print(f"  - Batch size: 2")
 
 # 创建DataLoader
-data_dir = 'data/casf2016'
-train_loader = create_ipa_dataloader(
+data_dir = 'data/apo_holo_triplets'
+train_loader = create_stage1_dataloader(
     data_dir,
     split='train',
     batch_size=2,
@@ -51,9 +51,12 @@ batch = next(iter(train_loader))
 print(f"\n✓ Batch加载成功")
 print(f"\n蛋白数据:")
 print(f"  - esm: {batch.esm.shape}")
-print(f"  - N: {batch.N.shape}")
-print(f"  - Ca: {batch.Ca.shape}")
-print(f"  - C: {batch.C.shape}")
+print(f"  - N_apo: {batch.N_apo.shape}")
+print(f"  - Ca_apo: {batch.Ca_apo.shape}")
+print(f"  - C_apo: {batch.C_apo.shape}")
+print(f"  - N_holo: {batch.N_holo.shape}")
+print(f"  - Ca_holo: {batch.Ca_holo.shape}")
+print(f"  - C_holo: {batch.C_holo.shape}")
 print(f"  - node_mask: {batch.node_mask.shape}, 有效节点: {batch.node_mask.sum().item()}")
 
 print(f"\n配体数据:")
@@ -62,8 +65,9 @@ print(f"  - lig_types: {batch.lig_types.shape}")
 print(f"  - lig_mask: {batch.lig_mask.shape}, 有效token: {batch.lig_mask.sum().item()}")
 
 print(f"\nGround Truth:")
-print(f"  - torsion_angles: {batch.torsion_angles.shape}")
-print(f"  - torsion_mask: {batch.torsion_mask.shape}")
+print(f"  - chi_holo: {batch.chi_holo.shape}")
+print(f"  - chi_mask: {batch.chi_mask.shape}")
+print(f"  - torsion_apo: {batch.torsion_apo.shape}")
 
 print(f"\n口袋:")
 print(f"  - w_res: {batch.w_res.shape}")
@@ -79,4 +83,3 @@ echo ""
 echo "============================================================================"
 echo -e "${GREEN}✅ 测试通过！${NC}"
 echo "============================================================================"
-

@@ -14,7 +14,7 @@ class TrainingConfig:
     """Stage-1训练配置"""
     
     # 数据
-    data_dir: str = 'data/casf2016'
+    data_dir: str = 'data/apo_holo_triplets'
     batch_size: int = 4
     num_workers: int = 4
     
@@ -29,10 +29,8 @@ class TrainingConfig:
     
     # 损失权重
     w_fape: float = 1.0
-    w_torsion: float = 1.0
-    w_dist: float = 0.1
+    w_chi: float = 1.0
     w_clash: float = 0.1
-    w_rotamer: float = 0.0
     
     # Warmup
     pocket_warmup_steps: int = 2000  # 口袋权重warmup
@@ -55,4 +53,3 @@ class TrainingConfig:
     # 其他
     seed: int = 2025
     resume_from: Optional[str] = None  # checkpoint路径
-

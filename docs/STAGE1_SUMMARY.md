@@ -1,5 +1,9 @@
 # BINDRAE Stage-1 工作总结与设计反思
 
+> ⚠️ **Legacy 说明（CASF holo-only）**  
+> 本文档总结的是旧版 Stage‑1（CASF‑2016，**HOLO+ligand → HOLO 重构**）的设计与实验记录。  
+> 当前主线 Stage‑1/Stage‑2 规范以 `Readme.md` 与 `docs/理论/Stage2理论与指导.md` 为准；旧版 Stage‑1 代码已迁移至 `legacy/stage1/` 仅作留档。
+
 ## 1. 任务定义与整体理念
 
 ### 1.1 Stage-1 的任务
