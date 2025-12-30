@@ -532,24 +532,31 @@ def extract_ligand_by_id(pdb_path: Path, l_chain: str, l_resname: str, l_resnum:
         element = (atom.element or "").strip().upper()
         name = atom.get_name().strip().upper()
         
-        # Fix missing elements for PDBIO to write correctly
+        # Aggressive element inference
         if not element:
-            # Heuristic: keep only alpha characters
+            # Clean name to alpha only
             alpha_name = "".join(filter(str.isalpha, name))
             
-            # If 2 chars and is a known element, use it
-            if len(alpha_name) == 2 and alpha_name in _TWO_CHAR_ELEMENTS:
-                element = alpha_name
-            # If starts with a known 2-char element (e.g. CA1 -> CA) - be careful about C-alpha (CA)
-            # For HETATM, CA is likely Calcium. For standard residue, CA is Carbon.
-            # But we are in extract_ligand, so likely HETATM.
-            # However, CA1 in a ligand could be Carbon.
-            # Generally, ions have atom name == element name.
-            elif len(found_residue) == 1 and alpha_name in _TWO_CHAR_ELEMENTS:
+            # Case 1: Single atom residue (likely ion)
+            # If the residue has only 1 atom, its name usually IS the element
+            if len(found_residue) == 1:
+               # Special check for known ions
+               if alpha_name in _TWO_CHAR_ELEMENTS:
+                   element = alpha_name
+               elif len(alpha_name) > 0:
+                   element = alpha_name # Take full name if 1 or 2 chars? Usually yes.
+                   # But if name is "CA1", clean is "CA".
+                   # If name is "MG", clean is "MG".
+            
+            # Case 2: Multi-atom residue
+            elif len(alpha_name) == 2 and alpha_name in _TWO_CHAR_ELEMENTS:
                 element = alpha_name
             elif len(alpha_name) > 0:
-                # Default to first letter (C, N, O, S, P, F, I, B, etc.)
                 element = alpha_name[0]
+            
+            # Safety fallback for common ions if still empty or suspicious
+            if not element and name in _TWO_CHAR_ELEMENTS:
+                element = name
             
             atom.element = element
 
@@ -563,6 +570,7 @@ def extract_ligand_by_id(pdb_path: Path, l_chain: str, l_resname: str, l_resnum:
     coords = np.array(coords, dtype=np.float32)
 
     # Build PDB block for this specific residue
+    # Use PDBIO but ensure formatting is element-friendly
     io = PDBIO()
     io.set_structure(structure)
     from io import StringIO
@@ -574,6 +582,82 @@ def extract_ligand_by_id(pdb_path: Path, l_chain: str, l_resname: str, l_resnum:
                    residue.get_resname().strip() == l_resname
     io.save(fh, select=SpecificLigandSelect())
     pdb_block = fh.getvalue()
+    
+    # POST-PROCESSING PDB BLOCK
+    # Biopython PDBIO might not write the element column correctly if it wasn't there initially,
+    # or RDKit might be very picky. 
+    # Explicitly fixing the element columns in the PDB block string.
+    # PDB format: Element symbol is at columns 77-78 (0-indexed: 76-77).
+    # Biopython PDBIO writes it if atom.element is set.
+    # But let's verify/force it.
+    
+    lines = pdb_block.splitlines()
+    new_lines = []
+    
+    # Re-map atoms to find their elements again? 
+    # Or just parse the line.
+    # It's better to force write the inferred element if missing in the block.
+    
+    atom_idx = 0
+    # Collect elements in order
+    elements = []
+    for atom in found_residue:
+        e = (atom.element or "").strip().upper()
+        n = atom.get_name().strip().upper()
+        if e == "H" or n.startswith("H"):
+            continue
+        elements.append(e)
+
+    # Filter lines to only ATOM/HETATM records of interest
+    # Note: PDBIO output might include disconnected atoms if select logic is complex, 
+    # but here we selected one residue. 
+    # However, 'lines' contains all atoms in that residue (including H).
+    # We skipped H in 'coords', so we should align logic.
+    
+    final_coords_check = []
+    
+    for line in lines:
+        if line.startswith("ATOM") or line.startswith("HETATM"):
+            # Check element col (76-77)
+            # Line length must be at least 78 to have element?
+            # Standard PDB is 80 cols.
+            curr_line = line.ljust(80)
+            
+            # Get atom name to identify which atom this is (if we need to match with our inference)
+            # Name at 12-15.
+            name = curr_line[12:16].strip()
+            element_in_file = curr_line[76:78].strip()
+            
+            # If element missing in file, try to fix from our inference logic
+            if not element_in_file:
+                # Re-infer (simple version) or match?
+                # Matching is hard without index.
+                # Let's use simple inference on name again.
+                alpha = "".join(filter(str.isalpha, name))
+                inferred = ""
+                if len(alpha) == 2 and alpha in _TWO_CHAR_ELEMENTS:
+                    inferred = alpha
+                elif len(alpha) > 0:
+                    inferred = alpha[0]
+                
+                # Special fix for ions
+                if len(lines) <= 3: # 1 atom + END/TER
+                     if name in _TWO_CHAR_ELEMENTS:
+                         inferred = name
+                
+                if inferred:
+                    # Write to col 76-77 (right justified)
+                    # changing text at index 76, 77
+                    # 76 is ' ' or char, 77 is char. Right aligned: " C", "MG"
+                    fmt_el = f"{inferred:>2}"
+                    curr_line = curr_line[:76] + fmt_el + curr_line[78:]
+            
+            new_lines.append(curr_line)
+        else:
+            new_lines.append(line)
+            
+    pdb_block = "\n".join(new_lines)
+
     return coords, pdb_block
 
 
