@@ -10,7 +10,7 @@ import sys
 import platform
 import torch
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 import warnings
 import argparse
 from tqdm import tqdm
