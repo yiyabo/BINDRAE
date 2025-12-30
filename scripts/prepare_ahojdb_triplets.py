@@ -519,13 +519,17 @@ def extract_ligand_by_id(pdb_path: Path, l_chain: str, l_resname: str, l_resnum:
     if not found_residue:
         raise ValueError(f"Ligand {l_chain}_{l_resname}_{l_resnum} not found in {pdb_path}")
 
-    # Common 2-letter elements to avoid truncating to 1st char
+    # Common 2-letter elements
     _TWO_CHAR_ELEMENTS = {
         "BR", "CL", "CA", "CD", "CE", "CO", "CR", "CS", "CU", "DY", "ER", "EU", "FE", "GA", "GD", 
         "HG", "HO", "IN", "IR", "KR", "LA", "LI", "LU", "MG", "MN", "MO", "NA", "NB", "ND", "NE", 
         "NI", "OS", "PB", "PD", "PM", "PR", "PT", "PU", "RA", "RB", "RE", "RH", "RU", "SB", "SC", 
         "SE", "SI", "SM", "SN", "SR", "TA", "TB", "TC", "TE", "TH", "TI", "TL", "TM", "UR", "XE", 
         "YB", "ZN", "ZR"
+    }
+    # Valid 1-letter elements
+    _ONE_CHAR_ELEMENTS = {
+        "B", "C", "F", "H", "I", "K", "N", "O", "P", "S", "U", "V", "W", "Y"
     }
 
     pdb_lines = []
@@ -538,24 +542,70 @@ def extract_ligand_by_id(pdb_path: Path, l_chain: str, l_resname: str, l_resnum:
         # Aggressive element inference
         if not element:
             alpha_name = "".join(filter(str.isalpha, name))
+            
+            # 1. Single atom residue (likely ion)
             if len(found_residue) == 1:
                if alpha_name in _TWO_CHAR_ELEMENTS:
                    element = alpha_name
-               elif len(alpha_name) > 0:
-                   element = alpha_name 
+               elif alpha_name in _ONE_CHAR_ELEMENTS:
+                   element = alpha_name
+               # If single atom matches valid element via name, force it.
+               if not element and name in _TWO_CHAR_ELEMENTS:
+                   element = name
+               if not element and name in _ONE_CHAR_ELEMENTS:
+                   element = name
+
+            # 2. Multi-atom residue
             elif len(alpha_name) == 2 and alpha_name in _TWO_CHAR_ELEMENTS:
                 element = alpha_name
             elif len(alpha_name) > 0:
-                element = alpha_name[0]
+                first_char = alpha_name[0]
+                if first_char in _ONE_CHAR_ELEMENTS:
+                    element = first_char
             
+            # Safety fallback for common ions if still empty
             if not element and name in _TWO_CHAR_ELEMENTS:
                 element = name
             
             atom.element = element
 
-        if element == "H" or name.startswith("H"):
+        # Final validity check
+        if not element:
+            # If we couldn't infer, skip (RDKit would assume it's C or crash?)
+            # RDKit crashes if name is weird.
+            # Skipping is safer for "Scientific" rigor (unknown atom).
             continue
             
+        if element == "H" or element == "D": # Skip Hydrogens (and Deuterium)
+            continue
+        if name.startswith("H") and element not in _TWO_CHAR_ELEMENTS and element not in _ONE_CHAR_ELEMENTS:
+             # Name starts with H but not Hg, Ho, Hf... and element not identified
+             continue
+
+        # Check if inferred element is actually valid (in limited set or general PT check)
+        # Using the sets above covers most bio-relevant. 
+        # But let's be permissive if it was already in atom.element (from PDBParser).
+        # But if it is "L" (from bad inference previously), we must catch it.
+        if len(element) == 2 and element not in _TWO_CHAR_ELEMENTS:
+             # Maybe a valid element we missed in the set? (e.g. Al, Ar, As, Au, Ag...)
+             # Let's expand list or trust PDBParser?
+             # PDBParser didn't set it (we are in 'if not element' block, or after assignment).
+             # If it came from PDBParser, we trust it?
+             # But if it came from our inference, we must verify.
+             pass
+        
+        # Critical: Filter out invalid elements that RDKit hates (e.g. L, G, A, J...)
+        is_valid = (element in _TWO_CHAR_ELEMENTS) or (element in _ONE_CHAR_ELEMENTS) or \
+                   (element in ["AL", "AR", "AS", "AU", "AG", "BA", "BE", "BI", "CR", "HE", "HF", "NB", "PO", "RN", "RU", "SB", "SE", "SN", "TE", "TI", "XE", "ZR"]) # Add more if needed
+        
+        # If not valid, and it was inferred, we should skip.
+        if not is_valid:
+             # Maybe it is valid but rare?
+             # RDKit crashes on "L". 
+             # Let's simple check: is it "L", "G", "A", "M"?
+             if element in ["A", "D", "E", "G", "J", "L", "M", "Q", "R", "T", "X", "Z"]:
+                 continue
+                 
         coords.append(atom.get_coord())
         
         # Manual PDB formatting to ensure RDKit compatibility
