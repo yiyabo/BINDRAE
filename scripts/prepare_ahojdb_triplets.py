@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 import glob
+import re
 
 import numpy as np
 
@@ -56,6 +57,7 @@ LOG = logging.getLogger("prepare_ahojdb_triplets")
 class Candidate:
     pdb_id: str
     chain_id: str
+    aln_matrix: Optional[str] = None
 
 
 class ChainSelect(Select):
@@ -96,9 +98,23 @@ def iter_json_array(path: Path) -> Iterator[Dict]:
 
 def resolve_entry_dir(entry: Dict, ahoj_root: Path) -> Optional[Path]:
     entry_dir = entry.get("entry_dir")
-    if entry_dir and "/data/" in entry_dir:
+    if not entry_dir:
+        return None
+    entry_dir = str(entry_dir)
+
+    p = Path(entry_dir)
+    if p.is_absolute() and p.exists():
+        return p
+
+    if "/data/" in entry_dir:
         rel = entry_dir.split("/data/", 1)[1]
-        return ahoj_root / "data" / rel
+        cand = ahoj_root / "data" / rel
+        if cand.exists():
+            return cand
+
+    cand = ahoj_root / entry_dir
+    if cand.exists():
+        return cand
     return None
 
 
@@ -121,18 +137,59 @@ def _split_chain(field: str) -> Optional[str]:
     return field
 
 
+_STRUCTURE_RE = re.compile(r"^(?:pdb)?([0-9A-Za-z]{4})(.*)$")
+
+
+def parse_structure_field(structure: str) -> Tuple[str, str]:
+    """Parse a candidate 'structure' field into (pdb_id, chain_id)."""
+    if not structure:
+        return "", ""
+    token = structure.strip().split()[0]
+    m = _STRUCTURE_RE.match(token)
+    if not m:
+        m2 = re.search(r"[0-9A-Za-z]{4}", token)
+        if not m2:
+            return "", ""
+        pdb_id = m2.group(0).lower()
+        rest = token[m2.end():]
+    else:
+        pdb_id = m.group(1).lower()
+        rest = m.group(2) or ""
+
+    rest = rest.strip()
+    chain_id = ""
+    if rest:
+        if rest[0] in "-_:":
+            chain_id = rest[1:2]
+        else:
+            chain_id = rest[0:1]
+    chain_id = chain_id.strip()
+    chain_id = _split_chain(chain_id) or ""
+    return pdb_id, chain_id
+
+
 def load_candidate(csv_path: Path) -> Optional[Candidate]:
     if not csv_path.exists():
         return None
     with csv_path.open("r", encoding="utf-8", errors="ignore") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            pdb_id = _pick_column(row, ["structure", "pdb_id", "pdb", "structure_id"])
+            structure = _pick_column(row, ["structure", "pdb_id", "pdb", "structure_id"])
+            if not structure:
+                continue
+            pdb_id, chain_id = parse_structure_field(structure)
+            if not pdb_id:
+                continue
+
             chain = _pick_column(row, ["chain", "chains", "chain_id", "chainID"])
-            if pdb_id:
-                pdb_id = pdb_id.lower()[:4]
-                chain = _split_chain(chain) or ""
-                return Candidate(pdb_id=pdb_id, chain_id=chain)
+            if chain:
+                chain_id = _split_chain(chain) or chain_id
+            if not chain_id:
+                chain_hint = _pick_column(row, ["aln_q_chains", "chains2", "chains3", "chains4"])
+                chain_id = _split_chain(chain_hint) or ""
+
+            aln_matrix = _pick_column(row, ["aln_matrix", "alignment_matrix", "matrix"])
+            return Candidate(pdb_id=pdb_id, chain_id=chain_id, aln_matrix=aln_matrix)
     return None
 
 
@@ -193,6 +250,22 @@ def find_alignment_matrix(entry_dir: Path,
     return None
 
 
+def resolve_alignment_matrix(entry_dir: Path,
+                             src: Candidate,
+                             dst: Candidate) -> Optional[Path]:
+    if src.aln_matrix:
+        raw = src.aln_matrix.strip()
+        if raw:
+            p = Path(raw)
+            if p.is_absolute() and p.exists():
+                return p
+            for base in [entry_dir, entry_dir / "matrices"]:
+                cand = base / p
+                if cand.exists():
+                    return cand
+    return find_alignment_matrix(entry_dir, src, dst)
+
+
 def find_pdb_file(entry_dir: Path,
                   pdb_id: str,
                   chain_id: str,
@@ -203,34 +276,83 @@ def find_pdb_file(entry_dir: Path,
     pdb_pat = glob.escape(pdb_id)
     chain_pat = glob.escape(chain_id) if chain_id else ""
     if structure_dir.exists():
-        patterns = [f"{pdb_id}.pdb"]
+        patterns = []
         if chain_id:
-            patterns = [
+            patterns.extend([
                 f"{pdb_id}_{chain_id}.pdb",
                 f"{pdb_id}{chain_id}.pdb",
                 f"{pdb_id}.pdb",
-            ]
+                f"{pdb_id}_{chain_id}.cif",
+                f"{pdb_id}{chain_id}.cif",
+                f"{pdb_id}.cif",
+                f"{pdb_id}_{chain_id}.pdb.gz",
+                f"{pdb_id}{chain_id}.pdb.gz",
+                f"{pdb_id}.pdb.gz",
+                f"{pdb_id}_{chain_id}.cif.gz",
+                f"{pdb_id}{chain_id}.cif.gz",
+                f"{pdb_id}.cif.gz",
+            ])
+        else:
+            patterns.extend([
+                f"{pdb_id}.pdb",
+                f"{pdb_id}.cif",
+                f"{pdb_id}.pdb.gz",
+                f"{pdb_id}.cif.gz",
+            ])
         for name in patterns:
             path = structure_dir / name
             if path.exists():
                 return path
         if chain_id:
-            matches = list(structure_dir.glob(f"*{pdb_pat}*{chain_pat}*.pdb"))
+            matches = list(structure_dir.glob(f"*{pdb_pat}*{chain_pat}*.pdb*"))
             if matches:
                 return matches[0]
-        matches = list(structure_dir.glob(f"*{pdb_pat}*.pdb"))
+            matches = list(structure_dir.glob(f"*{pdb_pat}*{chain_pat}*.cif*"))
+            if matches:
+                return matches[0]
+        matches = list(structure_dir.glob(f"*{pdb_pat}*.pdb*"))
+        if matches:
+            return matches[0]
+        matches = list(structure_dir.glob(f"*{pdb_pat}*.cif*"))
         if matches:
             return matches[0]
     if pdb_dir is not None:
-        fallback = pdb_dir / f"{pdb_id}.pdb"
-        if fallback.exists():
-            return fallback
+        candidates: List[Path] = []
+        for pid in [pdb_id.lower(), pdb_id.upper()]:
+            names = [
+                f"{pid}.pdb",
+                f"{pid}.cif",
+                f"{pid}.pdb.gz",
+                f"{pid}.cif.gz",
+                f"{pid}.ent",
+                f"{pid}.ent.gz",
+                f"pdb{pid}.ent",
+                f"pdb{pid}.ent.gz",
+            ]
+            candidates.extend([pdb_dir / n for n in names])
+        for p in candidates:
+            if p.exists():
+                return p
+        matches = list(pdb_dir.glob(f"{pdb_id}*"))
+        if matches:
+            return matches[0]
     return None
 
 
 def load_chain_structure(pdb_path: Path, chain_id: str):
-    parser = PDBParser(QUIET=True)
-    structure = parser.get_structure(pdb_path.stem, str(pdb_path))
+    suffixes = "".join(pdb_path.suffixes).lower()
+    if suffixes.endswith(".cif") or suffixes.endswith(".cif.gz"):
+        from Bio.PDB import MMCIFParser  # type: ignore
+        parser = MMCIFParser(QUIET=True)
+    else:
+        parser = PDBParser(QUIET=True)
+
+    if suffixes.endswith(".gz"):
+        import gzip
+        with gzip.open(pdb_path, "rt", encoding="utf-8", errors="ignore") as fh:
+            structure = parser.get_structure(pdb_path.stem, fh)
+    else:
+        structure = parser.get_structure(pdb_path.stem, str(pdb_path))
     if chain_id:
         for model in structure:
             if chain_id in model:
@@ -317,14 +439,17 @@ def main():
                         help="Output dataset directory (apo_holo_triplets)")
     parser.add_argument("--pdb-dir", type=str, default=None,
                         help="Fallback directory with downloaded PDBs (pdb_files)")
+    parser.add_argument("--max-samples", type=int, default=None,
+                        help="Stop after writing this many samples")
     parser.add_argument("--limit", type=int, default=None,
-                        help="Limit number of entries for testing")
+                        help="(deprecated) alias for --max-samples")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--split", type=str, default="0.9,0.05,0.05",
                         help="Train/val/test split ratio")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+    max_samples = args.max_samples if args.max_samples is not None else args.limit
 
     ahoj_root = Path(args.ahoj_root)
     if not (ahoj_root / "db_entries.json").exists():
@@ -348,7 +473,7 @@ def main():
     total = 0
 
     for entry in entry_iter:
-        if args.limit and total >= args.limit:
+        if max_samples is not None and len(written) >= max_samples:
             break
         total += 1
 
@@ -374,8 +499,8 @@ def main():
 
             query = Candidate(pdb_id=query_pdb, chain_id=query_chain)
 
-            apo_mat = find_alignment_matrix(entry_dir, apo, query)
-            holo_mat = find_alignment_matrix(entry_dir, holo, query)
+            apo_mat = resolve_alignment_matrix(entry_dir, apo, query)
+            holo_mat = resolve_alignment_matrix(entry_dir, holo, query)
             if apo_mat is None or holo_mat is None:
                 raise ValueError("missing alignment matrices")
 
