@@ -34,6 +34,7 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Tuple
+import glob
 
 import numpy as np
 
@@ -114,7 +115,7 @@ def _split_chain(field: str) -> Optional[str]:
         return None
     field = field.strip()
     # Some AHoJ fields use chain lists like "A,B"
-    for sep in [",", ";", " "]:
+    for sep in [",", ";", " ", "|", "/"]:
         if sep in field:
             return field.split(sep)[0].strip()
     return field
@@ -197,20 +198,27 @@ def find_pdb_file(entry_dir: Path,
                   chain_id: str,
                   pdb_dir: Optional[Path]) -> Optional[Path]:
     structure_dir = entry_dir / "structure_files"
+    chain_id = (chain_id or "").strip()
+    pdb_id = pdb_id.lower()
+    pdb_pat = glob.escape(pdb_id)
+    chain_pat = glob.escape(chain_id) if chain_id else ""
     if structure_dir.exists():
-        patterns = [
-            f"{pdb_id}_{chain_id}.pdb",
-            f"{pdb_id}{chain_id}.pdb",
-            f"{pdb_id}.pdb",
-        ]
+        patterns = [f"{pdb_id}.pdb"]
+        if chain_id:
+            patterns = [
+                f"{pdb_id}_{chain_id}.pdb",
+                f"{pdb_id}{chain_id}.pdb",
+                f"{pdb_id}.pdb",
+            ]
         for name in patterns:
             path = structure_dir / name
             if path.exists():
                 return path
-        matches = list(structure_dir.glob(f"*{pdb_id}*{chain_id}*.pdb"))
-        if matches:
-            return matches[0]
-        matches = list(structure_dir.glob(f"*{pdb_id}*.pdb"))
+        if chain_id:
+            matches = list(structure_dir.glob(f"*{pdb_pat}*{chain_pat}*.pdb"))
+            if matches:
+                return matches[0]
+        matches = list(structure_dir.glob(f"*{pdb_pat}*.pdb"))
         if matches:
             return matches[0]
     if pdb_dir is not None:
@@ -350,7 +358,7 @@ def main():
             continue
 
         query_pdb = entry.get("target_pdb_id", "").lower()[:4]
-        query_chain = entry.get("query_chain", "")
+        query_chain = _split_chain(entry.get("query_chain", "")) or ""
         ligand_resname = entry.get("target_ligand", "").strip()
         if not query_pdb or not query_chain or not ligand_resname:
             skipped += 1
