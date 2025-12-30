@@ -200,46 +200,71 @@ class ESM2CacheAHoJ:
         
         print(f"Processing in {total_batches} batches (Batch Size: {batch_size})...")
         
-        for i in tqdm(range(0, len(tasks), batch_size), desc="Inference"):
-            batch_tasks = tasks[i : i + batch_size]
-            
-            # Prepare batch data for ESM
-            # batch_converter input: list of (id, seq)
+    def process_batch_safe(self, batch_tasks: List[Tuple[str, str, Path]]):
+        """Process a batch with OOM automatic recovery (recursive splitting)."""
+        if not batch_tasks:
+            return
+
+        try:
+            # Prepare batch data
             batch_data = [(t[0], t[1]) for t in batch_tasks]
             
-            try:
-                _, _, batch_tokens = self.batch_converter(batch_data)
-                batch_tokens = batch_tokens.to(self.device)
+            _, _, batch_tokens = self.batch_converter(batch_data)
+            batch_tokens = batch_tokens.to(self.device)
+            
+            with torch.no_grad():
+                results = self.model(batch_tokens, repr_layers=[self.model.num_layers])
+            
+            token_reprs = results['representations'][self.model.num_layers]
+            
+            # Save results
+            for j, (sample_id, seq, out_path) in enumerate(batch_tasks):
+                seq_len = len(seq)
+                per_residue = token_reprs[j, 1 : seq_len + 1].cpu()
+                sequence_repr = token_reprs[j, 0].cpu()
                 
-                with torch.no_grad():
-                    results = self.model(batch_tokens, repr_layers=[self.model.num_layers])
+                encoding = {
+                    'per_residue': per_residue,
+                    'sequence': sequence_repr,
+                    'sequence_str': seq,
+                    'n_residues': seq_len
+                }
+                torch.save(encoding, out_path)
                 
-                token_reprs = results['representations'][self.model.num_layers]
-                
-                # Iterate and save
-                for j, (sample_id, seq, out_path) in enumerate(batch_tasks):
-                    # Extract individual sample from batch
-                    # Note: batch_tokens includes padding, we need to slice using true length
-                    # ESM encoding adds <cls> at start and <eos> at end
-                    # token_reprs shape: [Batch, MaxLen, Dim]
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                torch.cuda.empty_cache()
+                n = len(batch_tasks)
+                if n <= 1:
+                    print(f"❌ Error: Sample {batch_tasks[0][0]} (len={len(batch_tasks[0][1])}) caused OOM even with batch_size=1. Skipping.")
+                    return
                     
-                    seq_len = len(seq)
-                    # Slicing: [1 : seq_len + 1] to skip <cls> and exclude <eos>/padding
-                    per_residue = token_reprs[j, 1 : seq_len + 1].cpu()
-                    sequence_repr = token_reprs[j, 0].cpu() # <cls> token
-                    
-                    encoding = {
-                        'per_residue': per_residue,
-                        'sequence': sequence_repr,
-                        'sequence_str': seq,
-                        'n_residues': seq_len
-                    }
-                    torch.save(encoding, out_path)
-                    
-            except Exception as e:
-                print(f"Batch {i//batch_size} failed: {e}")
-                # Fallback? Maybe skip this batch or retry one by one if critical
-                continue
+                mid = n // 2
+                print(f"⚠️  OOM with batch={n}. Retrying with split batches ({mid}, {n-mid})...")
+                self.process_batch_safe(batch_tasks[:mid])
+                self.process_batch_safe(batch_tasks[mid:])
+            else:
+                print(f"❌ Batch inference failed: {e}")
+
+    def run(self):
+        tasks = self.prepare_samples()
+        print(f"Found {len(tasks)} samples to process.")
+        
+        if not tasks:
+            print("No samples to process.")
+            return
+
+        # Sort by length to minimize padding
+        tasks.sort(key=lambda x: len(x[1]))
+        
+        batch_size = self.batch_size
+        total_batches = (len(tasks) + batch_size - 1) // batch_size
+        
+        print(f"Processing in {total_batches} batches (Start BS: {batch_size})...")
+        
+        for i in tqdm(range(0, len(tasks), batch_size), desc="Inference"):
+            batch_tasks = tasks[i : i + batch_size]
+            self.process_batch_safe(batch_tasks)
             
 def main():
     parser = argparse.ArgumentParser()
