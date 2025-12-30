@@ -57,7 +57,8 @@ LOG = logging.getLogger("prepare_ahojdb_triplets")
 class Candidate:
     pdb_id: str
     chain_id: str
-    aln_matrix: Optional[str] = None
+    pocket: str = ""  # e.g., "p1", "p2"
+    aln_matrix: str = ""  # filename
 
 
 class ChainSelect(Select):
@@ -169,9 +170,14 @@ def parse_structure_field(structure: str) -> Tuple[str, str]:
 
 
 def load_candidate(csv_path: Path) -> Optional[Candidate]:
+    """
+    从 CSV 加载候选结构。
+    
+    重要：链 ID 从 aln_matrix 文件名解析，格式为 aln_<pdb><chain>_to_<query>.txt
+    """
     if not csv_path.exists():
         return None
-    with csv_path.open("r", encoding="utf-8", errors="ignore") as f:
+    with csv_path.open("r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
             structure = _pick_column(row, ["structure", "pdb_id", "pdb", "structure_id"])
@@ -181,40 +187,105 @@ def load_candidate(csv_path: Path) -> Optional[Candidate]:
             if not pdb_id:
                 continue
 
-            chain = _pick_column(row, ["chain", "chains", "chain_id", "chainID"])
-            if chain:
-                chain_id = _split_chain(chain) or chain_id
-            if not chain_id:
-                chain_hint = _pick_column(row, ["aln_q_chains", "chains2", "chains3", "chains4"])
-                chain_id = _split_chain(chain_hint) or ""
-
+            # 优先从 aln_matrix 文件名解析链 ID
+            # 格式: aln_<pdb><chain>_to_<query_pdb><query_chain>.txt
             aln_matrix = _pick_column(row, ["aln_matrix", "alignment_matrix", "matrix"])
-            return Candidate(pdb_id=pdb_id, chain_id=chain_id, aln_matrix=aln_matrix)
+            if aln_matrix and not chain_id:
+                # 尝试从文件名解析: aln_5uwlB_to_3kryB.txt -> pdb=5uwl, chain=B
+                m = re.match(r"aln_([0-9A-Za-z]{4})([A-Za-z0-9])_to_", aln_matrix)
+                if m:
+                    parsed_pdb = m.group(1).lower()
+                    parsed_chain = m.group(2)
+                    # 验证 pdb_id 一致
+                    if parsed_pdb == pdb_id:
+                        chain_id = parsed_chain
+
+            # 如果还没有链 ID，尝试其他列
+            if not chain_id:
+                chain = _pick_column(row, ["chain", "chains", "chain_id", "chainID"])
+                if chain:
+                    chain_id = _split_chain(chain) or ""
+
+            pocket = _pick_column(row, ["pocket", "pocket_id", "pocket_index"]) or ""
+            return Candidate(pdb_id=pdb_id, chain_id=chain_id, pocket=pocket, aln_matrix=aln_matrix)
     return None
 
 
+def load_ligands_map(json_path: Path) -> Dict[Tuple[str, str], List[str]]:
+    """
+    Load ligands.json into a map: (structure, pocket_index) -> [ligand_id, ...]
+    ligand_id format: "Chain_ResName_ResNum" (e.g. "A_ZN_275") or similar from AHoJ
+    """
+    if not json_path.exists():
+        return {}
+    
+    mapping = {}
+    with json_path.open("r", encoding="utf-8") as f:
+        # ligands.json is a list of objects
+        try:
+            data = json.load(f)
+            for item in data:
+                struct = item.get("structure", "").lower()
+                pocket = item.get("pocket_index", "")
+                ligs = item.get("pocket_ligs", [])
+                if struct:
+                    mapping[(struct, pocket)] = ligs
+        except json.JSONDecodeError:
+            pass
+    return mapping
+
+
 def load_alignment_matrix(path: Path) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    加载 US-align 输出的对齐矩阵。
+    
+    US-align 格式：
+    m               t[m]        u[m][0]        u[m][1]        u[m][2]
+    0       4.7013404849  -0.0108799269  -0.9989012922  -0.0455832829
+    1      10.0250808253   0.9999404926  -0.0108321852  -0.0012942403
+    2      20.4247760425   0.0007990517  -0.0455946516   0.9989597035
+    
+    Returns:
+        R: (3, 3) 旋转矩阵
+        t: (3,) 平移向量
+    """
     if not path.exists():
-        raise FileNotFoundError(path)
-    nums: List[float] = []
-    with path.open("r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            for tok in line.strip().split():
-                try:
-                    nums.append(float(tok))
-                except ValueError:
-                    continue
-    if len(nums) == 16:
-        mat = np.array(nums, dtype=np.float32).reshape(4, 4)
-        R = mat[:3, :3]
-        t = mat[:3, 3]
-        return R, t
-    if len(nums) == 12:
-        mat = np.array(nums, dtype=np.float32).reshape(3, 4)
-        R = mat[:, :3]
-        t = mat[:, 3]
-        return R, t
-    raise ValueError(f"Unexpected matrix format in {path} (len={len(nums)})")
+        raise FileNotFoundError(f"Alignment matrix file not found: {path}")
+    
+    with path.open("r", encoding="utf-8") as f:
+        lines = f.readlines()
+    
+    # 查找矩阵表头行
+    matrix_start = -1
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("m") and "t[m]" in stripped and "u[m]" in stripped:
+            matrix_start = i + 1
+            break
+    
+    if matrix_start < 0:
+        raise ValueError(f"US-align matrix header not found in {path}")
+    
+    if matrix_start + 3 > len(lines):
+        raise ValueError(f"Incomplete US-align matrix in {path}")
+    
+    # 解析 3 行矩阵数据
+    R = np.zeros((3, 3), dtype=np.float32)
+    t = np.zeros(3, dtype=np.float32)
+    
+    for row_idx in range(3):
+        line = lines[matrix_start + row_idx].strip()
+        parts = line.split()
+        
+        if len(parts) < 5:
+            raise ValueError(f"Invalid matrix row {row_idx} in {path}: expected 5 columns, got {len(parts)}")
+        
+        t[row_idx] = float(parts[1])
+        R[row_idx, 0] = float(parts[2])
+        R[row_idx, 1] = float(parts[3])
+        R[row_idx, 2] = float(parts[4])
+    
+    return R, t
 
 
 def invert_rt(R: np.ndarray, t: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -385,7 +456,7 @@ def extract_ligand_from_pdb(pdb_path: Path, ligand_resname: str, chain_id: str) 
             if chain_id and chain.id != chain_id:
                 continue
             for residue in chain:
-                if residue.get_id()[0] == " ":
+                if residue.get_id()[0] == " ": # Skip heteroatoms
                     continue
                 if residue.get_resname().strip() != ligand_resname:
                     continue
@@ -407,8 +478,70 @@ def extract_ligand_from_pdb(pdb_path: Path, ligand_resname: str, chain_id: str) 
     fh = StringIO()
     class LigandSelect(Select):
         def accept_residue(self, residue) -> bool:
-            return residue.get_id()[0] != " " and residue.get_resname().strip() == ligand_resname
+            return residue.get_id()[0] != " " and residue.get_resname().strip() == ligand_resname and (not chain_id or residue.get_parent().id == chain_id)
     io.save(fh, select=LigandSelect())
+    pdb_block = fh.getvalue()
+    return coords, pdb_block
+
+def extract_ligand_by_id(pdb_path: Path, l_chain: str, l_resname: str, l_resnum: str) -> Tuple[np.ndarray, str]:
+    parser = PDBParser(QUIET=True)
+    structure = parser.get_structure(pdb_path.stem, str(pdb_path))
+    coords = []
+    
+    # Biopython residue ID is (hetero_flag, sequence_identifier, insertion_code)
+    # hetero_flag: ' ' for standard amino/nucleic acids, 'W' for water, 'H_' for HETATM
+    # sequence_identifier: integer
+    # insertion_code: ' ' or a character
+    
+    # AHoJ ligand_id format: "Chain_ResName_ResNum" (e.g. "A_ZN_275")
+    # ResNum is typically the sequence_identifier.
+    
+    target_res_id = ('H_' if l_resname not in ['HOH', 'WAT'] else 'W', int(l_resnum), ' ')
+    
+    found_residue = None
+    for model in structure:
+        if l_chain in model:
+            chain = model[l_chain]
+            for residue in chain:
+                # Check if residue matches resname and resnum
+                # Note: Biopython's get_id() returns (hetero_flag, sequence_identifier, insertion_code)
+                # We need to match sequence_identifier and resname.
+                # The hetero_flag can be tricky, ' ' for standard, 'H_' for HETATM.
+                # AHoJ's ligand_id doesn't specify hetero_flag directly, but it's usually HETATM.
+                
+                res_id = residue.get_id()
+                if res_id[1] == int(l_resnum) and residue.get_resname().strip() == l_resname:
+                    found_residue = residue
+                    break
+            if found_residue:
+                break
+    
+    if not found_residue:
+        raise ValueError(f"Ligand {l_chain}_{l_resname}_{l_resnum} not found in {pdb_path}")
+
+    for atom in found_residue:
+        element = (atom.element or "").strip().upper()
+        name = atom.get_name().strip().upper()
+        if element == "H" or name.startswith("H"):
+            continue
+        coords.append(atom.get_coord())
+
+    if not coords:
+        raise ValueError(f"Ligand {l_chain}_{l_resname}_{l_resnum} has no heavy atoms in {pdb_path}")
+
+    coords = np.array(coords, dtype=np.float32)
+
+    # Build PDB block for this specific residue
+    io = PDBIO()
+    io.set_structure(structure)
+    from io import StringIO
+    fh = StringIO()
+    class SpecificLigandSelect(Select):
+        def accept_residue(self, residue) -> bool:
+            return residue.get_parent().id == l_chain and \
+                   residue.get_id()[1] == int(l_resnum) and \
+                   residue.get_resname().strip() == l_resname
+    io.save(fh, select=SpecificLigandSelect())
     pdb_block = fh.getvalue()
     return coords, pdb_block
 
@@ -492,8 +625,12 @@ def main():
         try:
             apo_csv = entry_dir / "apo_filtered_sorted_results.csv"
             holo_csv = entry_dir / "holo_filtered_sorted_results.csv"
+            ligands_json = entry_dir / "ligands.json"
+            
             apo = load_candidate(apo_csv)
             holo = load_candidate(holo_csv)
+            ligands_map = load_ligands_map(ligands_json)
+            
             if apo is None or holo is None:
                 raise ValueError("missing apo/holo candidates")
 
@@ -516,11 +653,13 @@ def main():
             _, query_chain = load_chain_structure(query_pdb_path, query.chain_id)
 
             # Transforms
-            R_aq, t_aq = load_alignment_matrix(apo_mat)
-            R_hq, t_hq = load_alignment_matrix(holo_mat)
-            R_qa, t_qa = invert_rt(R_aq, t_aq)
+            R_aq, t_aq = load_alignment_matrix(apo_mat) # Apo to Query
+            R_hq, t_hq = load_alignment_matrix(holo_mat) # Holo to Query
+            R_qa, t_qa = invert_rt(R_aq, t_aq) # Query to Apo
 
             # Map holo -> apo
+            # First, transform holo to query frame (R_hq, t_hq)
+            # Then, transform from query frame to apo frame (R_qa, t_qa)
             R_ha = R_qa @ R_hq
             t_ha = R_qa @ t_hq + t_qa
 
@@ -536,10 +675,69 @@ def main():
             write_chain_pdb(holo_struct, holo_chain, out_dir / "holo.pdb")
 
             # Ligand extraction from query structure (aligned to apo frame)
-            lig_coords, lig_pdb_block = extract_ligand_from_pdb(
-                query_pdb_path, ligand_resname, query_chain
-            )
-            lig_coords = apply_rt(lig_coords, R_qa, t_qa)
+            # Need Query structure to extract ligand reference for checking
+            # But we should prefer extracting from Holo if possible.
+            # However, "target_ligand" is just a resname (e.g. "ZN").
+            # We need to find "ZN" in Holo structure's pocket.
+            
+            lig_coords = None
+            lig_pdb_block = None
+            
+            # Try to find ligand in Holo
+            # 1. Get potential ligands from ligands.json
+            cand_ligs = ligands_map.get((holo.pdb_id, holo.pocket), [])
+            
+            # 2. Filter by resname (target_ligand)
+            matched_lig_id = None
+            for lig_str in cand_ligs:
+                # lig_str format usually "Chain_ResName_ResNum" e.g. "A_ZN_275"
+                parts = lig_str.split("_")
+                if len(parts) >= 2:
+                    resname = parts[1]
+                    if resname == ligand_resname:
+                        matched_lig_id = lig_str
+                        break
+            
+            if matched_lig_id:
+                # specific extraction from Holo
+                # parse matched_lig_id to get chain, resnum?
+                # Actually extract_ligand logic usually builds mask by chain and resname.
+                # If there are multiple ZN, we need the specific one.
+                # Let's rely on extract_ligand_by_id.
+                # matched_lig_id string: "A_ZN_275" -> Chain A, ResName ZN, ResNum 275
+                # We need to parse this.
+                l_parts = matched_lig_id.split("_")
+                l_chain = l_parts[0]
+                l_resname = l_parts[1]
+                l_resnum = l_parts[2] if len(l_parts) > 2 else None
+                
+                try:
+                    # Extract from Holo PDB (unaligned)
+                    raw_coords, raw_block = extract_ligand_by_id(
+                        holo_pdb, l_chain, l_resname, l_resnum
+                    )
+                    
+                    # Apply Holo -> Query transformation (R_hq, t_hq)
+                    # Then Query -> Apo transformation (R_qa, t_qa)
+                    # Combined: Holo -> Apo (R_ha, t_ha)
+                    lig_coords = apply_rt(raw_coords, R_ha, t_ha)
+                    lig_pdb_block = raw_block # PDB block is untransformed, but RDKit will use new coords.
+                    
+                except Exception as e:
+                    LOG.warning(f"Failed to extract ligand {matched_lig_id} from Holo for {sample_id}: {e}. Falling back to Query structure.")
+                    # Fallback to query
+                    pass
+
+            if lig_coords is None:
+                # Fallback to Query Ligand (original behavior)
+                # Extract from Query structure and transform to Apo frame
+                lig_coords, lig_pdb_block = extract_ligand_from_pdb(query_pdb_path, ligand_resname, query_chain)
+                lig_coords = apply_rt(lig_coords, R_qa, t_qa)
+            
+            if lig_coords.shape[0] == 0:
+                raise ValueError(f"Ligand {ligand_resname} not found or has no heavy atoms after extraction.")
+
+            # Save Ligand
             np.save(out_dir / "ligand_coords.npy", lig_coords.astype(np.float32))
 
             # Write ligand.sdf (strict)
