@@ -192,7 +192,9 @@ def load_candidate(csv_path: Path) -> Optional[Candidate]:
             aln_matrix = _pick_column(row, ["aln_matrix", "alignment_matrix", "matrix"])
             if aln_matrix and not chain_id:
                 # 尝试从文件名解析: aln_5uwlB_to_3kryB.txt -> pdb=5uwl, chain=B
-                m = re.match(r"aln_([0-9A-Za-z]{4})([A-Za-z0-9])_to_", aln_matrix)
+                # Ensure we only check the filename, not the full path
+                matrix_filename = Path(aln_matrix).name
+                m = re.match(r"aln_([0-9A-Za-z]{4})([A-Za-z0-9])_to_", matrix_filename)
                 if m:
                     parsed_pdb = m.group(1).lower()
                     parsed_chain = m.group(2)
@@ -226,7 +228,7 @@ def load_ligands_map(json_path: Path) -> Dict[Tuple[str, str], List[str]]:
             data = json.load(f)
             for item in data:
                 struct = item.get("structure", "").lower()
-                pocket = item.get("pocket_index", "")
+                pocket = str(item.get("pocket_index", "")) # Normalize to string
                 ligs = item.get("pocket_ligs", [])
                 if struct:
                     mapping[(struct, pocket)] = ligs
@@ -264,6 +266,41 @@ def load_alignment_matrix(path: Path) -> Tuple[np.ndarray, np.ndarray]:
             break
     
     if matrix_start < 0:
+        # Fallback: Try to parse as raw numeric matrix (last 3 lines or 4x3/4x4)
+        # Check if file has at least 3 lines of numbers
+        try:
+           data = np.loadtxt(str(path))
+           if data.shape == (3, 4) or data.shape == (4, 4):
+               # Assume format: [R t]
+               # US-align usually outputs:
+               # t x y z
+               # and R is rows.
+               # Wait, US-align numeric block is:
+               # 0.999 ...  5.4
+               # ...
+               # If it's pure numbers, assume standard transformation matrix [R|t]
+               # where t is the last column
+               R = data[:3, :3]
+               t = data[:3, 3]
+               return R, t
+           
+           # Handle flat 1D arrays (12 or 16 elements)
+           flat = data.flatten()
+           if flat.size == 12:
+               # Assume row-major 3x4 [R|t]
+               mat = flat.reshape(3, 4)
+               R = mat[:3, :3]
+               t = mat[:3, 3]
+               return R, t
+           elif flat.size == 16:
+               # Assume row-major 4x4 [R|t / 0 1]
+               mat = flat.reshape(4, 4)
+               R = mat[:3, :3]
+               t = mat[:3, 3]
+               return R, t
+               
+        except Exception:
+            pass
         raise ValueError(f"US-align matrix header not found in {path}")
     
     if matrix_start + 3 > len(lines):
