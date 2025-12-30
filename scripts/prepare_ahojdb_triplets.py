@@ -451,36 +451,109 @@ def extract_ligand_from_pdb(pdb_path: Path, ligand_resname: str, chain_id: str) 
     parser = PDBParser(QUIET=True)
     structure = parser.get_structure(pdb_path.stem, str(pdb_path))
     coords = []
+    
+    # Reuse the sets if possible, or redefine them locally to keep independent
+    _TWO_CHAR_ELEMENTS = {
+        "BR", "CL", "CA", "CD", "CE", "CO", "CR", "CS", "CU", "DY", "ER", "EU", "FE", "GA", "GD", 
+        "HG", "HO", "IN", "IR", "KR", "LA", "LI", "LU", "MG", "MN", "MO", "NA", "NB", "ND", "NE", 
+        "NI", "OS", "PB", "PD", "PM", "PR", "PT", "PU", "RA", "RB", "RE", "RH", "RU", "SB", "SC", 
+        "SE", "SI", "SM", "SN", "SR", "TA", "TB", "TC", "TE", "TH", "TI", "TL", "TM", "UR", "XE", 
+        "YB", "ZN", "ZR"
+    }
+    _ONE_CHAR_ELEMENTS = {
+        "B", "C", "F", "H", "I", "K", "N", "O", "P", "S", "U", "V", "W", "Y"
+    }
+
+    pdb_lines = []
+    serial = 1
+
     for model in structure:
         for chain in model:
             if chain_id and chain.id != chain_id:
                 continue
             for residue in chain:
-                if residue.get_id()[0] == " ": # Skip heteroatoms
+                if residue.get_id()[0] == " ":
                     continue
                 if residue.get_resname().strip() != ligand_resname:
                     continue
+                
+                # Check residue atom count for ion logic
+                is_single_atom = (len(residue) == 1)
+
                 for atom in residue:
                     element = (atom.element or "").strip().upper()
                     name = atom.get_name().strip().upper()
-                    if element == "H" or name.startswith("H"):
+                    
+                    if not element:
+                        alpha_name = "".join(filter(str.isalpha, name))
+                        
+                        if is_single_atom:
+                           if alpha_name in _TWO_CHAR_ELEMENTS:
+                               element = alpha_name
+                           elif alpha_name in _ONE_CHAR_ELEMENTS:
+                               element = alpha_name
+                           if not element and name in _TWO_CHAR_ELEMENTS:
+                               element = name
+                           if not element and name in _ONE_CHAR_ELEMENTS:
+                               element = name
+                        
+                        elif len(alpha_name) == 2 and alpha_name in _TWO_CHAR_ELEMENTS:
+                            element = alpha_name
+                        elif len(alpha_name) > 0:
+                            first = alpha_name[0]
+                            if first in _ONE_CHAR_ELEMENTS:
+                                element = first
+                                
+                        if not element and name in _TWO_CHAR_ELEMENTS:
+                            element = name
+                        
+                        atom.element = element
+
+                    if not element:
                         continue
+
+                    if element == "H" or element == "D": 
+                        continue
+                    if name.startswith("H") and element not in _TWO_CHAR_ELEMENTS and element not in _ONE_CHAR_ELEMENTS:
+                         continue
+                         
+                    # Validity Check
+                    is_valid = (element in _TWO_CHAR_ELEMENTS) or (element in _ONE_CHAR_ELEMENTS) or \
+                               (element in ["AL", "AR", "AS", "AU", "AG", "BA", "BE", "BI", "CR", "HE", "HF", "NB", "PO", "RN", "RU", "SB", "SE", "SN", "TE", "TI", "XE", "ZR"])
+                    
+                    if not is_valid:
+                         if element in ["A", "D", "E", "G", "J", "L", "M", "Q", "R", "T", "X", "Z"]:
+                             continue
+
                     coords.append(atom.get_coord())
+                    
+                    # Manual Fmt
+                    x, y, z = atom.get_coord()
+                    # ResSeq: Biopython residue.id[1]
+                    r_uid = residue.get_id()[1]
+                    
+                    pdb_line = _format_pdb_atom_line(
+                        record_type="HETATM",
+                        serial=serial,
+                        name=name,
+                        alt_loc=" ",
+                        res_name=ligand_resname,
+                        chain_id=chain.id,
+                        res_seq=int(r_uid),
+                        ins_code=" ",
+                        x=x, y=y, z=z,
+                        occ=1.00,
+                        temp=0.00,
+                        element=element
+                    )
+                    pdb_lines.append(pdb_line)
+                    serial += 1
+
     if not coords:
         raise ValueError(f"Ligand {ligand_resname} not found in {pdb_path}")
 
     coords = np.array(coords, dtype=np.float32)
-
-    # Build PDB block (RDKit) for this residue
-    io = PDBIO()
-    io.set_structure(structure)
-    from io import StringIO
-    fh = StringIO()
-    class LigandSelect(Select):
-        def accept_residue(self, residue) -> bool:
-            return residue.get_id()[0] != " " and residue.get_resname().strip() == ligand_resname and (not chain_id or residue.get_parent().id == chain_id)
-    io.save(fh, select=LigandSelect())
-    pdb_block = fh.getvalue()
+    pdb_block = "\n".join(pdb_lines) + "\n"
     return coords, pdb_block
 
 def extract_ligand_by_id(pdb_path: Path, l_chain: str, l_resname: str, l_resnum: str) -> Tuple[np.ndarray, str]:
