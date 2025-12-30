@@ -906,6 +906,11 @@ def main():
             out_dir = samples_dir / sample_id
             out_dir.mkdir(parents=True, exist_ok=True)
 
+            if (out_dir / "meta.json").exists():
+                 # Already processed
+                 written.append(sample_id)
+                 continue
+
             # Write apo (native) and holo (aligned)
             write_chain_pdb(apo_struct, apo_chain, out_dir / "apo.pdb")
             write_chain_pdb(holo_struct, holo_chain, out_dir / "holo.pdb")
