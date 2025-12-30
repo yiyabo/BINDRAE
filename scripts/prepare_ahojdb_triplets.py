@@ -528,33 +528,26 @@ def extract_ligand_by_id(pdb_path: Path, l_chain: str, l_resname: str, l_resnum:
         "YB", "ZN", "ZR"
     }
 
+    pdb_lines = []
+    serial = 1
+    
     for atom in found_residue:
         element = (atom.element or "").strip().upper()
         name = atom.get_name().strip().upper()
         
         # Aggressive element inference
         if not element:
-            # Clean name to alpha only
             alpha_name = "".join(filter(str.isalpha, name))
-            
-            # Case 1: Single atom residue (likely ion)
-            # If the residue has only 1 atom, its name usually IS the element
             if len(found_residue) == 1:
-               # Special check for known ions
                if alpha_name in _TWO_CHAR_ELEMENTS:
                    element = alpha_name
                elif len(alpha_name) > 0:
-                   element = alpha_name # Take full name if 1 or 2 chars? Usually yes.
-                   # But if name is "CA1", clean is "CA".
-                   # If name is "MG", clean is "MG".
-            
-            # Case 2: Multi-atom residue
+                   element = alpha_name 
             elif len(alpha_name) == 2 and alpha_name in _TWO_CHAR_ELEMENTS:
                 element = alpha_name
             elif len(alpha_name) > 0:
                 element = alpha_name[0]
             
-            # Safety fallback for common ions if still empty or suspicious
             if not element and name in _TWO_CHAR_ELEMENTS:
                 element = name
             
@@ -562,104 +555,109 @@ def extract_ligand_by_id(pdb_path: Path, l_chain: str, l_resname: str, l_resnum:
 
         if element == "H" or name.startswith("H"):
             continue
+            
         coords.append(atom.get_coord())
+        
+        # Manual PDB formatting to ensure RDKit compatibility
+        # HETATM serial name altRes chain resSeq insCode   x y z occ temp      seg element charge
+        x, y, z = atom.get_coord()
+        pdb_line = _format_pdb_atom_line(
+            record_type="HETATM",
+            serial=serial,
+            name=name,
+            alt_loc=" ",
+            res_name=l_resname,
+            chain_id=l_chain,
+            res_seq=int(l_resnum),
+            ins_code=" ",
+            x=x, y=y, z=z,
+            occ=1.00,
+            temp=0.00,
+            element=element
+        )
+        pdb_lines.append(pdb_line)
+        serial += 1
 
     if not coords:
         raise ValueError(f"Ligand {l_chain}_{l_resname}_{l_resnum} has no heavy atoms in {pdb_path}")
 
     coords = np.array(coords, dtype=np.float32)
-
-    # Build PDB block for this specific residue
-    # Use PDBIO but ensure formatting is element-friendly
-    io = PDBIO()
-    io.set_structure(structure)
-    from io import StringIO
-    fh = StringIO()
-    class SpecificLigandSelect(Select):
-        def accept_residue(self, residue) -> bool:
-            return residue.get_parent().id == l_chain and \
-                   residue.get_id()[1] == int(l_resnum) and \
-                   residue.get_resname().strip() == l_resname
-    io.save(fh, select=SpecificLigandSelect())
-    pdb_block = fh.getvalue()
+    pdb_block = "\n".join(pdb_lines) + "\n"
     
-    # POST-PROCESSING PDB BLOCK
-    # Biopython PDBIO might not write the element column correctly if it wasn't there initially,
-    # or RDKit might be very picky. 
-    # Explicitly fixing the element columns in the PDB block string.
-    # PDB format: Element symbol is at columns 77-78 (0-indexed: 76-77).
-    # Biopython PDBIO writes it if atom.element is set.
-    # But let's verify/force it.
-    
-    lines = pdb_block.splitlines()
-    new_lines = []
-    
-    # Re-map atoms to find their elements again? 
-    # Or just parse the line.
-    # It's better to force write the inferred element if missing in the block.
-    
-    atom_idx = 0
-    # Collect elements in order
-    elements = []
-    for atom in found_residue:
-        e = (atom.element or "").strip().upper()
-        n = atom.get_name().strip().upper()
-        if e == "H" or n.startswith("H"):
-            continue
-        elements.append(e)
-
-    # Filter lines to only ATOM/HETATM records of interest
-    # Note: PDBIO output might include disconnected atoms if select logic is complex, 
-    # but here we selected one residue. 
-    # However, 'lines' contains all atoms in that residue (including H).
-    # We skipped H in 'coords', so we should align logic.
-    
-    final_coords_check = []
-    
-    for line in lines:
-        if line.startswith("ATOM") or line.startswith("HETATM"):
-            # Check element col (76-77)
-            # Line length must be at least 78 to have element?
-            # Standard PDB is 80 cols.
-            curr_line = line.ljust(80)
-            
-            # Get atom name to identify which atom this is (if we need to match with our inference)
-            # Name at 12-15.
-            name = curr_line[12:16].strip()
-            element_in_file = curr_line[76:78].strip()
-            
-            # If element missing in file, try to fix from our inference logic
-            if not element_in_file:
-                # Re-infer (simple version) or match?
-                # Matching is hard without index.
-                # Let's use simple inference on name again.
-                alpha = "".join(filter(str.isalpha, name))
-                inferred = ""
-                if len(alpha) == 2 and alpha in _TWO_CHAR_ELEMENTS:
-                    inferred = alpha
-                elif len(alpha) > 0:
-                    inferred = alpha[0]
-                
-                # Special fix for ions
-                if len(lines) <= 3: # 1 atom + END/TER
-                     if name in _TWO_CHAR_ELEMENTS:
-                         inferred = name
-                
-                if inferred:
-                    # Write to col 76-77 (right justified)
-                    # changing text at index 76, 77
-                    # 76 is ' ' or char, 77 is char. Right aligned: " C", "MG"
-                    fmt_el = f"{inferred:>2}"
-                    curr_line = curr_line[:76] + fmt_el + curr_line[78:]
-            
-            new_lines.append(curr_line)
-        else:
-            new_lines.append(line)
-            
-    pdb_block = "\n".join(new_lines)
-
     return coords, pdb_block
 
+
+def _format_pdb_atom_line(record_type, serial, name, alt_loc, res_name, chain_id, res_seq, ins_code, x, y, z, occ, temp, element):
+    """
+    Format a PDB ATOM/HETATM line strictly according to PDB format v3.3.
+    Ensures that Element (cols 77-78) and Atom Name (cols 13-16) are correctly aligned for RDKit.
+    """
+    # Atom name alignment logic
+    # Columns 13-16 (1-based), width 4.
+    # If 4 chars, use all 4. 
+    # If < 4 chars:
+    #   If element is 2 chars (e.g. CA, FE), starts at col 14 (index 13). " CA "
+    #   Otherwise typically starts at col 14. " C  "
+    #   Wait, PDB standard: 
+    #   "Atom name ... starting at column 14 ... however, for 4-character atom names ... start at column 13"
+    #   We will align 1-3 char names to center-left (start at index 13, i.e., column 14).
+    
+    if len(name) >= 4:
+        name_field = name[:4]
+    else:
+        # Pad to 4 chars. Standard is usually " N  " (space N space space) for 1 char
+        # or " CA " (space CA space) for 2 chars.
+        # But RDKit is robust if column 13 is empty for <4 chars.
+        # Let's align to start at col 14 (index 13).
+        name_field = f" {name:<3}"[:4]
+    
+    # Element alignment: Columns 77-78, right justified.
+    element_field = f"{element:>2}"[:2]
+    
+    # Truncate strings to prevent overflow
+    record_type = record_type[:6]
+    res_name = res_name[:3] 
+    chain_id = chain_id[:1]
+    
+    # PDB format string
+    # 1-6 Record name
+    # 7-11 Serial
+    # 13-16 Atom name (handled above)
+    # 17 AltLoc
+    # 18-20 ResName
+    # 22 ChainID
+    # 23-26 ResSeq
+    # 27 iCode
+    # 31-38 X
+    # 39-46 Y
+    # 47-54 Z
+    # 55-60 Occupancy
+    # 61-66 TempFactor
+    # 77-78 Element  <-- CRITICAL for RDKit
+    # 79-80 Charge
+    
+    line = (
+        f"{record_type:<6}"
+        f"{serial:>5}"
+        f" " # col 12
+        f"{name_field}" # 13-16
+        f"{alt_loc[:1]}" # 17
+        f"{res_name:>3}" # 18-20
+        f" " # 21
+        f"{chain_id}" # 22
+        f"{res_seq:>4}" # 23-26
+        f"{ins_code[:1]}" # 27
+        f"   " # 28-30
+        f"{x:8.3f}" # 31-38
+        f"{y:8.3f}" # 39-46
+        f"{z:8.3f}" # 47-54
+        f"{occ:6.2f}" # 55-60
+        f"{temp:6.2f}" # 61-66
+        f"          " # 67-76
+        f"{element_field}" # 77-78
+        f"  " # 79-80
+    )
+    return line
 
 def pdb_block_to_sdf(pdb_block: str, coords: np.ndarray, out_path: Path) -> None:
     mol = Chem.MolFromPDBBlock(pdb_block, removeHs=False, sanitize=False)
