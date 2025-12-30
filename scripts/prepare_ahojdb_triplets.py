@@ -519,9 +519,40 @@ def extract_ligand_by_id(pdb_path: Path, l_chain: str, l_resname: str, l_resnum:
     if not found_residue:
         raise ValueError(f"Ligand {l_chain}_{l_resname}_{l_resnum} not found in {pdb_path}")
 
+    # Common 2-letter elements to avoid truncating to 1st char
+    _TWO_CHAR_ELEMENTS = {
+        "BR", "CL", "CA", "CD", "CE", "CO", "CR", "CS", "CU", "DY", "ER", "EU", "FE", "GA", "GD", 
+        "HG", "HO", "IN", "IR", "KR", "LA", "LI", "LU", "MG", "MN", "MO", "NA", "NB", "ND", "NE", 
+        "NI", "OS", "PB", "PD", "PM", "PR", "PT", "PU", "RA", "RB", "RE", "RH", "RU", "SB", "SC", 
+        "SE", "SI", "SM", "SN", "SR", "TA", "TB", "TC", "TE", "TH", "TI", "TL", "TM", "UR", "XE", 
+        "YB", "ZN", "ZR"
+    }
+
     for atom in found_residue:
         element = (atom.element or "").strip().upper()
         name = atom.get_name().strip().upper()
+        
+        # Fix missing elements for PDBIO to write correctly
+        if not element:
+            # Heuristic: keep only alpha characters
+            alpha_name = "".join(filter(str.isalpha, name))
+            
+            # If 2 chars and is a known element, use it
+            if len(alpha_name) == 2 and alpha_name in _TWO_CHAR_ELEMENTS:
+                element = alpha_name
+            # If starts with a known 2-char element (e.g. CA1 -> CA) - be careful about C-alpha (CA)
+            # For HETATM, CA is likely Calcium. For standard residue, CA is Carbon.
+            # But we are in extract_ligand, so likely HETATM.
+            # However, CA1 in a ligand could be Carbon.
+            # Generally, ions have atom name == element name.
+            elif len(found_residue) == 1 and alpha_name in _TWO_CHAR_ELEMENTS:
+                element = alpha_name
+            elif len(alpha_name) > 0:
+                # Default to first letter (C, N, O, S, P, F, I, B, etc.)
+                element = alpha_name[0]
+            
+            atom.element = element
+
         if element == "H" or name.startswith("H"):
             continue
         coords.append(atom.get_coord())
