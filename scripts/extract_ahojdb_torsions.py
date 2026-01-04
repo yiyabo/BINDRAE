@@ -96,7 +96,26 @@ class TorsionExtractor:
         
         try:
             structure = self.parser.get_structure(pdb_path.stem, str(pdb_path))
-            residues = [r for r in structure.get_residues() if is_aa(r, standard=True)]
+            
+            # More robust residue filtering - handle altLoc and non-standard naming
+            standard_aa = {
+                'ALA', 'CYS', 'ASP', 'GLU', 'PHE', 'GLY', 'HIS', 'ILE',
+                'LYS', 'LEU', 'MET', 'ASN', 'PRO', 'GLN', 'ARG', 'SER',
+                'THR', 'VAL', 'TRP', 'TYR'
+            }
+            
+            residues = []
+            for r in structure.get_residues():
+                # Get residue name and clean it
+                resname = r.get_resname().strip()
+                # Handle altLoc: AALA -> ALA, BALA -> ALA
+                if len(resname) == 4 and resname[0] in 'AB' and resname[1:] in standard_aa:
+                    resname = resname[1:]
+                
+                # Check if it's a standard amino acid
+                if resname in standard_aa:
+                    residues.append(r)
+            
             if not residues: return None
 
             n_res = len(residues)
