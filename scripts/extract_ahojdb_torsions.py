@@ -55,14 +55,21 @@ CHI_ANGLES_ATOMS = {
 
 class TorsionExtractor:
     def __init__(self):
-        self.parser = PDBParser(QUIET=True)
+        # Use PERMISSIVE=1 to handle duplicate residue IDs
+        from Bio.PDB.PDBExceptions import PDBConstructionWarning
+        import warnings
+        warnings.simplefilter('ignore', PDBConstructionWarning)
+        self.parser = PDBParser(QUIET=True, PERMISSIVE=1)
 
     def get_atom_coord(self, residue, atom_name: str) -> Optional[np.ndarray]:
         if atom_name not in residue:
             return None
         atom = residue[atom_name]
-        if atom.is_disordered():
+        # Safely handle disordered atoms
+        if hasattr(atom, 'selected_child'):
             atom = atom.selected_child
+        elif hasattr(atom, 'disordered_select'):
+            atom.disordered_select(list(atom.child_dict.keys())[0])
         coord = atom.coord
         if coord is None: return None
         return np.array(coord, dtype=np.float32)
