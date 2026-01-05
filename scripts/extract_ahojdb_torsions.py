@@ -62,17 +62,24 @@ class TorsionExtractor:
         self.parser = PDBParser(QUIET=True, PERMISSIVE=1)
 
     def get_atom_coord(self, residue, atom_name: str) -> Optional[np.ndarray]:
+        """Get atom coordinate, handling disordered atoms safely"""
         if atom_name not in residue:
             return None
-        atom = residue[atom_name]
-        # Safely handle disordered atoms
-        if hasattr(atom, 'selected_child'):
-            atom = atom.selected_child
-        elif hasattr(atom, 'disordered_select'):
-            atom.disordered_select(list(atom.child_dict.keys())[0])
-        coord = atom.coord
-        if coord is None: return None
-        return np.array(coord, dtype=np.float32)
+        
+        try:
+            atom = residue[atom_name]
+            # For disordered atoms, just take the first one
+            if hasattr(atom, 'get_coord'):
+                coord = atom.get_coord()
+            else:
+                # If it's a DisorderedAtom, get any child
+                coord = list(atom.child_dict.values())[0].get_coord()
+            
+            if coord is None:
+                return None
+            return np.array(coord, dtype=np.float32)
+        except:
+            return None
 
     def calc_dihedral_angle(self, residue, atom_names, prev_residue=None, next_residue=None):
         coords = []
@@ -102,8 +109,15 @@ class TorsionExtractor:
             return None
         
         try:
+            # Parse structure - catch all PDB parsing errors here
             structure = self.parser.get_structure(pdb_path.stem, str(pdb_path))
-            
+        except Exception as e:
+            # Skip files with parsing errors (duplicate IDs, malformed structures, etc.)
+            import sys
+            print(f"Skipping {pdb_path.name}: {str(e)[:50]}", file=sys.stderr)
+            return None
+        
+        try:
             # More robust residue filtering - handle altLoc and non-standard naming
             standard_aa = {
                 'ALA', 'CYS', 'ASP', 'GLU', 'PHE', 'GLY', 'HIS', 'ILE',
@@ -155,7 +169,7 @@ class TorsionExtractor:
                     angle = self.calc_dihedral_angle(res, ['N', 'CA', 'C', '+N'], next_residue=nxt)
                     if angle is not None:
                         psi[i] = angle
-                        bb_mask[i] = True # Either phi or psi is enough to say backbone is somewhat valid? usually we want both.
+                        bb_mask[i] = True
                 
                 # Omega
                 if has_next:
@@ -187,10 +201,14 @@ class TorsionExtractor:
             print(f"Error processing {pdb_path}: {e}", file=sys.stderr)
             return None
 
-def process_sample(sample_dir: Path, extractor: TorsionExtractor):
+def process_sample(sample_dir: Path):
+    """Process one sample - creates its own extractor to avoid threading issues"""
     sample_id = sample_dir.name
     
-    # Proces Apo
+    # Create extractor for this thread
+    extractor = TorsionExtractor()
+    
+    # Process Apo
     apo_pdb = sample_dir / "apo.pdb"
     if apo_pdb.exists() and not (sample_dir / "torsion_apo.npz").exists():
         data = extractor.extract(apo_pdb)
@@ -230,11 +248,9 @@ def main():
     sample_dirs = [d for d in samples_dir.iterdir() if d.is_dir()]
     print(f"Found {len(sample_dirs)} samples in {samples_dir}")
     
-    extractor = TorsionExtractor()
-    
-    # Run in parallel
+    # Run in parallel - each thread creates its own extractor
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.num_workers) as executor:
-        futures = {executor.submit(process_sample, d, extractor): d for d in sample_dirs}
+        futures = {executor.submit(process_sample, d): d for d in sample_dirs}
         for _ in tqdm(concurrent.futures.as_completed(futures), total=len(sample_dirs), desc="Extracting Torsions"):
             pass
 
