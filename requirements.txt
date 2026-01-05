@@ -1,45 +1,49 @@
 # ============================================================================
-# BINDRAE - Stage-1 IPA Implementation Requirements
+# BINDRAE - Stage-1 & Stage-2 Requirements
 # ============================================================================
 # 
 # 项目: 基于 FlashIPA 的蛋白质构象生成模型
 # 环境: Linux + CUDA 11.8+ (训练), Mac (开发)
 # Python: >=3.10 (推荐 3.11)
 # 
-# 安装顺序:
-# 1. mamba create -n bindrae python=3.11
-# 2. mamba activate bindrae
-# 3. mamba install pytorch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 pytorch-cuda=11.8 -c pytorch -c nvidia
-# 4. mamba install -c conda-forge rdkit
-# 5. pip install -r requirements.txt
-# 6. pip install flash-attn --no-build-isolation  # Linux + CUDA only
-# 7. pip install git+https://github.com/flagshippioneering/flash_ipa.git
-# 
+# 快速安装:
+# ============================================================================
+#   conda create -n bindrae python=3.11
+#   conda activate bindrae
+#   conda install pytorch pytorch-cuda=11.8 -c pytorch -c nvidia
+#   conda install -c conda-forge rdkit
+#   pip install -r requirements.txt
+#   pip install flash-attn --no-build-isolation  # 需要 5-15 分钟编译
+#   
+#   # 安装 flash_ipa 到 vendor 目录
+#   mkdir -p vendor && cd vendor
+#   git clone https://github.com/flagshippioneering/flash_ipa.git
 # ============================================================================
 
 # ----------------------------------------------------------------------------
 # 核心深度学习框架
 # ----------------------------------------------------------------------------
 torch>=2.0.0
-# torchvision>=0.15.0  # Stage-1不需要
-# torchaudio>=2.0.0    # Stage-1不需要
-# pytorch-lightning==2.2.5  # 不使用Lightning，用原生PyTorch
-# lightning==2.2.5
-# torchmetrics>=1.0.0  # 不需要
 
 # ----------------------------------------------------------------------------
-# 蛋白质语言模型 (ESM-2) - 仅用于数据预处理
+# FlashAttention 编译依赖 (必须在 flash-attn 之前安装)
 # ----------------------------------------------------------------------------
-# transformers>=4.30.0  # Stage-1用缓存的ESM特征，不需要在线推理
-# tokenizers>=0.13.0
-# huggingface-hub>=0.16.0
-# safetensors>=0.3.0
+psutil>=5.9.0
+ninja>=1.11.0
+packaging>=23.0
+
+# ----------------------------------------------------------------------------
+# FlashIPA 运行依赖
+# ----------------------------------------------------------------------------
+einops>=0.7.0
+beartype>=0.15.0
+jaxtyping>=0.2.20
 
 # ----------------------------------------------------------------------------
 # 生物信息学工具
 # ----------------------------------------------------------------------------
 biopython>=1.80
-# rdkit>=2023.3.1  # 建议用 conda 安装: conda install -c conda-forge rdkit
+# rdkit - 建议用 conda 安装: conda install -c conda-forge rdkit
 
 # ----------------------------------------------------------------------------
 # 科学计算
@@ -48,101 +52,45 @@ numpy>=1.24.0,<2.0.0
 scipy>=1.10.0
 
 # ----------------------------------------------------------------------------
-# 图神经网络 (可选，用于 GVP)
+# 数据处理与进度显示
 # ----------------------------------------------------------------------------
-# torch-geometric>=2.3.0
-
-# ----------------------------------------------------------------------------
-# 数据处理与加载
-# ----------------------------------------------------------------------------
-# datasets>=2.14.0  # 不使用HuggingFace datasets
-# pyarrow>=12.0.0
-# dill>=0.3.6
-
-# ----------------------------------------------------------------------------
-# 网络与下载
-# ----------------------------------------------------------------------------
+tqdm>=4.65.0
 requests>=2.31.0
 
 # ----------------------------------------------------------------------------
-# 实验管理与日志
+# 可选：ESM 预处理 (如需重新生成 ESM 特征)
 # ----------------------------------------------------------------------------
-# wandb>=0.15.0  # 可选，不强制
-# tensorboard>=2.13.0  # 可选
-tqdm>=4.65.0  # 进度条，必需
+# fair-esm>=2.0.0
+# transformers>=4.30.0
 
 # ----------------------------------------------------------------------------
-# 配置管理
+# 可选：实验管理与可视化
 # ----------------------------------------------------------------------------
-# pyyaml>=6.0  # 当前用dataclass配置，不需要yaml
-# omegaconf>=2.3.0
-
-# ----------------------------------------------------------------------------
-# 工具库
-# ----------------------------------------------------------------------------
-# click>=8.1.0  # 不使用命令行工具
-# joblib>=1.3.0  # 不需要
-# einops>=0.7.0  # 不使用
-
-# ----------------------------------------------------------------------------
-# 加速与优化
-# ----------------------------------------------------------------------------
-# accelerate>=0.20.0  # 不使用HuggingFace Accelerate
-
-# ----------------------------------------------------------------------------
-# FlashIPA 相关依赖 (Stage-1 核心)
-# ----------------------------------------------------------------------------
-# flash-attn>=2.0.0  # 见下方特殊安装说明
-# flash_ipa  # 见下方特殊安装说明
-
-# ----------------------------------------------------------------------------
-# 可选：ESM 预处理 / 统计分析 / 可视化
-# ----------------------------------------------------------------------------
-# fair-esm>=2.0.0  # cache_esm2.py 需要
-# pandas>=2.0.0
-# scikit-learn>=1.3.0
+# wandb>=0.15.0
+# tensorboard>=2.13.0
 # matplotlib>=3.7.0
-# seaborn>=0.12.0
+# pandas>=2.0.0
 
 # ============================================================================
-# 特殊安装说明
+# 安装后验证
 # ============================================================================
 # 
-# 1. RDKit 推荐用 conda 安装（避免依赖问题）:
-#    conda install -c conda-forge rdkit
-# 
-# 2. FlashAttention (仅 Linux + CUDA，必须与PyTorch版本匹配):
-#    ⚠️  重要：必须在安装PyTorch后重新编译flash-attn
-#    pip uninstall flash-attn -y  # 卸载旧版本
-#    pip install flash-attn --no-build-isolation  # 重新编译
-#    
-#    验证安装:
-#    python -c "from flash_attn import flash_attn_varlen_func; print('FlashAttention OK')"
-# 
-# 3. FlashIPA (依赖 FlashAttention):
-#    pip install git+https://github.com/flagshippioneering/flash_ipa.git
-#    
-#    或从源码安装（如果git安装失败）:
-#    git clone https://github.com/flagshippioneering/flash_ipa.git /tmp/flash_ipa
-#    pip install -e /tmp/flash_ipa
-#    
-#    验证安装:
-#    python -c "import sys; sys.path.insert(0, '/tmp/flash_ipa/src'); from flash_ipa.ipa import InvariantPointAttention; print('FlashIPA OK')"
-# 
-# 4. OpenFold (可选，用于 Rigid Utils):
-#    pip install git+https://github.com/aqlaboratory/openfold.git
-# 
-# ============================================================================
-# 验证安装
-# ============================================================================
-# 
-# python -c "import torch; print(f'PyTorch: {torch.__version__}')"
-# python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
+# python -c "import torch; print(f'PyTorch: {torch.__version__}, CUDA: {torch.cuda.is_available()}')"
 # python -c "from rdkit import Chem; print('RDKit: OK')"
 # python -c "from Bio import PDB; print('BioPython: OK')"
-# python -c "import transformers; print('Transformers: OK')"
-# python -c "import beartype, jaxtyping; print('beartype & jaxtyping: OK')"
+# python -c "import einops, beartype, jaxtyping; print('einops/beartype/jaxtyping: OK')"
 # python -c "from flash_attn import flash_attn_varlen_func; print('FlashAttention: OK')"
-# python -c "import sys; sys.path.insert(0, '/tmp/flash_ipa/src'); from flash_ipa.ipa import InvariantPointAttention; print('FlashIPA: OK')"
+# 
+# ============================================================================
+# FlashIPA 验证 (安装到 vendor 后)
+# ============================================================================
+# 
+# cd /path/to/BINDRAE
+# python -c "
+# import sys
+# sys.path.insert(0, 'vendor/flash_ipa/src')
+# from flash_ipa.ipa import InvariantPointAttention
+# print('FlashIPA: OK')
+# "
 # 
 # ============================================================================
