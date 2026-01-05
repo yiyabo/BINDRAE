@@ -176,7 +176,8 @@ class TorsionExtractor:
             }
 
         except Exception as e:
-            # print(f"Error processing {pdb_path}: {e}")
+            import sys
+            print(f"Error processing {pdb_path}: {e}", file=sys.stderr)
             return None
 
 def process_sample(sample_dir: Path, extractor: TorsionExtractor):
