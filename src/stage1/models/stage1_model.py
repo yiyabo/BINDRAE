@@ -16,8 +16,10 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-# FlashIPA路径
-flash_ipa_path = '/tmp/flash_ipa/src'
+# FlashIPA路径 (项目内 vendor 目录)
+from pathlib import Path
+_project_root = Path(__file__).resolve().parent.parent.parent.parent
+flash_ipa_path = str(_project_root / 'vendor' / 'flash_ipa' / 'src')
 if os.path.exists(flash_ipa_path) and flash_ipa_path not in sys.path:
     sys.path.insert(0, flash_ipa_path)
 
