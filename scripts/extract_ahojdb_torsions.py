@@ -248,11 +248,12 @@ def main():
     sample_dirs = [d for d in samples_dir.iterdir() if d.is_dir()]
     print(f"Found {len(sample_dirs)} samples in {samples_dir}")
     
-    # Run in parallel - each thread creates its own extractor
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.num_workers) as executor:
-        futures = {executor.submit(process_sample, d): d for d in sample_dirs}
-        for _ in tqdm(concurrent.futures.as_completed(futures), total=len(sample_dirs), desc="Extracting Torsions"):
-            pass
+    # Run in parallel using ProcessPoolExecutor for true parallelism
+    # ProcessPoolExecutor bypasses GIL and uses multiple CPU cores effectively
+    with concurrent.futures.ProcessPoolExecutor(max_workers=args.num_workers) as executor:
+        # Use map for simpler and often faster execution
+        list(tqdm(executor.map(process_sample, sample_dirs, chunksize=100), 
+                  total=len(sample_dirs), desc="Extracting Torsions"))
 
 if __name__ == "__main__":
     main()
