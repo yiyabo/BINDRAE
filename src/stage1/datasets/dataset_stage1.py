@@ -10,6 +10,7 @@ This dataset is aligned to the current Stage-1 spec:
 import sys
 import os
 import json
+from functools import partial
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 from dataclasses import dataclass
@@ -115,6 +116,21 @@ def extract_backbone_coords(pdb_file: Path) -> Tuple[np.ndarray, np.ndarray, np.
     C_coords = np.array(C_coords, dtype=np.float32)
 
     return N_coords, Ca_coords, C_coords, sequence
+
+
+def _load_backbone_npz(path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    data = np.load(path)
+    return data['N'], data['Ca'], data['C']
+
+
+def _coords_valid_mask(N_coords: np.ndarray,
+                       Ca_coords: np.ndarray,
+                       C_coords: np.ndarray,
+                       eps: float = 1e-6) -> np.ndarray:
+    n_norm = np.linalg.norm(N_coords, axis=-1)
+    ca_norm = np.linalg.norm(Ca_coords, axis=-1)
+    c_norm = np.linalg.norm(C_coords, axis=-1)
+    return (n_norm > eps) & (ca_norm > eps) & (c_norm > eps)
 
 
 # -----------------------------
@@ -232,8 +248,18 @@ class ApoHoloTripletDataset(Dataset):
         if apo_pdb is None or holo_pdb is None:
             raise FileNotFoundError(f"apo/holo PDB not found for {sample_id}")
 
-        N_apo, Ca_apo, C_apo, _ = extract_backbone_coords(apo_pdb)
-        N_holo, Ca_holo, C_holo, _ = extract_backbone_coords(holo_pdb)
+        apo_backbone = self._resolve_path(sample, 'apo_backbone', 'apo_backbone.npz')
+        holo_backbone = self._resolve_path(sample, 'holo_backbone', 'holo_backbone.npz')
+
+        if apo_backbone is not None and apo_backbone.exists():
+            N_apo, Ca_apo, C_apo = _load_backbone_npz(apo_backbone)
+        else:
+            N_apo, Ca_apo, C_apo, _ = extract_backbone_coords(apo_pdb)
+
+        if holo_backbone is not None and holo_backbone.exists():
+            N_holo, Ca_holo, C_holo = _load_backbone_npz(holo_backbone)
+        else:
+            N_holo, Ca_holo, C_holo, _ = extract_backbone_coords(holo_pdb)
 
         # Check for empty backbone (PDB parsing failed)
         if len(N_apo) == 0:
@@ -244,6 +270,7 @@ class ApoHoloTripletDataset(Dataset):
         # Align to ESM length
         N_apo, Ca_apo, C_apo = _align_len(N_apo, Ca_apo, C_apo, n_res)
         N_holo, Ca_holo, C_holo = _align_len(N_holo, Ca_holo, C_holo, n_res)
+        node_mask = _coords_valid_mask(N_apo, Ca_apo, C_apo) & _coords_valid_mask(N_holo, Ca_holo, C_holo)
 
         # Ligand tokens
         lig_coords_path = self._resolve_path(sample, 'ligand_coords', 'ligand_coords.npy')
@@ -268,6 +295,7 @@ class ApoHoloTripletDataset(Dataset):
 
         chi_holo = torsion_holo['angles'][:, 3:7]
         chi_mask = torsion_holo['chi_mask'][:, :4]
+        chi_mask = chi_mask & node_mask[:, None]
 
         # Pocket weights (apo frame)
         w_res_path = self._resolve_path(sample, 'w_res', 'w_res.npy')
@@ -276,6 +304,7 @@ class ApoHoloTripletDataset(Dataset):
             w_res = _align_array(w_res, n_res)
         else:
             w_res = compute_pocket_weights(Ca_apo, lig_tokens['coords'])
+        w_res = w_res * node_mask.astype(np.float32)
 
         # Optional atom14 holo
         atom14_path = self._resolve_path(sample, 'atom14_holo', 'atom14_holo.npy')
@@ -304,6 +333,7 @@ class ApoHoloTripletDataset(Dataset):
             'Ca_holo': Ca_holo,
             'C_holo': C_holo,
             'sequence': sequence_str,
+            'node_mask': node_mask,
             'lig_points': lig_tokens['coords'],
             'lig_types': lig_tokens['types'],
             'chi_holo': chi_holo,
@@ -321,7 +351,12 @@ class ApoHoloTripletDataset(Dataset):
 # Collate
 # -----------------------------
 
-def collate_stage1_batch(samples: List[Dict]) -> Stage1Batch:
+def collate_stage1_batch(samples: List[Dict], max_n_res: Optional[int] = None) -> Optional[Stage1Batch]:
+    if max_n_res is not None:
+        samples = [s for s in samples if s['n_residues'] <= max_n_res]
+        if len(samples) == 0:
+            return None
+
     batch_size = len(samples)
     max_n_res = max(s['n_residues'] for s in samples)
     max_lig = max(len(s['lig_points']) for s in samples)
@@ -365,7 +400,10 @@ def collate_stage1_batch(samples: List[Dict]) -> Stage1Batch:
         N_holo_batch[i, :n_res] = sample['N_holo']
         Ca_holo_batch[i, :n_res] = sample['Ca_holo']
         C_holo_batch[i, :n_res] = sample['C_holo']
-        node_mask[i, :n_res] = True
+        sample_mask = sample.get('node_mask')
+        if sample_mask is None:
+            sample_mask = np.ones((n_res,), dtype=bool)
+        node_mask[i, :n_res] = sample_mask
 
         lig_points[i, :n_lig] = sample['lig_points']
         lig_types[i, :n_lig] = sample['lig_types']
@@ -384,7 +422,7 @@ def collate_stage1_batch(samples: List[Dict]) -> Stage1Batch:
             if sample['atom14_holo_mask'] is not None:
                 atom14_holo_mask[i, :n_res] = sample['atom14_holo_mask']
             else:
-                atom14_holo_mask[i, :n_res] = True
+                atom14_holo_mask[i, :n_res] = sample_mask[:, None]
 
         pdb_ids.append(sample['id'])
         n_residues.append(n_res)
@@ -428,16 +466,18 @@ def create_stage1_dataloader(data_dir: str,
                              batch_size: int = 4,
                              shuffle: bool = True,
                              num_workers: int = 0,
+                             max_n_res: Optional[int] = None,
                              **kwargs):
     from torch.utils.data import DataLoader
 
     dataset = ApoHoloTripletDataset(data_dir, split=split, **kwargs)
+    collate_fn = partial(collate_stage1_batch, max_n_res=max_n_res)
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
-        collate_fn=collate_stage1_batch,
+        collate_fn=collate_fn,
         pin_memory=True,
     )
 

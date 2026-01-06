@@ -13,6 +13,13 @@ import sys
 from pathlib import Path
 import argparse
 
+# 避免 /dev/shm 限制导致的 DataLoader 崩溃
+try:
+    import torch.multiprocessing as mp
+    mp.set_sharing_strategy('file_system')
+except Exception:
+    pass
+
 # 添加项目路径
 project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root))
@@ -30,6 +37,8 @@ def parse_args():
                        help='数据目录')
     parser.add_argument('--batch_size', type=int, default=4,
                        help='批大小')
+    parser.add_argument('--max_n_res', type=int, default=None,
+                       help='每个batch的最大残基数（超过会过滤）')
     
     # 训练
     parser.add_argument('--lr', type=float, default=1e-4,
@@ -74,6 +83,7 @@ def main():
     config = TrainingConfig(
         data_dir=args.data_dir,
         batch_size=args.batch_size,
+        max_n_res=args.max_n_res,
         num_workers=args.num_workers,
         lr=args.lr,
         max_epochs=args.max_epochs,
@@ -92,6 +102,7 @@ def main():
     print(f"\n配置:")
     print(f"  - 数据目录: {config.data_dir}")
     print(f"  - 批大小: {config.batch_size}")
+    print(f"  - 最大残基数: {config.max_n_res}")
     print(f"  - 学习率: {config.lr}")
     print(f"  - 最大轮数: {config.max_epochs}")
     print(f"  - 早停patience: {config.early_stop_patience}")

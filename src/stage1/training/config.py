@@ -17,6 +17,7 @@ class TrainingConfig:
     data_dir: str = 'data/apo_holo_triplets'
     batch_size: int = 4
     num_workers: int = 4
+    max_n_res: Optional[int] = None  # 限制每个batch的最大残基数（None=不限制）
     
     # 优化器
     lr: float = 5e-4  # 折中值（1e-4太慢，1e-3可能不稳定）

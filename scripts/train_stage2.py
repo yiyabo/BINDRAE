@@ -10,6 +10,13 @@ import sys
 from pathlib import Path
 import argparse
 
+# 避免 /dev/shm 限制导致的 DataLoader 崩溃
+try:
+    import torch.multiprocessing as mp
+    mp.set_sharing_strategy('file_system')
+except Exception:
+    pass
+
 # 添加项目路径
 project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root))

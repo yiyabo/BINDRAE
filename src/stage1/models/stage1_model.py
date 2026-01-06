@@ -188,44 +188,31 @@ class Stage1Model(nn.Module):
         """
         B, N = batch.esm.shape[:2]
         device = batch.esm.device
-        debug = current_step is not None and current_step < 5  # 前5步调试
         
         # 1. ESM Adapter
         s = self.esm_adapter(batch.esm)  # [B, N, 384]
-        if debug and torch.isnan(s).any():
-            print(f"[MODEL DEBUG] NaN after ESM Adapter")
         
         # 2. 创建初始Rigid帧（从apo的N, CA, C）
         rigids = self._build_rigids_from_backbone(
             batch.N_apo, batch.Ca_apo, batch.C_apo, batch.node_mask
         )
-        if debug:
-            R = rigids.get_rots().get_rot_mats()
-            t = rigids.get_trans()
-            if torch.isnan(R).any() or torch.isnan(t).any():
-                print(f"[MODEL DEBUG] NaN in initial rigids: R={torch.isnan(R).any()}, t={torch.isnan(t).any()}")
         
         # 3. LigandConditioner（在IPA前注入，符合理论）
-        # 理论：配体信息应该影响IPA的几何建模（docs/理论 第15-26行）
         s_with_ligand = self.ligand_conditioner(
-            s,  # 在Adapter后立即注入
+            s,
             batch.lig_points,
             batch.lig_types,
             batch.node_mask,
             batch.lig_mask,
             current_step=current_step
         )
-        if debug and torch.isnan(s_with_ligand).any():
-            print(f"[MODEL DEBUG] NaN after LigandConditioner")
         
         # 4. EdgeEmbedder
         edge_outputs = self.edge_embedder(s_with_ligand, batch.Ca_apo, batch.node_mask)
         z_f1 = edge_outputs['z_f1']
         z_f2 = edge_outputs['z_f2']
-        if debug and (torch.isnan(z_f1).any() or torch.isnan(z_f2).any()):
-            print(f"[MODEL DEBUG] NaN after EdgeEmbedder: z_f1={torch.isnan(z_f1).any()}, z_f2={torch.isnan(z_f2).any()}")
         
-        # 5. FlashIPA（几何分支，已包含配体信息，并在每层后进行配体条件化）
+        # 5. FlashIPA（几何分支）
         s_geo, rigids_updated = self.ipa_module(
             s_with_ligand,
             rigids,
@@ -239,8 +226,6 @@ class Stage1Model(nn.Module):
             ligand_mask=batch.lig_mask,
             current_step=current_step,
         )
-        if debug and torch.isnan(s_geo).any():
-            print(f"[MODEL DEBUG] NaN after IPA module")
         
         # 6. TorsionHead（使用IPA输出）
         pred_chi = self.chi_head(s_geo)  # [B, N, 4, 2]

@@ -370,15 +370,8 @@ class IPABlock(nn.Module):
             mask=mask_float  # 使用 float mask
         )
         
-        # 检查 IPA 输出
+        # 替换可能的 NaN（bf16 偶尔可能产生）
         if torch.isnan(s_ipa).any():
-            # 打印更多信息帮助调试
-            nan_count = torch.isnan(s_ipa).sum().item()
-            total = s_ipa.numel()
-            print(f"[IPA BLOCK] NaN in s_ipa: {nan_count}/{total} ({100*nan_count/total:.2f}%)")
-            print(f"[IPA BLOCK] s input nan: {torch.isnan(s_masked).any()}, max: {s_masked.abs().max():.2f}")
-            print(f"[IPA BLOCK] z_f1 nan: {torch.isnan(z_f1_masked).any()}, max: {z_f1_masked.abs().max():.2f}")
-            # 替换 NaN 为 0 以继续训练
             s_ipa = torch.where(torch.isnan(s_ipa), torch.zeros_like(s_ipa), s_ipa)
         
         # 残差连接
@@ -466,14 +459,9 @@ class FlashIPAModule(nn.Module):
             s_geo: [B, N, c_s] 几何增强的节点表示
             rigids_final: Rigid对象 [B, N] 最终帧
         """
-        debug = current_step is not None and current_step < 3
-        
         # 逐层更新
         for i, block in enumerate(self.ipa_blocks):
             s, rigids = block(s, rigids, z_factor_1, z_factor_2, mask)
-            
-            if debug and torch.isnan(s).any():
-                print(f"[IPA DEBUG] NaN after IPA block {i}")
             
             if ligand_conditioner is not None:
                 s = ligand_conditioner(
@@ -484,8 +472,6 @@ class FlashIPAModule(nn.Module):
                     ligand_mask,
                     current_step=current_step,
                 )
-                if debug and torch.isnan(s).any():
-                    print(f"[IPA DEBUG] NaN after LigandConditioner in layer {i}")
         
         # 最终归一化
         s = self.final_norm(s)

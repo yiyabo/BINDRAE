@@ -108,6 +108,21 @@ def extract_backbone_coords(pdb_file: Path):
     return N_coords, Ca_coords, C_coords, sequence
 
 
+def _load_backbone_npz(path: Path):
+    data = np.load(path)
+    return data['N'], data['Ca'], data['C']
+
+
+def _coords_valid_mask(N_coords: np.ndarray,
+                       Ca_coords: np.ndarray,
+                       C_coords: np.ndarray,
+                       eps: float = 1e-6) -> np.ndarray:
+    n_norm = np.linalg.norm(N_coords, axis=-1)
+    ca_norm = np.linalg.norm(Ca_coords, axis=-1)
+    c_norm = np.linalg.norm(C_coords, axis=-1)
+    return (n_norm > eps) & (ca_norm > eps) & (c_norm > eps)
+
+
 # -----------------------------
 # Pocket weights
 # -----------------------------
@@ -214,11 +229,22 @@ class ApoHoloBridgeDataset(Dataset):
         if apo_pdb is None or holo_pdb is None:
             raise FileNotFoundError(f"apo/holo PDB not found for {sample_id}")
 
-        N_apo, Ca_apo, C_apo, _ = extract_backbone_coords(apo_pdb)
-        N_holo, Ca_holo, C_holo, _ = extract_backbone_coords(holo_pdb)
+        apo_backbone = self._resolve_path(sample, 'apo_backbone', 'apo_backbone.npz')
+        holo_backbone = self._resolve_path(sample, 'holo_backbone', 'holo_backbone.npz')
+
+        if apo_backbone is not None and apo_backbone.exists():
+            N_apo, Ca_apo, C_apo = _load_backbone_npz(apo_backbone)
+        else:
+            N_apo, Ca_apo, C_apo, _ = extract_backbone_coords(apo_pdb)
+
+        if holo_backbone is not None and holo_backbone.exists():
+            N_holo, Ca_holo, C_holo = _load_backbone_npz(holo_backbone)
+        else:
+            N_holo, Ca_holo, C_holo, _ = extract_backbone_coords(holo_pdb)
 
         N_apo, Ca_apo, C_apo = _align_len(N_apo, Ca_apo, C_apo, n_res)
         N_holo, Ca_holo, C_holo = _align_len(N_holo, Ca_holo, C_holo, n_res)
+        node_mask = _coords_valid_mask(N_apo, Ca_apo, C_apo) & _coords_valid_mask(N_holo, Ca_holo, C_holo)
 
         # Ligand tokens
         lig_coords_path = self._resolve_path(sample, 'ligand_coords', 'ligand_coords.npy')
@@ -255,6 +281,10 @@ class ApoHoloBridgeDataset(Dataset):
             w_res = _align_array(w_res, n_res)
         else:
             w_res = compute_pocket_weights(Ca_apo, lig_tokens['coords'])
+        w_res = w_res * node_mask.astype(np.float32)
+
+        bb_mask = torsion_apo['bb_mask'] & node_mask[:, None]
+        chi_mask = torsion_apo['chi_mask'] & node_mask[:, None]
 
         # Optional NMA features
         nma_features = None
@@ -277,14 +307,15 @@ class ApoHoloBridgeDataset(Dataset):
             'C_holo': C_holo,
             'torsion_apo': torsion_apo['angles'],
             'torsion_holo': torsion_holo['angles'],
-            'bb_mask': torsion_apo['bb_mask'],
-            'chi_mask': torsion_apo['chi_mask'],
+            'bb_mask': bb_mask,
+            'chi_mask': chi_mask,
             'aatype': aatype,
             'lig_points': lig_tokens['coords'],
             'lig_types': lig_tokens['types'],
             'w_res': w_res,
             'nma_features': nma_features,
             'n_residues': n_res,
+            'node_mask': node_mask,
         }
 
 
@@ -342,7 +373,10 @@ def collate_stage2_batch(samples: List[Dict]) -> Stage2Batch:
         torsion_holo[i, :n_res] = sample['torsion_holo']
         bb_mask[i, :n_res] = sample['bb_mask']
         chi_mask[i, :n_res] = sample['chi_mask']
-        node_mask[i, :n_res] = True
+        sample_mask = sample.get('node_mask')
+        if sample_mask is None:
+            sample_mask = np.ones((n_res,), dtype=bool)
+        node_mask[i, :n_res] = sample_mask
 
         N_apo[i, :n_res] = sample['N_apo']
         Ca_apo[i, :n_res] = sample['Ca_apo']

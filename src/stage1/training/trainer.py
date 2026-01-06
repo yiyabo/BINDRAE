@@ -76,6 +76,7 @@ class Stage1Trainer:
             batch_size=config.batch_size,
             shuffle=True,
             num_workers=config.num_workers,
+            max_n_res=config.max_n_res,
             require_atom14=False,  # atom14_holo 可选，缺失时跳过 FAPE
         )
         self.val_loader = create_stage1_dataloader(
@@ -84,6 +85,7 @@ class Stage1Trainer:
             batch_size=config.batch_size,
             shuffle=False,
             num_workers=config.num_workers,
+            max_n_res=config.max_n_res,
             require_atom14=False,
         )
 
@@ -222,20 +224,12 @@ class Stage1Trainer:
         pred_R = outputs['rigids_final'].get_rots().get_rot_mats()
         pred_t = pred_atom14[:, :, 1]
 
-        # 调试 holo backbone
-        if step < 3:
-            print(f"[HOLO DEBUG] N_holo max={batch.N_holo.abs().max():.2f}, Ca_holo max={batch.Ca_holo.abs().max():.2f}, C_holo max={batch.C_holo.abs().max():.2f}")
-        
         true_R, true_t = self._build_frames_from_backbone(
             batch.N_holo,
             batch.Ca_holo,
             batch.C_holo,
             batch.node_mask,
         )
-        
-        # 调试 true_R
-        if step < 3 and true_R.abs().max() > 10:
-            print(f"[HOLO DEBUG] true_R 异常: max={true_R.abs().max():.2f}, 应该在 [-1,1]")
 
         # FAPE loss: 用 FK 动态生成 atom14_holo 真值（保证一致性）
         # 如果原始 atom14_holo 为空或全零，就用 FK 生成
@@ -251,29 +245,21 @@ class Stage1Trainer:
             # 用 FK 从 holo backbone + torsion_holo 动态生成
             target_atom14, _ = self._generate_atom14_holo_with_fk(batch)
         
-        # 调试 FAPE 输入
-        if step < 5:
-            # 检查异常大的值
-            if pred_atom14.abs().max() > 1000:
-                print(f"[FAPE DEBUG] pred_atom14 过大: max={pred_atom14.abs().max():.2f}")
-            if target_atom14.abs().max() > 1000:
-                print(f"[FAPE DEBUG] target_atom14 过大: max={target_atom14.abs().max():.2f}")
-            if true_R.abs().max() > 10:
-                print(f"[FAPE DEBUG] true_R 过大: max={true_R.abs().max():.2f} (应该 ≤1)")
-            if true_t.abs().max() > 1000:
-                print(f"[FAPE DEBUG] true_t 过大: max={true_t.abs().max():.2f}")
-        
+        fape_mask = batch.node_mask.float() if batch.node_mask is not None else None
         loss_fape = fape_loss(
             pred_atom14,
             target_atom14,
             (pred_R, pred_t),
             (true_R, true_t),
-            w_res=None,
-            debug=(step < 3),  # 前3步调试
+            w_res=fape_mask,
         )
 
         # Clash on predicted atoms
-        pred_all_atoms = pred_atom14.reshape(pred_atom14.shape[0], -1, 3)
+        B, N, A, _ = pred_atom14.shape
+        pred_all_atoms = pred_atom14.reshape(B, -1, 3)
+        if batch.node_mask is not None:
+            valid_atom_mask = batch.node_mask.unsqueeze(-1).expand(-1, -1, A).reshape(B, -1)
+            pred_all_atoms = pred_all_atoms.masked_fill(~valid_atom_mask.unsqueeze(-1), 1e6)
         loss_clash = clash_penalty(pred_all_atoms, clash_threshold=2.2)
 
         total_loss = (
@@ -348,25 +334,12 @@ class Stage1Trainer:
         self.optimizer.zero_grad()
 
         batch = self._batch_to_device(batch)
-        
-        # NaN 调试：检查输入
-        if self.global_step < 5:  # 只在前几步调试
-            self._debug_batch(batch)
 
         if self.scaler is not None:
             with autocast():
                 outputs = self.model(batch, self.global_step)
-                
-                # NaN 调试：检查输出
-                if self.global_step < 5:
-                    self._debug_outputs(outputs)
-                
                 losses = self.compute_loss(outputs, batch, self.global_step)
                 loss = losses['total']
-                
-                # NaN 调试：检查 loss
-                if self.global_step < 5 and torch.isnan(loss):
-                    print(f"[NaN DEBUG] losses = {losses}")
 
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
@@ -423,10 +396,14 @@ class Stage1Trainer:
         }
 
         pbar = tqdm(self.train_loader, desc=f'Epoch {self.current_epoch:3d}', ncols=120, leave=True)
+        n_batches = 0
         for batch in pbar:
+            if batch is None:
+                continue
             step_losses = self.train_step(batch)
             for k in epoch_losses:
                 epoch_losses[k] += step_losses[k]
+            n_batches += 1
 
             pbar.set_postfix({
                 'loss': f"{step_losses['total']:.3f}",
@@ -436,7 +413,7 @@ class Stage1Trainer:
                 'lr': f"{self.optimizer.param_groups[0]['lr']:.1e}",
             }, refresh=True)
 
-        n_batches = len(self.train_loader)
+        n_batches = max(n_batches, 1)
         return {k: v / n_batches for k, v in epoch_losses.items()}
 
     @torch.no_grad()
@@ -458,10 +435,14 @@ class Stage1Trainer:
         n_structures = 0
 
         pbar = tqdm(self.val_loader, desc='  Validating', ncols=120, leave=False)
+        n_batches = 0
         for batch in pbar:
+            if batch is None:
+                continue
             batch = self._batch_to_device(batch)
             outputs = self.model(batch, self.global_step)
             losses = self.compute_loss(outputs, batch, self.global_step)
+            n_batches += 1
 
             for k in val_losses:
                 val_losses[k] += losses[k].item()
@@ -498,7 +479,17 @@ class Stage1Trainer:
                 'chi1': f"{chi1_acc:5.1%}",
             }, refresh=False)
 
-        n_batches = len(self.val_loader)
+        if n_batches == 0:
+            return {
+                'total': float('nan'),
+                'chi': float('nan'),
+                'clash': float('nan'),
+                'fape': float('nan'),
+                'chi1_acc': float('nan'),
+                'pocket_irmsd': float('nan'),
+                'clash_pct': float('nan'),
+            }
+
         val_losses = {k: v / n_batches for k, v in val_losses.items()}
         val_metrics['chi1_acc'] = val_metrics['chi1_acc'] / n_batches
         if n_structures > 0:
