@@ -18,6 +18,39 @@ from ..datasets import create_stage1_dataloader
 from ..modules.losses import fape_loss, torsion_loss, clash_penalty
 from utils.metrics import compute_pocket_irmsd, compute_chi1_accuracy, compute_clash_percentage
 
+# FlashIPA Rigid (与 FK 模块一致)
+import os
+import sys
+from pathlib import Path
+project_root = Path(__file__).resolve().parent.parent.parent.parent
+flash_ipa_path = str(project_root / 'vendor' / 'flash_ipa' / 'src')
+if os.path.exists(flash_ipa_path) and flash_ipa_path not in sys.path:
+    sys.path.insert(0, flash_ipa_path)
+from flash_ipa.rigid import Rigid, Rotation
+
+
+# ---------------------------------------------------------------------
+# Sequence -> aatype mapping
+# ---------------------------------------------------------------------
+AA_RESTYPE_MAP = {
+    'A': 0, 'R': 1, 'N': 2, 'D': 3, 'C': 4,
+    'Q': 5, 'E': 6, 'G': 7, 'H': 8, 'I': 9,
+    'L': 10, 'K': 11, 'M': 12, 'F': 13, 'P': 14,
+    'S': 15, 'T': 16, 'W': 17, 'Y': 18, 'V': 19,
+}
+
+
+def sequences_to_aatype(sequences, max_len: int, device: torch.device) -> torch.Tensor:
+    """Convert list of sequences to [B, N] aatype tensor."""
+    B = len(sequences)
+    aatype = torch.zeros(B, max_len, dtype=torch.long, device=device)
+    for i, seq in enumerate(sequences):
+        for j, aa in enumerate(seq):
+            if j >= max_len:
+                break
+            aatype[i, j] = AA_RESTYPE_MAP.get(aa, 0)  # default to ALA for unknown
+    return aatype
+
 
 class Stage1Trainer:
     """Stage-1 trainer."""
@@ -43,6 +76,7 @@ class Stage1Trainer:
             batch_size=config.batch_size,
             shuffle=True,
             num_workers=config.num_workers,
+            require_atom14=False,  # atom14_holo 可选，缺失时跳过 FAPE
         )
         self.val_loader = create_stage1_dataloader(
             config.data_dir,
@@ -50,6 +84,7 @@ class Stage1Trainer:
             batch_size=config.batch_size,
             shuffle=False,
             num_workers=config.num_workers,
+            require_atom14=False,
         )
 
         # Optimizer
@@ -113,6 +148,38 @@ class Stage1Trainer:
 
         return R, t
 
+    def _build_rigids_from_backbone(self, N, Ca, C, mask) -> Rigid:
+        """Build Rigid object from backbone coordinates for FK."""
+        R, t = self._build_frames_from_backbone(N, Ca, C, mask)
+        rotation = Rotation(rot_mats=R)
+        return Rigid(rots=rotation, trans=t)
+
+    def _generate_atom14_holo_with_fk(self, batch) -> torch.Tensor:
+        """
+        用 FK 从 holo backbone + torsion_holo 生成 atom14_holo
+        
+        这是 SQ1 理论方案：用 FK 动态生成真值以保持一致性
+        """
+        # 1. 从 holo backbone 构建 Rigid frames
+        holo_rigids = self._build_rigids_from_backbone(
+            batch.N_holo, batch.Ca_holo, batch.C_holo, batch.node_mask
+        )
+        
+        # 2. torsion_holo [B, N, 7] -> sin/cos [B, N, 7, 2]
+        torsion_sincos = torch.stack([
+            torch.sin(batch.torsion_holo),
+            torch.cos(batch.torsion_holo)
+        ], dim=-1)
+        
+        # 3. 从 sequences 生成 aatype
+        B, N = batch.torsion_holo.shape[:2]
+        aatype = sequences_to_aatype(batch.sequences, N, self.device)
+        
+        # 4. 调用 FK 生成 atom14
+        fk_result = self.model.fk_module(torsion_sincos, holo_rigids, aatype)
+        
+        return fk_result['atom14_pos'], fk_result['atom14_mask']
+
     def compute_loss(self, outputs: Dict, batch, step: int) -> Dict[str, torch.Tensor]:
         pred_chi_sincos = outputs['pred_chi']  # [B,N,4,2]
         pred_chi = torch.atan2(pred_chi_sincos[..., 0], pred_chi_sincos[..., 1])
@@ -140,9 +207,23 @@ class Stage1Trainer:
             batch.node_mask,
         )
 
+        # FAPE loss: 用 FK 动态生成 atom14_holo 真值（保证一致性）
+        # 如果原始 atom14_holo 为空或全零，就用 FK 生成
+        atom14_holo_valid = (
+            batch.atom14_holo is not None and 
+            batch.atom14_holo.abs().sum() > 0
+        )
+        
+        if atom14_holo_valid:
+            # 使用原始 atom14_holo 数据
+            target_atom14 = batch.atom14_holo
+        else:
+            # 用 FK 从 holo backbone + torsion_holo 动态生成
+            target_atom14, _ = self._generate_atom14_holo_with_fk(batch)
+        
         loss_fape = fape_loss(
             pred_atom14,
-            batch.atom14_holo,
+            target_atom14,
             (pred_R, pred_t),
             (true_R, true_t),
             w_res=None,
@@ -213,9 +294,12 @@ class Stage1Trainer:
         batch.chi_holo = batch.chi_holo.to(self.device)
         batch.chi_mask = batch.chi_mask.to(self.device)
         batch.torsion_apo = batch.torsion_apo.to(self.device)
+        batch.torsion_holo = batch.torsion_holo.to(self.device)
         batch.w_res = batch.w_res.to(self.device)
-        batch.atom14_holo = batch.atom14_holo.to(self.device)
-        batch.atom14_holo_mask = batch.atom14_holo_mask.to(self.device)
+        if batch.atom14_holo is not None:
+            batch.atom14_holo = batch.atom14_holo.to(self.device)
+        if batch.atom14_holo_mask is not None:
+            batch.atom14_holo_mask = batch.atom14_holo_mask.to(self.device)
         return batch
 
     def train_epoch(self) -> Dict[str, float]:

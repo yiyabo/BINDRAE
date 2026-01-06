@@ -62,6 +62,9 @@ class Stage1Batch:
 
     # Apo torsions (phi/psi/omega/chi1-4), used to fill FK
     torsion_apo: torch.Tensor    # [B, N, 7]
+    
+    # Holo torsions (phi/psi/omega/chi1-4), used for FK-generated atom14
+    torsion_holo: torch.Tensor   # [B, N, 7]
 
     # Pocket weights (computed in apo frame)
     w_res: torch.Tensor          # [B, N]
@@ -300,6 +303,7 @@ class ApoHoloTripletDataset(Dataset):
             'chi_holo': chi_holo,
             'chi_mask': chi_mask,
             'torsion_apo': torsion_apo['angles'],
+            'torsion_holo': torsion_holo['angles'],  # 完整 7 角，用于 FK 生成 atom14
             'w_res': w_res,
             'atom14_holo': atom14_holo,
             'atom14_holo_mask': atom14_holo_mask,
@@ -332,6 +336,7 @@ def collate_stage1_batch(samples: List[Dict]) -> Stage1Batch:
     chi_holo = np.zeros((batch_size, max_n_res, 4), dtype=np.float32)
     chi_mask = np.zeros((batch_size, max_n_res, 4), dtype=bool)
     torsion_apo = np.zeros((batch_size, max_n_res, 7), dtype=np.float32)
+    torsion_holo = np.zeros((batch_size, max_n_res, 7), dtype=np.float32)
 
     w_res = np.zeros((batch_size, max_n_res), dtype=np.float32)
 
@@ -363,6 +368,7 @@ def collate_stage1_batch(samples: List[Dict]) -> Stage1Batch:
         chi_holo[i, :n_res] = sample['chi_holo']
         chi_mask[i, :n_res] = sample['chi_mask']
         torsion_apo[i, :n_res] = sample['torsion_apo']
+        torsion_holo[i, :n_res] = sample['torsion_holo']
 
         w_res[i, :n_res] = sample['w_res']
 
@@ -397,6 +403,7 @@ def collate_stage1_batch(samples: List[Dict]) -> Stage1Batch:
         chi_holo=torch.from_numpy(chi_holo),
         chi_mask=torch.from_numpy(chi_mask),
         torsion_apo=torch.from_numpy(torsion_apo),
+        torsion_holo=torch.from_numpy(torsion_holo),
         w_res=torch.from_numpy(w_res),
         atom14_holo=torch.from_numpy(atom14_holo),
         atom14_holo_mask=torch.from_numpy(atom14_holo_mask),
