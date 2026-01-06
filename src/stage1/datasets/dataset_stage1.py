@@ -235,6 +235,12 @@ class ApoHoloTripletDataset(Dataset):
         N_apo, Ca_apo, C_apo, _ = extract_backbone_coords(apo_pdb)
         N_holo, Ca_holo, C_holo, _ = extract_backbone_coords(holo_pdb)
 
+        # Check for empty backbone (PDB parsing failed)
+        if len(N_apo) == 0:
+            raise ValueError(f"Empty apo backbone for {sample_id} (PDB parsing failed)")
+        if len(N_holo) == 0:
+            raise ValueError(f"Empty holo backbone for {sample_id} (PDB parsing failed)")
+
         # Align to ESM length
         N_apo, Ca_apo, C_apo = _align_len(N_apo, Ca_apo, C_apo, n_res)
         N_holo, Ca_holo, C_holo = _align_len(N_holo, Ca_holo, C_holo, n_res)
@@ -444,8 +450,14 @@ def _align_len(N_coords: np.ndarray,
                Ca_coords: np.ndarray,
                C_coords: np.ndarray,
                n_res: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Align backbone coords to target length n_res."""
+    # Handle empty arrays
+    if len(N_coords) == 0:
+        raise ValueError(f"Empty backbone coords (0 residues parsed from PDB)")
+    
     if len(N_coords) == n_res:
         return N_coords, Ca_coords, C_coords
+    
     N_out = np.zeros((n_res, 3), dtype=np.float32)
     Ca_out = np.zeros((n_res, 3), dtype=np.float32)
     C_out = np.zeros((n_res, 3), dtype=np.float32)
