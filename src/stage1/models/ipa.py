@@ -80,7 +80,7 @@ class FlashIPAModuleConfig:
             no_qk_points=self.no_qk_points,
             no_v_points=self.no_v_points,
             use_flash_attn=True,
-            attn_dtype='fp32',  # fp16 容易溢出导致 NaN，改用 fp32
+            attn_dtype='fp16',  # FlashAttention 只支持 fp16/bf16
         )
 
 

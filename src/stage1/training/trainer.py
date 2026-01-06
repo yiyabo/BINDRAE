@@ -277,6 +277,22 @@ class Stage1Trainer:
         if self._check_nan(batch.chi_holo, "chi_holo"): issues.append("chi_holo")
         if self._check_nan(batch.torsion_holo, "torsion_holo"): issues.append("torsion_holo")
         if self._check_nan(batch.lig_points, "lig_points"): issues.append("lig_points")
+        
+        # 检查骨架坐标是否有异常值（太大或全零）
+        ca_max = batch.Ca_apo.abs().max().item()
+        ca_min = batch.Ca_apo[batch.node_mask.bool()].abs().min().item() if batch.node_mask.any() else 0
+        if ca_max > 1000:
+            print(f"[NaN DEBUG] Ca_apo 坐标过大: max={ca_max}")
+            issues.append("Ca_apo_large")
+        
+        # 检查是否有全零的残基（有效位置）
+        valid_mask = batch.node_mask.bool()
+        ca_norms = torch.norm(batch.Ca_apo, dim=-1)  # [B, N]
+        zero_ca = (ca_norms[valid_mask] < 1e-6).sum().item()
+        if zero_ca > 0:
+            print(f"[NaN DEBUG] 有 {zero_ca} 个有效残基的 Ca 坐标接近零")
+            issues.append("Ca_zero")
+        
         if issues:
             print(f"[NaN DEBUG] 输入数据有问题: {issues}")
             print(f"[NaN DEBUG] sequences[0]: {batch.sequences[0][:50]}...")
