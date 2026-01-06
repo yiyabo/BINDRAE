@@ -39,6 +39,8 @@ def parse_args():
                        help='批大小')
     parser.add_argument('--max_n_res', type=int, default=None,
                        help='每个batch的最大残基数（超过会过滤）')
+    parser.add_argument('--valid_samples_file', type=str, default=None,
+                       help='有效样本列表文件路径（由scripts/validate_triplets_data.py生成）')
     
     # 训练
     parser.add_argument('--lr', type=float, default=1e-4,
@@ -84,6 +86,7 @@ def main():
         data_dir=args.data_dir,
         batch_size=args.batch_size,
         max_n_res=args.max_n_res,
+        valid_samples_file=args.valid_samples_file,
         num_workers=args.num_workers,
         lr=args.lr,
         max_epochs=args.max_epochs,

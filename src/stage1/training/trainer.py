@@ -77,6 +77,7 @@ class Stage1Trainer:
             shuffle=True,
             num_workers=config.num_workers,
             max_n_res=config.max_n_res,
+            valid_samples_file=config.valid_samples_file,
             require_atom14=False,  # atom14_holo 可选，缺失时跳过 FAPE
         )
         self.val_loader = create_stage1_dataloader(
@@ -86,6 +87,7 @@ class Stage1Trainer:
             shuffle=False,
             num_workers=config.num_workers,
             max_n_res=config.max_n_res,
+            valid_samples_file=config.valid_samples_file,
             require_atom14=False,
         )
 
@@ -335,22 +337,32 @@ class Stage1Trainer:
 
         batch = self._batch_to_device(batch)
 
+        # Forward pass
         if self.scaler is not None:
             with autocast():
                 outputs = self.model(batch, self.global_step)
                 losses = self.compute_loss(outputs, batch, self.global_step)
                 loss = losses['total']
+        else:
+            outputs = self.model(batch, self.global_step)
+            losses = self.compute_loss(outputs, batch, self.global_step)
+            loss = losses['total']
 
+        # === NaN/Inf 检查：跳过坏 batch，防止污染模型参数 ===
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"[WARN] NaN/Inf loss detected at step {self.global_step}, skipping batch (pdb_ids: {batch.pdb_ids[:3]}...)")
+            self.optimizer.zero_grad()  # 清除任何残留梯度
+            self.global_step += 1
+            return {k: float('nan') for k in losses.keys()}
+
+        # Backward pass (只有 loss 正常时才执行)
+        if self.scaler is not None:
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
             self.scaler.step(self.optimizer)
             self.scaler.update()
         else:
-            outputs = self.model(batch, self.global_step)
-            losses = self.compute_loss(outputs, batch, self.global_step)
-            loss = losses['total']
-
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
             self.optimizer.step()
@@ -397,10 +409,22 @@ class Stage1Trainer:
 
         pbar = tqdm(self.train_loader, desc=f'Epoch {self.current_epoch:3d}', ncols=120, leave=True)
         n_batches = 0
+        n_skipped = 0
         for batch in pbar:
             if batch is None:
                 continue
             step_losses = self.train_step(batch)
+            
+            # 跳过 NaN batch（不计入平均）
+            if math.isnan(step_losses['total']):
+                n_skipped += 1
+                pbar.set_postfix({
+                    'loss': 'nan',
+                    'skipped': n_skipped,
+                    'lr': f"{self.optimizer.param_groups[0]['lr']:.1e}",
+                }, refresh=True)
+                continue
+                
             for k in epoch_losses:
                 epoch_losses[k] += step_losses[k]
             n_batches += 1
@@ -413,6 +437,9 @@ class Stage1Trainer:
                 'lr': f"{self.optimizer.param_groups[0]['lr']:.1e}",
             }, refresh=True)
 
+        if n_skipped > 0:
+            print(f"  [INFO] Epoch {self.current_epoch}: skipped {n_skipped} NaN batches")
+        
         n_batches = max(n_batches, 1)
         return {k: v / n_batches for k, v in epoch_losses.items()}
 
