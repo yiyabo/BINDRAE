@@ -19,9 +19,13 @@ sys.path.insert(0, str(project_root))
 from src.stage1.datasets.dataset_stage1 import ApoHoloTripletDataset, extract_backbone_coords
 
 
-def save_backbone_npz(path: Path, N: np.ndarray, Ca: np.ndarray, C: np.ndarray) -> None:
+def save_backbone_npz(path: Path, N: np.ndarray, Ca: np.ndarray, C: np.ndarray, 
+                       residue_ids: list = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(path, N=N, Ca=Ca, C=C)
+    if residue_ids is not None:
+        np.savez_compressed(path, N=N, Ca=Ca, C=C, residue_ids=np.array(residue_ids))
+    else:
+        np.savez_compressed(path, N=N, Ca=Ca, C=C)
 
 
 def parse_args():
@@ -70,15 +74,15 @@ def main():
             continue
 
         try:
-            N_apo, Ca_apo, C_apo, _ = extract_backbone_coords(apo_pdb)
-            N_holo, Ca_holo, C_holo, _ = extract_backbone_coords(holo_pdb)
+            N_apo, Ca_apo, C_apo, _, apo_res_ids = extract_backbone_coords(apo_pdb)
+            N_holo, Ca_holo, C_holo, _, holo_res_ids = extract_backbone_coords(holo_pdb)
 
             if len(N_apo) == 0 or len(N_holo) == 0:
                 failed += 1
                 continue
 
-            save_backbone_npz(apo_out, N_apo, Ca_apo, C_apo)
-            save_backbone_npz(holo_out, N_holo, Ca_holo, C_holo)
+            save_backbone_npz(apo_out, N_apo, Ca_apo, C_apo, apo_res_ids)
+            save_backbone_npz(holo_out, N_holo, Ca_holo, C_holo, holo_res_ids)
             ok += 1
         except Exception:
             failed += 1

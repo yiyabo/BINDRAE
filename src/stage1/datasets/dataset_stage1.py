@@ -84,8 +84,16 @@ class Stage1Batch:
 # PDB parsing
 # -----------------------------
 
-def extract_backbone_coords(pdb_file: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[str]]:
-    """Extract N, CA, C coords and sequence from a PDB file."""
+def extract_backbone_coords(pdb_file: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[str], List[int]]:
+    """Extract N, CA, C coords, sequence and residue IDs from a PDB file.
+    
+    Returns:
+        N_coords: [N, 3] array
+        Ca_coords: [N, 3] array
+        C_coords: [N, 3] array
+        sequence: list of 3-letter residue names
+        residue_ids: list of integer residue IDs (for alignment)
+    """
     parser = PDBParser(QUIET=True)
     structure = parser.get_structure('protein', str(pdb_file))
 
@@ -93,6 +101,7 @@ def extract_backbone_coords(pdb_file: Path) -> Tuple[np.ndarray, np.ndarray, np.
     Ca_coords = []
     C_coords = []
     sequence = []
+    residue_ids = []
 
     for model in structure:
         for chain in model:
@@ -110,17 +119,91 @@ def extract_backbone_coords(pdb_file: Path) -> Tuple[np.ndarray, np.ndarray, np.
                 Ca_coords.append(Ca)
                 C_coords.append(C)
                 sequence.append(residue.get_resname())
+                residue_ids.append(residue.get_id()[1])  # residue sequence number
 
     N_coords = np.array(N_coords, dtype=np.float32)
     Ca_coords = np.array(Ca_coords, dtype=np.float32)
     C_coords = np.array(C_coords, dtype=np.float32)
 
-    return N_coords, Ca_coords, C_coords, sequence
+    return N_coords, Ca_coords, C_coords, sequence, residue_ids
 
 
-def _load_backbone_npz(path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _load_backbone_npz(path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[List[int]]]:
+    """Load cached backbone coords. Returns residue_ids if stored."""
     data = np.load(path)
-    return data['N'], data['Ca'], data['C']
+    residue_ids = data['residue_ids'].tolist() if 'residue_ids' in data else None
+    return data['N'], data['Ca'], data['C'], residue_ids
+
+
+def align_by_residue_ids(
+    apo_coords: Tuple[np.ndarray, np.ndarray, np.ndarray],
+    apo_res_ids: List[int],
+    holo_coords: Tuple[np.ndarray, np.ndarray, np.ndarray],
+    holo_res_ids: List[int],
+    target_len: int
+) -> Tuple[Tuple[np.ndarray, np.ndarray, np.ndarray],
+           Tuple[np.ndarray, np.ndarray, np.ndarray],
+           np.ndarray]:
+    """
+    Align apo and holo backbone coords based on residue IDs, not prefix.
+    
+    Only residues present in BOTH apo and holo (by ID) will be valid.
+    This fixes the issue where missing residues in the middle cause misalignment.
+    
+    Args:
+        apo_coords: (N_apo, Ca_apo, C_apo) arrays
+        apo_res_ids: list of residue IDs for apo
+        holo_coords: (N_holo, Ca_holo, C_holo) arrays
+        holo_res_ids: list of residue IDs for holo
+        target_len: target output length (typically from ESM)
+    
+    Returns:
+        aligned_apo: (N, Ca, C) aligned to target_len
+        aligned_holo: (N, Ca, C) aligned to target_len
+        valid_mask: [target_len] boolean mask, True where both apo and holo have data
+    """
+    N_apo, Ca_apo, C_apo = apo_coords
+    N_holo, Ca_holo, C_holo = holo_coords
+    
+    # Build residue ID -> index mapping
+    apo_id_to_idx = {rid: i for i, rid in enumerate(apo_res_ids)}
+    holo_id_to_idx = {rid: i for i, rid in enumerate(holo_res_ids)}
+    
+    # Find common residue IDs
+    common_ids = set(apo_res_ids) & set(holo_res_ids)
+    
+    # Initialize output arrays
+    N_apo_out = np.zeros((target_len, 3), dtype=np.float32)
+    Ca_apo_out = np.zeros((target_len, 3), dtype=np.float32)
+    C_apo_out = np.zeros((target_len, 3), dtype=np.float32)
+    N_holo_out = np.zeros((target_len, 3), dtype=np.float32)
+    Ca_holo_out = np.zeros((target_len, 3), dtype=np.float32)
+    C_holo_out = np.zeros((target_len, 3), dtype=np.float32)
+    valid_mask = np.zeros(target_len, dtype=bool)
+    
+    # Map to output indices (sorted by residue ID for consistency)
+    sorted_common = sorted(common_ids)
+    
+    for out_idx, res_id in enumerate(sorted_common):
+        if out_idx >= target_len:
+            break
+        
+        apo_idx = apo_id_to_idx[res_id]
+        holo_idx = holo_id_to_idx[res_id]
+        
+        N_apo_out[out_idx] = N_apo[apo_idx]
+        Ca_apo_out[out_idx] = Ca_apo[apo_idx]
+        C_apo_out[out_idx] = C_apo[apo_idx]
+        N_holo_out[out_idx] = N_holo[holo_idx]
+        Ca_holo_out[out_idx] = Ca_holo[holo_idx]
+        C_holo_out[out_idx] = C_holo[holo_idx]
+        valid_mask[out_idx] = True
+    
+    return (
+        (N_apo_out, Ca_apo_out, C_apo_out),
+        (N_holo_out, Ca_holo_out, C_holo_out),
+        valid_mask
+    )
 
 
 def _coords_valid_mask(N_coords: np.ndarray,
@@ -251,15 +334,19 @@ class ApoHoloTripletDataset(Dataset):
         apo_backbone = self._resolve_path(sample, 'apo_backbone', 'apo_backbone.npz')
         holo_backbone = self._resolve_path(sample, 'holo_backbone', 'holo_backbone.npz')
 
+        apo_res_ids = None
+        holo_res_ids = None
+        
+        # Try to load cached backbone with residue IDs
         if apo_backbone is not None and apo_backbone.exists():
-            N_apo, Ca_apo, C_apo = _load_backbone_npz(apo_backbone)
+            N_apo, Ca_apo, C_apo, apo_res_ids = _load_backbone_npz(apo_backbone)
         else:
-            N_apo, Ca_apo, C_apo, _ = extract_backbone_coords(apo_pdb)
+            N_apo, Ca_apo, C_apo, _, apo_res_ids = extract_backbone_coords(apo_pdb)
 
         if holo_backbone is not None and holo_backbone.exists():
-            N_holo, Ca_holo, C_holo = _load_backbone_npz(holo_backbone)
+            N_holo, Ca_holo, C_holo, holo_res_ids = _load_backbone_npz(holo_backbone)
         else:
-            N_holo, Ca_holo, C_holo, _ = extract_backbone_coords(holo_pdb)
+            N_holo, Ca_holo, C_holo, _, holo_res_ids = extract_backbone_coords(holo_pdb)
 
         # Check for empty backbone (PDB parsing failed)
         if len(N_apo) == 0:
@@ -267,10 +354,19 @@ class ApoHoloTripletDataset(Dataset):
         if len(N_holo) == 0:
             raise ValueError(f"Empty holo backbone for {sample_id} (PDB parsing failed)")
 
-        # Align to ESM length
-        N_apo, Ca_apo, C_apo = _align_len(N_apo, Ca_apo, C_apo, n_res)
-        N_holo, Ca_holo, C_holo = _align_len(N_holo, Ca_holo, C_holo, n_res)
-        node_mask = _coords_valid_mask(N_apo, Ca_apo, C_apo) & _coords_valid_mask(N_holo, Ca_holo, C_holo)
+        # Align to ESM length - prefer residue ID alignment if available
+        if apo_res_ids is not None and holo_res_ids is not None:
+            # Use residue ID based alignment (fixes middle-missing residue issues)
+            (N_apo, Ca_apo, C_apo), (N_holo, Ca_holo, C_holo), node_mask = align_by_residue_ids(
+                (N_apo, Ca_apo, C_apo), apo_res_ids,
+                (N_holo, Ca_holo, C_holo), holo_res_ids,
+                n_res
+            )
+        else:
+            # Fallback to prefix alignment (legacy behavior)
+            N_apo, Ca_apo, C_apo = _align_len(N_apo, Ca_apo, C_apo, n_res)
+            N_holo, Ca_holo, C_holo = _align_len(N_holo, Ca_holo, C_holo, n_res)
+            node_mask = _coords_valid_mask(N_apo, Ca_apo, C_apo) & _coords_valid_mask(N_holo, Ca_holo, C_holo)
 
         # Ligand tokens
         lig_coords_path = self._resolve_path(sample, 'ligand_coords', 'ligand_coords.npy')
@@ -352,8 +448,16 @@ class ApoHoloTripletDataset(Dataset):
 # -----------------------------
 
 def collate_stage1_batch(samples: List[Dict], max_n_res: Optional[int] = None) -> Optional[Stage1Batch]:
+    original_count = len(samples)
     if max_n_res is not None:
         samples = [s for s in samples if s['n_residues'] <= max_n_res]
+        filtered_count = original_count - len(samples)
+        if filtered_count > 0:
+            import logging
+            logging.getLogger('stage1.data').debug(
+                f"max_n_res filter: {filtered_count}/{original_count} samples removed "
+                f"(>{max_n_res} residues)"
+            )
         if len(samples) == 0:
             return None
 

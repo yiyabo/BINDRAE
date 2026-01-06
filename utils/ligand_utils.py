@@ -104,7 +104,7 @@ class LigandTokenBuilder:
             self.feature_factory = None
     
     def build_tokens(self, ligand_coords: np.ndarray, 
-                    ligand_mol: Optional[Chem.Mol] = None) -> Dict[str, np.ndarray]:
+                    ligand_mol: Optional['Chem.Mol'] = None) -> Dict[str, np.ndarray]:
         """
         构建配体 tokens
         
@@ -166,7 +166,7 @@ class LigandTokenBuilder:
             'importance': importance.astype(np.float32)
         }
     
-    def _analyze_atoms(self, mol: Optional[Chem.Mol], n_atoms: int) -> Dict:
+    def _analyze_atoms(self, mol: Optional['Chem.Mol'], n_atoms: int) -> Dict:
         """
         分析原子类型和特性
         
@@ -246,7 +246,7 @@ class LigandTokenBuilder:
         return info
     
     def _generate_probes(self, coords: np.ndarray, 
-                        mol: Optional[Chem.Mol],
+                        mol: Optional['Chem.Mol'],
                         atom_info: Dict) -> Tuple[np.ndarray, np.ndarray]:
         """
         为关键原子生成方向探针

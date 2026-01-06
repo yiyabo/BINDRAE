@@ -75,7 +75,7 @@ class Stage2Batch:
 # -----------------------------
 
 def extract_backbone_coords(pdb_file: Path):
-    """Extract N, CA, C coords and sequence from a PDB file."""
+    """Extract N, CA, C coords, sequence and residue IDs from a PDB file."""
     parser = PDBParser(QUIET=True)
     structure = parser.get_structure('protein', str(pdb_file))
 
@@ -83,6 +83,7 @@ def extract_backbone_coords(pdb_file: Path):
     Ca_coords = []
     C_coords = []
     sequence = []
+    residue_ids = []
 
     for model in structure:
         for chain in model:
@@ -100,17 +101,20 @@ def extract_backbone_coords(pdb_file: Path):
                 Ca_coords.append(Ca)
                 C_coords.append(C)
                 sequence.append(residue.get_resname())
+                residue_ids.append(residue.get_id()[1])
 
     N_coords = np.array(N_coords, dtype=np.float32)
     Ca_coords = np.array(Ca_coords, dtype=np.float32)
     C_coords = np.array(C_coords, dtype=np.float32)
 
-    return N_coords, Ca_coords, C_coords, sequence
+    return N_coords, Ca_coords, C_coords, sequence, residue_ids
 
 
 def _load_backbone_npz(path: Path):
+    """Load cached backbone coords. Returns residue_ids if stored."""
     data = np.load(path)
-    return data['N'], data['Ca'], data['C']
+    residue_ids = data['residue_ids'].tolist() if 'residue_ids' in data else None
+    return data['N'], data['Ca'], data['C'], residue_ids
 
 
 def _coords_valid_mask(N_coords: np.ndarray,
@@ -121,6 +125,45 @@ def _coords_valid_mask(N_coords: np.ndarray,
     ca_norm = np.linalg.norm(Ca_coords, axis=-1)
     c_norm = np.linalg.norm(C_coords, axis=-1)
     return (n_norm > eps) & (ca_norm > eps) & (c_norm > eps)
+
+
+def align_by_residue_ids(
+    apo_coords, apo_res_ids, holo_coords, holo_res_ids, target_len
+):
+    """Align apo and holo backbone coords based on residue IDs."""
+    N_apo, Ca_apo, C_apo = apo_coords
+    N_holo, Ca_holo, C_holo = holo_coords
+    
+    apo_id_to_idx = {rid: i for i, rid in enumerate(apo_res_ids)}
+    holo_id_to_idx = {rid: i for i, rid in enumerate(holo_res_ids)}
+    common_ids = set(apo_res_ids) & set(holo_res_ids)
+    
+    N_apo_out = np.zeros((target_len, 3), dtype=np.float32)
+    Ca_apo_out = np.zeros((target_len, 3), dtype=np.float32)
+    C_apo_out = np.zeros((target_len, 3), dtype=np.float32)
+    N_holo_out = np.zeros((target_len, 3), dtype=np.float32)
+    Ca_holo_out = np.zeros((target_len, 3), dtype=np.float32)
+    C_holo_out = np.zeros((target_len, 3), dtype=np.float32)
+    valid_mask = np.zeros(target_len, dtype=bool)
+    
+    for out_idx, res_id in enumerate(sorted(common_ids)):
+        if out_idx >= target_len:
+            break
+        apo_idx = apo_id_to_idx[res_id]
+        holo_idx = holo_id_to_idx[res_id]
+        N_apo_out[out_idx] = N_apo[apo_idx]
+        Ca_apo_out[out_idx] = Ca_apo[apo_idx]
+        C_apo_out[out_idx] = C_apo[apo_idx]
+        N_holo_out[out_idx] = N_holo[holo_idx]
+        Ca_holo_out[out_idx] = Ca_holo[holo_idx]
+        C_holo_out[out_idx] = C_holo[holo_idx]
+        valid_mask[out_idx] = True
+    
+    return (
+        (N_apo_out, Ca_apo_out, C_apo_out),
+        (N_holo_out, Ca_holo_out, C_holo_out),
+        valid_mask
+    )
 
 
 # -----------------------------
@@ -232,19 +275,30 @@ class ApoHoloBridgeDataset(Dataset):
         apo_backbone = self._resolve_path(sample, 'apo_backbone', 'apo_backbone.npz')
         holo_backbone = self._resolve_path(sample, 'holo_backbone', 'holo_backbone.npz')
 
+        apo_res_ids = None
+        holo_res_ids = None
+
         if apo_backbone is not None and apo_backbone.exists():
-            N_apo, Ca_apo, C_apo = _load_backbone_npz(apo_backbone)
+            N_apo, Ca_apo, C_apo, apo_res_ids = _load_backbone_npz(apo_backbone)
         else:
-            N_apo, Ca_apo, C_apo, _ = extract_backbone_coords(apo_pdb)
+            N_apo, Ca_apo, C_apo, _, apo_res_ids = extract_backbone_coords(apo_pdb)
 
         if holo_backbone is not None and holo_backbone.exists():
-            N_holo, Ca_holo, C_holo = _load_backbone_npz(holo_backbone)
+            N_holo, Ca_holo, C_holo, holo_res_ids = _load_backbone_npz(holo_backbone)
         else:
-            N_holo, Ca_holo, C_holo, _ = extract_backbone_coords(holo_pdb)
+            N_holo, Ca_holo, C_holo, _, holo_res_ids = extract_backbone_coords(holo_pdb)
 
-        N_apo, Ca_apo, C_apo = _align_len(N_apo, Ca_apo, C_apo, n_res)
-        N_holo, Ca_holo, C_holo = _align_len(N_holo, Ca_holo, C_holo, n_res)
-        node_mask = _coords_valid_mask(N_apo, Ca_apo, C_apo) & _coords_valid_mask(N_holo, Ca_holo, C_holo)
+        # Align using residue IDs if available
+        if apo_res_ids is not None and holo_res_ids is not None:
+            (N_apo, Ca_apo, C_apo), (N_holo, Ca_holo, C_holo), node_mask = align_by_residue_ids(
+                (N_apo, Ca_apo, C_apo), apo_res_ids,
+                (N_holo, Ca_holo, C_holo), holo_res_ids,
+                n_res
+            )
+        else:
+            N_apo, Ca_apo, C_apo = _align_len(N_apo, Ca_apo, C_apo, n_res)
+            N_holo, Ca_holo, C_holo = _align_len(N_holo, Ca_holo, C_holo, n_res)
+            node_mask = _coords_valid_mask(N_apo, Ca_apo, C_apo) & _coords_valid_mask(N_holo, Ca_holo, C_holo)
 
         # Ligand tokens
         lig_coords_path = self._resolve_path(sample, 'ligand_coords', 'ligand_coords.npy')
