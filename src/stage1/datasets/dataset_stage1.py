@@ -312,7 +312,8 @@ class ApoHoloTripletDataset(Dataset):
             return self.data_dir / 'samples' / sample['id'] / default_name
         return None
 
-    def __getitem__(self, idx: int) -> Dict:
+    def _getitem_impl(self, idx: int) -> Dict:
+        """Internal implementation - may raise exceptions."""
         sample = self.samples[idx]
         sample_id = sample.get('id', f'sample_{idx}')
 
@@ -442,7 +443,23 @@ class ApoHoloTripletDataset(Dataset):
             'n_residues': n_res,
         }
 
-
+    def __getitem__(self, idx: int) -> Dict:
+        """Safe wrapper that returns a random valid sample on error."""
+        import random
+        max_retries = 5
+        
+        for attempt in range(max_retries):
+            try:
+                target_idx = idx if attempt == 0 else random.randint(0, len(self) - 1)
+                return self._getitem_impl(target_idx)
+            except Exception as e:
+                if attempt == 0:
+                    import sys
+                    sample_id = self.samples[idx].get('id', f'sample_{idx}')
+                    print(f"[WARN] Skipping sample {sample_id}: {str(e)[:80]}", file=sys.stderr)
+        
+        # Last resort: return a minimal dummy sample
+        raise RuntimeError(f"Failed to load any valid sample after {max_retries} retries")
 # -----------------------------
 # Collate
 # -----------------------------
