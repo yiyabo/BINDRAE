@@ -276,32 +276,35 @@ class Stage1Model(nn.Module):
                                     eps: float = 1e-6) -> Rigid:
         """Build per-residue backbone frames from N/CA/C.
         
-        添加了 NaN 保护：当向量接近零时使用单位向量。
+        修复：当向量接近零时，使用单位向量（而不是除以很小的 norm）
         """
+        device = Ca.device
+        default_e1 = torch.tensor([1.0, 0.0, 0.0], device=device)
+        default_e2 = torch.tensor([0.0, 1.0, 0.0], device=device)
+        default_e3 = torch.tensor([0.0, 0.0, 1.0], device=device)
+        
         # e1: CA -> C
         e1 = C - Ca
         e1_norm = torch.norm(e1, dim=-1, keepdim=True)
-        # 保护：如果 norm 太小，使用默认方向 [1,0,0]
-        e1_safe = torch.where(e1_norm > eps, e1, torch.tensor([1.0, 0.0, 0.0], device=e1.device))
-        e1_norm_safe = torch.clamp(e1_norm, min=eps)
-        e1 = e1_safe / e1_norm_safe
+        e1_valid = e1_norm > eps
+        e1_normalized = e1 / torch.clamp(e1_norm, min=eps)
+        e1 = torch.where(e1_valid, e1_normalized, default_e1.expand_as(e1))
 
         # u: CA -> N
         u = N - Ca
-        # e2: u orthogonalized to e1
         proj = (u * e1).sum(dim=-1, keepdim=True) * e1
         e2 = u - proj
         e2_norm = torch.norm(e2, dim=-1, keepdim=True)
-        # 保护：如果 norm 太小，使用默认方向 [0,1,0]
-        e2_safe = torch.where(e2_norm > eps, e2, torch.tensor([0.0, 1.0, 0.0], device=e2.device))
-        e2_norm_safe = torch.clamp(e2_norm, min=eps)
-        e2 = e2_safe / e2_norm_safe
+        e2_valid = e2_norm > eps
+        e2_normalized = e2 / torch.clamp(e2_norm, min=eps)
+        e2 = torch.where(e2_valid, e2_normalized, default_e2.expand_as(e2))
 
-        # e3: right-handed
+        # e3: cross product
         e3 = torch.cross(e1, e2, dim=-1)
-        # 保护：确保 e3 是单位向量
         e3_norm = torch.norm(e3, dim=-1, keepdim=True)
-        e3 = e3 / torch.clamp(e3_norm, min=eps)
+        e3_valid = e3_norm > eps
+        e3_normalized = e3 / torch.clamp(e3_norm, min=eps)
+        e3 = torch.where(e3_valid, e3_normalized, default_e3.expand_as(e3))
 
         R = torch.stack([e1, e2, e3], dim=-1)  # [B, N, 3, 3]
         t = Ca
@@ -309,12 +312,12 @@ class Stage1Model(nn.Module):
         # For padded residues, set identity rotation and zero translation
         if mask is not None:
             mask_expanded = mask.unsqueeze(-1).unsqueeze(-1)
-            eye = torch.eye(3, device=R.device).view(1, 1, 3, 3)
+            eye = torch.eye(3, device=device).view(1, 1, 3, 3)
             R = torch.where(mask_expanded, R, eye)
             t = torch.where(mask.unsqueeze(-1), t, torch.zeros_like(t))
 
         # 最终检查：替换任何残留的 NaN
-        R = torch.where(torch.isnan(R), torch.eye(3, device=R.device).view(1, 1, 3, 3).expand_as(R), R)
+        R = torch.where(torch.isnan(R), torch.eye(3, device=device).view(1, 1, 3, 3).expand_as(R), R)
         t = torch.where(torch.isnan(t), torch.zeros_like(t), t)
 
         rotation = Rotation(rot_mats=R)

@@ -126,35 +126,46 @@ class Stage1Trainer:
 
     def _build_frames_from_backbone(self, N, Ca, C, mask, eps: float = 1e-6):
         """Build frames from backbone with NaN protection."""
+        device = Ca.device
+        default_e1 = torch.tensor([1.0, 0.0, 0.0], device=device)
+        default_e2 = torch.tensor([0.0, 1.0, 0.0], device=device)
+        default_e3 = torch.tensor([0.0, 0.0, 1.0], device=device)
+        
         # e1: CA -> C
         e1 = C - Ca
         e1_norm = torch.norm(e1, dim=-1, keepdim=True)
-        e1_safe = torch.where(e1_norm > eps, e1, torch.tensor([1.0, 0.0, 0.0], device=e1.device))
-        e1 = e1_safe / torch.clamp(e1_norm, min=eps)
+        e1_valid = e1_norm > eps
+        # 只对有效向量归一化，无效的用默认单位向量
+        e1_normalized = e1 / torch.clamp(e1_norm, min=eps)
+        e1 = torch.where(e1_valid, e1_normalized, default_e1.expand_as(e1))
 
         # u: CA -> N
         u = N - Ca
         proj = (u * e1).sum(dim=-1, keepdim=True) * e1
         e2 = u - proj
         e2_norm = torch.norm(e2, dim=-1, keepdim=True)
-        e2_safe = torch.where(e2_norm > eps, e2, torch.tensor([0.0, 1.0, 0.0], device=e2.device))
-        e2 = e2_safe / torch.clamp(e2_norm, min=eps)
+        e2_valid = e2_norm > eps
+        e2_normalized = e2 / torch.clamp(e2_norm, min=eps)
+        e2 = torch.where(e2_valid, e2_normalized, default_e2.expand_as(e2))
 
+        # e3: cross product
         e3 = torch.cross(e1, e2, dim=-1)
         e3_norm = torch.norm(e3, dim=-1, keepdim=True)
-        e3 = e3 / torch.clamp(e3_norm, min=eps)
+        e3_valid = e3_norm > eps
+        e3_normalized = e3 / torch.clamp(e3_norm, min=eps)
+        e3 = torch.where(e3_valid, e3_normalized, default_e3.expand_as(e3))
 
         R = torch.stack([e1, e2, e3], dim=-1)
         t = Ca
 
         if mask is not None:
             mask_expanded = mask.unsqueeze(-1).unsqueeze(-1)
-            eye = torch.eye(3, device=R.device).view(1, 1, 3, 3)
+            eye = torch.eye(3, device=device).view(1, 1, 3, 3)
             R = torch.where(mask_expanded, R, eye)
             t = torch.where(mask.unsqueeze(-1), t, torch.zeros_like(t))
 
         # Replace any remaining NaN
-        R = torch.where(torch.isnan(R), torch.eye(3, device=R.device).view(1, 1, 3, 3).expand_as(R), R)
+        R = torch.where(torch.isnan(R), torch.eye(3, device=device).view(1, 1, 3, 3).expand_as(R), R)
         t = torch.where(torch.isnan(t), torch.zeros_like(t), t)
 
         return R, t
@@ -211,12 +222,20 @@ class Stage1Trainer:
         pred_R = outputs['rigids_final'].get_rots().get_rot_mats()
         pred_t = pred_atom14[:, :, 1]
 
+        # 调试 holo backbone
+        if step < 3:
+            print(f"[HOLO DEBUG] N_holo max={batch.N_holo.abs().max():.2f}, Ca_holo max={batch.Ca_holo.abs().max():.2f}, C_holo max={batch.C_holo.abs().max():.2f}")
+        
         true_R, true_t = self._build_frames_from_backbone(
             batch.N_holo,
             batch.Ca_holo,
             batch.C_holo,
             batch.node_mask,
         )
+        
+        # 调试 true_R
+        if step < 3 and true_R.abs().max() > 10:
+            print(f"[HOLO DEBUG] true_R 异常: max={true_R.abs().max():.2f}, 应该在 [-1,1]")
 
         # FAPE loss: 用 FK 动态生成 atom14_holo 真值（保证一致性）
         # 如果原始 atom14_holo 为空或全零，就用 FK 生成
@@ -234,14 +253,15 @@ class Stage1Trainer:
         
         # 调试 FAPE 输入
         if step < 5:
-            if torch.isnan(pred_atom14).any():
-                print(f"[FAPE DEBUG] pred_atom14 has NaN: {torch.isnan(pred_atom14).sum().item()}")
-            if torch.isnan(target_atom14).any():
-                print(f"[FAPE DEBUG] target_atom14 has NaN: {torch.isnan(target_atom14).sum().item()}")
-            if torch.isnan(pred_R).any() or torch.isnan(pred_t).any():
-                print(f"[FAPE DEBUG] pred frames has NaN: R={torch.isnan(pred_R).any()}, t={torch.isnan(pred_t).any()}")
-            if torch.isnan(true_R).any() or torch.isnan(true_t).any():
-                print(f"[FAPE DEBUG] true frames has NaN: R={torch.isnan(true_R).any()}, t={torch.isnan(true_t).any()}")
+            # 检查异常大的值
+            if pred_atom14.abs().max() > 1000:
+                print(f"[FAPE DEBUG] pred_atom14 过大: max={pred_atom14.abs().max():.2f}")
+            if target_atom14.abs().max() > 1000:
+                print(f"[FAPE DEBUG] target_atom14 过大: max={target_atom14.abs().max():.2f}")
+            if true_R.abs().max() > 10:
+                print(f"[FAPE DEBUG] true_R 过大: max={true_R.abs().max():.2f} (应该 ≤1)")
+            if true_t.abs().max() > 1000:
+                print(f"[FAPE DEBUG] true_t 过大: max={true_t.abs().max():.2f}")
         
         loss_fape = fape_loss(
             pred_atom14,
