@@ -80,7 +80,7 @@ class FlashIPAModuleConfig:
             no_qk_points=self.no_qk_points,
             no_v_points=self.no_v_points,
             use_flash_attn=True,   # 保持 FlashAttention
-            attn_dtype='fp16',     # FlashAttention 要求 fp16/bf16
+            attn_dtype='bf16',     # bf16 比 fp16 更稳定（A100 支持）
         )
 
 
