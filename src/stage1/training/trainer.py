@@ -246,17 +246,68 @@ class Stage1Trainer:
             'fape': loss_fape,
         }
 
+    def _check_nan(self, tensor: torch.Tensor, name: str) -> bool:
+        """检查 tensor 是否包含 NaN/Inf"""
+        has_nan = torch.isnan(tensor).any().item()
+        has_inf = torch.isinf(tensor).any().item()
+        if has_nan or has_inf:
+            print(f"[NaN DEBUG] {name}: nan={has_nan}, inf={has_inf}, shape={tensor.shape}")
+            return True
+        return False
+
+    def _debug_batch(self, batch):
+        """调试输入数据"""
+        issues = []
+        if self._check_nan(batch.esm, "esm"): issues.append("esm")
+        if self._check_nan(batch.N_apo, "N_apo"): issues.append("N_apo")
+        if self._check_nan(batch.Ca_apo, "Ca_apo"): issues.append("Ca_apo")
+        if self._check_nan(batch.N_holo, "N_holo"): issues.append("N_holo")
+        if self._check_nan(batch.Ca_holo, "Ca_holo"): issues.append("Ca_holo")
+        if self._check_nan(batch.chi_holo, "chi_holo"): issues.append("chi_holo")
+        if self._check_nan(batch.torsion_holo, "torsion_holo"): issues.append("torsion_holo")
+        if self._check_nan(batch.lig_points, "lig_points"): issues.append("lig_points")
+        if issues:
+            print(f"[NaN DEBUG] 输入数据有问题: {issues}")
+            print(f"[NaN DEBUG] sequences[0]: {batch.sequences[0][:50]}...")
+            return False
+        return True
+
+    def _debug_outputs(self, outputs):
+        """调试模型输出"""
+        issues = []
+        for key, val in outputs.items():
+            if isinstance(val, torch.Tensor):
+                if self._check_nan(val, f"output.{key}"):
+                    issues.append(key)
+        if issues:
+            print(f"[NaN DEBUG] 模型输出有问题: {issues}")
+            return False
+        return True
+
     def train_step(self, batch) -> Dict[str, float]:
         self.model.train()
         self.optimizer.zero_grad()
 
         batch = self._batch_to_device(batch)
+        
+        # NaN 调试：检查输入
+        if self.global_step < 5:  # 只在前几步调试
+            self._debug_batch(batch)
 
         if self.scaler is not None:
             with autocast():
                 outputs = self.model(batch, self.global_step)
+                
+                # NaN 调试：检查输出
+                if self.global_step < 5:
+                    self._debug_outputs(outputs)
+                
                 losses = self.compute_loss(outputs, batch, self.global_step)
                 loss = losses['total']
+                
+                # NaN 调试：检查 loss
+                if self.global_step < 5 and torch.isnan(loss):
+                    print(f"[NaN DEBUG] losses = {losses}")
 
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)

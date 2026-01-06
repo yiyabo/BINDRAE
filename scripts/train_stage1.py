@@ -49,6 +49,10 @@ def parse_args():
     parser.add_argument('--log_dir', type=str, default='logs/stage1',
                        help='日志目录')
     
+    # 数据加载
+    parser.add_argument('--num_workers', type=int, default=4,
+                       help='DataLoader workers (如遇shm不足可设为0)')
+    
     # 设备
     parser.add_argument('--device', type=str, default='cuda',
                        help='训练设备')
@@ -70,6 +74,7 @@ def main():
     config = TrainingConfig(
         data_dir=args.data_dir,
         batch_size=args.batch_size,
+        num_workers=args.num_workers,
         lr=args.lr,
         max_epochs=args.max_epochs,
         grad_clip=args.grad_clip,
