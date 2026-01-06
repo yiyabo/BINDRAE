@@ -9,6 +9,8 @@ import argparse
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
+from multiprocessing import Pool, cpu_count
+from functools import partial
 
 
 def validate_pdb(pdb_path: Path) -> bool:
@@ -37,12 +39,43 @@ def validate_pdb(pdb_path: Path) -> bool:
         return False
 
 
+def check_sample(sample_dir: Path, required_files: list, do_validate_pdb: bool) -> dict:
+    """
+    Check a single sample directory.
+    Returns: {'id': str, 'valid': bool, 'missing': list, 'pdb_invalid': bool}
+    """
+    result = {
+        'id': sample_dir.name,
+        'valid': True,
+        'missing': [],
+        'pdb_invalid': False
+    }
+    
+    # Check all required files
+    for f in required_files:
+        if not (sample_dir / f).exists():
+            result['missing'].append(f)
+            result['valid'] = False
+    
+    # Only validate PDB if all files exist
+    if result['valid'] and do_validate_pdb:
+        apo_ok = validate_pdb(sample_dir / "apo.pdb")
+        holo_ok = validate_pdb(sample_dir / "holo.pdb")
+        if not (apo_ok and holo_ok):
+            result['pdb_invalid'] = True
+            result['valid'] = False
+    
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", required=True, help="dataset root (apo_holo_triplets)")
     parser.add_argument("--split", type=str, default="0.9,0.05,0.05", help="split ratios")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--validate-pdb", action="store_true", help="validate PDB files (slower)")
+    parser.add_argument("--workers", type=int, default=None, 
+                        help="number of worker processes (default: auto, max 64)")
     args = parser.parse_args()
     
     data_dir = Path(args.data_dir)
@@ -52,12 +85,6 @@ def main():
         print(f"Error: {samples_dir} does not exist.")
         return
 
-    valid_ids = []
-    missing_stats = {}  # 统计缺失文件
-    total_dirs = 0
-    
-    print(f"Scanning {samples_dir}...")
-    
     required_files = [
         "esm.pt",           # ESM-2 features (必需)
         "apo.pdb",          # Apo structure
@@ -69,32 +96,49 @@ def main():
         "meta.json",        # Metadata
     ]
     
+    print(f"Scanning {samples_dir}...")
+    
+    # 获取所有目录
+    all_dirs = sorted([d for d in samples_dir.iterdir() if d.is_dir()])
+    total_dirs = len(all_dirs)
+    
+    # 确定 worker 数量
+    if args.workers is not None:
+        n_workers = args.workers
+    else:
+        # 自动选择：CPU 核数，最多 64（避免过多进程开销）
+        n_workers = min(cpu_count(), 64)
+    
+    print(f"使用 {n_workers} 个进程并行处理...")
+    
+    # 并行处理
+    check_fn = partial(check_sample, 
+                       required_files=required_files, 
+                       do_validate_pdb=args.validate_pdb)
+    
+    valid_ids = []
+    missing_stats = {}
     pdb_invalid = 0
     
-    # 获取所有目录并显示进度条
-    all_dirs = sorted([d for d in samples_dir.iterdir() if d.is_dir()])
     desc = "验证样本 (含PDB解析)" if args.validate_pdb else "检查文件"
     
-    for sample_dir in tqdm(all_dirs, desc=desc, ncols=100):
-        total_dirs += 1
-        
-        # Check all required files
-        missing = [f for f in required_files if not (sample_dir / f).exists()]
-        
-        if missing:
-            for f in missing:
+    with Pool(n_workers) as pool:
+        results = list(tqdm(
+            pool.imap(check_fn, all_dirs, chunksize=100),
+            total=total_dirs,
+            desc=desc,
+            ncols=100
+        ))
+    
+    # 汇总结果
+    for r in results:
+        if r['valid']:
+            valid_ids.append(r['id'])
+        else:
+            for f in r['missing']:
                 missing_stats[f] = missing_stats.get(f, 0) + 1
-            continue
-        
-        # Optional: validate PDB files (can parse and have backbone atoms)
-        if args.validate_pdb:
-            apo_ok = validate_pdb(sample_dir / "apo.pdb")
-            holo_ok = validate_pdb(sample_dir / "holo.pdb")
-            if not (apo_ok and holo_ok):
+            if r['pdb_invalid']:
                 pdb_invalid += 1
-                continue
-        
-        valid_ids.append(sample_dir.name)
     
     print(f"\n=== 数据统计 ===")
     print(f"总样本目录: {total_dirs}")
