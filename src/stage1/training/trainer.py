@@ -124,27 +124,38 @@ class Stage1Trainer:
             return 1.0
         return step / max(self.config.pocket_warmup_steps, 1)
 
-    def _build_frames_from_backbone(self, N, Ca, C, mask, eps: float = 1e-8):
+    def _build_frames_from_backbone(self, N, Ca, C, mask, eps: float = 1e-6):
+        """Build frames from backbone with NaN protection."""
         # e1: CA -> C
         e1 = C - Ca
-        e1 = e1 / (torch.norm(e1, dim=-1, keepdim=True) + eps)
+        e1_norm = torch.norm(e1, dim=-1, keepdim=True)
+        e1_safe = torch.where(e1_norm > eps, e1, torch.tensor([1.0, 0.0, 0.0], device=e1.device))
+        e1 = e1_safe / torch.clamp(e1_norm, min=eps)
 
         # u: CA -> N
         u = N - Ca
         proj = (u * e1).sum(dim=-1, keepdim=True) * e1
         e2 = u - proj
-        e2 = e2 / (torch.norm(e2, dim=-1, keepdim=True) + eps)
+        e2_norm = torch.norm(e2, dim=-1, keepdim=True)
+        e2_safe = torch.where(e2_norm > eps, e2, torch.tensor([0.0, 1.0, 0.0], device=e2.device))
+        e2 = e2_safe / torch.clamp(e2_norm, min=eps)
 
         e3 = torch.cross(e1, e2, dim=-1)
+        e3_norm = torch.norm(e3, dim=-1, keepdim=True)
+        e3 = e3 / torch.clamp(e3_norm, min=eps)
 
         R = torch.stack([e1, e2, e3], dim=-1)
         t = Ca
 
         if mask is not None:
-            mask = mask.unsqueeze(-1).unsqueeze(-1)
+            mask_expanded = mask.unsqueeze(-1).unsqueeze(-1)
             eye = torch.eye(3, device=R.device).view(1, 1, 3, 3)
-            R = torch.where(mask, R, eye)
-            t = torch.where(mask.squeeze(-1), t, torch.zeros_like(t))
+            R = torch.where(mask_expanded, R, eye)
+            t = torch.where(mask.unsqueeze(-1), t, torch.zeros_like(t))
+
+        # Replace any remaining NaN
+        R = torch.where(torch.isnan(R), torch.eye(3, device=R.device).view(1, 1, 3, 3).expand_as(R), R)
+        t = torch.where(torch.isnan(t), torch.zeros_like(t), t)
 
         return R, t
 
