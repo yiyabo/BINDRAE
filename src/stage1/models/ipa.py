@@ -79,8 +79,8 @@ class FlashIPAModuleConfig:
             z_factor_rank=self.z_factor_rank,
             no_qk_points=self.no_qk_points,
             no_v_points=self.no_v_points,
-            use_flash_attn=True,
-            attn_dtype='fp16',  # FlashAttention 只支持 fp16/bf16
+            use_flash_attn=True,   # 保持 FlashAttention
+            attn_dtype='fp16',     # FlashAttention 要求 fp16/bf16
         )
 
 
@@ -348,14 +348,26 @@ class IPABlock(nn.Module):
             s_updated: [B, N, c_s] 更新后的节点表示
             rigids_updated: Rigid对象 [B, N] 更新后的帧
         """
+        # 确保 mask 是 float 类型（FlashIPA 期望 float mask）
+        if mask.dtype == torch.bool:
+            mask_float = mask.float()
+        else:
+            mask_float = mask
+        
+        # 对 padding 位置的输入特征进行清零（避免 NaN 传播）
+        mask_expanded = mask_float.unsqueeze(-1)  # [B, N, 1]
+        s_masked = s * mask_expanded
+        z_f1_masked = z_factor_1 * mask_expanded.unsqueeze(-1)  # [B, N, 1, 1]
+        z_f2_masked = z_factor_2 * mask_expanded.unsqueeze(-1)
+        
         # 1. IPA 注意力
         s_ipa = self.ipa(
-            s=s,
+            s=s_masked,
             z=None,  # 不使用完整边表示（用因子化）
-            z_factor_1=z_factor_1,
-            z_factor_2=z_factor_2,
+            z_factor_1=z_f1_masked,
+            z_factor_2=z_f2_masked,
             r=rigids,
-            mask=mask
+            mask=mask_float  # 使用 float mask
         )
         
         # 检查 IPA 输出
@@ -364,8 +376,8 @@ class IPABlock(nn.Module):
             nan_count = torch.isnan(s_ipa).sum().item()
             total = s_ipa.numel()
             print(f"[IPA BLOCK] NaN in s_ipa: {nan_count}/{total} ({100*nan_count/total:.2f}%)")
-            print(f"[IPA BLOCK] s input nan: {torch.isnan(s).any()}, max: {s.abs().max():.2f}")
-            print(f"[IPA BLOCK] z_f1 nan: {torch.isnan(z_factor_1).any()}, max: {z_factor_1.abs().max():.2f}")
+            print(f"[IPA BLOCK] s input nan: {torch.isnan(s_masked).any()}, max: {s_masked.abs().max():.2f}")
+            print(f"[IPA BLOCK] z_f1 nan: {torch.isnan(z_f1_masked).any()}, max: {z_f1_masked.abs().max():.2f}")
             # 替换 NaN 为 0 以继续训练
             s_ipa = torch.where(torch.isnan(s_ipa), torch.zeros_like(s_ipa), s_ipa)
         
