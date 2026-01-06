@@ -8,6 +8,7 @@ import json
 import argparse
 import numpy as np
 from pathlib import Path
+from tqdm import tqdm
 
 
 def validate_pdb(pdb_path: Path) -> bool:
@@ -70,9 +71,11 @@ def main():
     
     pdb_invalid = 0
     
-    for sample_dir in sorted(samples_dir.iterdir()):
-        if not sample_dir.is_dir():
-            continue
+    # 获取所有目录并显示进度条
+    all_dirs = sorted([d for d in samples_dir.iterdir() if d.is_dir()])
+    desc = "验证样本 (含PDB解析)" if args.validate_pdb else "检查文件"
+    
+    for sample_dir in tqdm(all_dirs, desc=desc, ncols=100):
         total_dirs += 1
         
         # Check all required files
