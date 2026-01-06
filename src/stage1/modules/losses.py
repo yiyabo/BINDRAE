@@ -28,7 +28,8 @@ def fape_loss(pred_coords: torch.Tensor,
              true_frames: Tuple[torch.Tensor, torch.Tensor],
              w_res: Optional[torch.Tensor] = None,
              clamp_distance: float = 10.0,
-             eps: float = 1e-8) -> torch.Tensor:
+             eps: float = 1e-8,
+             debug: bool = False) -> torch.Tensor:
     """
     FAPE损失（可微分版本）
     
@@ -42,6 +43,7 @@ def fape_loss(pred_coords: torch.Tensor,
         w_res: [B, N] 残基权重（口袋加权，可选）
         clamp_distance: 裁剪距离（Å）
         eps: 数值稳定性
+        debug: 是否输出调试信息
         
     Returns:
         loss: scalar tensor
@@ -63,13 +65,26 @@ def fape_loss(pred_coords: torch.Tensor,
         if w_res is not None:
             w_res = w_res.unsqueeze(2).expand(-1, -1, n_atoms).reshape(B, N * n_atoms)
     
+    if debug:
+        print(f"[FAPE INTERNAL] pred_coords: nan={torch.isnan(pred_coords).any()}, inf={torch.isinf(pred_coords).any()}, max={pred_coords.abs().max():.2f}")
+        print(f"[FAPE INTERNAL] true_coords: nan={torch.isnan(true_coords).any()}, inf={torch.isinf(true_coords).any()}, max={true_coords.abs().max():.2f}")
+        print(f"[FAPE INTERNAL] true_R: nan={torch.isnan(true_R).any()}, inf={torch.isinf(true_R).any()}, max={true_R.abs().max():.2f}")
+        print(f"[FAPE INTERNAL] true_t: nan={torch.isnan(true_t).any()}, inf={torch.isinf(true_t).any()}, max={true_t.abs().max():.2f}")
+    
     # 变换到真实帧的局部坐标系
     # x_local = R_true^T @ (x - t_true)
     pred_local = torch.einsum('bnik,bnk->bni', true_R.transpose(-2, -1), pred_coords - true_t)
     true_local = torch.einsum('bnik,bnk->bni', true_R.transpose(-2, -1), true_coords - true_t)
     
+    if debug:
+        print(f"[FAPE INTERNAL] pred_local: nan={torch.isnan(pred_local).any()}, inf={torch.isinf(pred_local).any()}, max={pred_local.abs().max():.2f}")
+        print(f"[FAPE INTERNAL] true_local: nan={torch.isnan(true_local).any()}, inf={torch.isinf(true_local).any()}, max={true_local.abs().max():.2f}")
+    
     # 计算误差
     diff = torch.sqrt(torch.sum((pred_local - true_local) ** 2, dim=-1) + eps)  # [B, N]
+    
+    if debug:
+        print(f"[FAPE INTERNAL] diff: nan={torch.isnan(diff).any()}, inf={torch.isinf(diff).any()}, max={diff.max():.2f}, mean={diff.mean():.2f}")
     
     # Clamp
     diff = torch.clamp(diff, max=clamp_distance)

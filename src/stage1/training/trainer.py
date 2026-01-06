@@ -249,6 +249,7 @@ class Stage1Trainer:
             (pred_R, pred_t),
             (true_R, true_t),
             w_res=None,
+            debug=(step < 3),  # 前3步调试
         )
 
         # Clash on predicted atoms
