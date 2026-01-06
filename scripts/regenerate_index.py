@@ -75,7 +75,7 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--validate-pdb", action="store_true", help="validate PDB files (slower)")
     parser.add_argument("--workers", type=int, default=None, 
-                        help="number of worker processes (default: auto, max 64)")
+                        help="number of worker processes (default: auto, max 32)")
     args = parser.parse_args()
     
     data_dir = Path(args.data_dir)
@@ -106,8 +106,8 @@ def main():
     if args.workers is not None:
         n_workers = args.workers
     else:
-        # 自动选择：CPU 核数，最多 64（避免过多进程开销）
-        n_workers = min(cpu_count(), 64)
+        # 自动选择：CPU 核数，最多 32（避免过多进程开销）
+        n_workers = min(cpu_count(), 32)
     
     print(f"使用 {n_workers} 个进程并行处理...")
     
