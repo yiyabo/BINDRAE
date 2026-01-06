@@ -24,21 +24,44 @@ def main():
         return
 
     valid_ids = []
+    missing_stats = {}  # 统计缺失文件
+    total_dirs = 0
     
     print(f"Scanning {samples_dir}...")
+    
+    required_files = [
+        "esm.pt",           # ESM-2 features (必需)
+        "apo.pdb",          # Apo structure
+        "holo.pdb",         # Holo structure
+        "ligand.sdf",       # Ligand
+        "ligand_coords.npy", # Ligand coordinates
+        "torsion_apo.npz",  # Apo torsion angles
+        "torsion_holo.npz", # Holo torsion angles
+        "meta.json",        # Metadata
+    ]
     
     for sample_dir in sorted(samples_dir.iterdir()):
         if not sample_dir.is_dir():
             continue
-            
-        # Basic validation: check for critical files
-        if (sample_dir / "apo.pdb").exists() and \
-           (sample_dir / "holo.pdb").exists() and \
-           (sample_dir / "ligand.sdf").exists() and \
-           (sample_dir / "meta.json").exists():
+        total_dirs += 1
+        
+        # Check all required files
+        missing = [f for f in required_files if not (sample_dir / f).exists()]
+        
+        if not missing:
             valid_ids.append(sample_dir.name)
-            
-    print(f"Found {len(valid_ids)} valid samples.")
+        else:
+            for f in missing:
+                missing_stats[f] = missing_stats.get(f, 0) + 1
+    
+    print(f"\n=== 数据统计 ===")
+    print(f"总样本目录: {total_dirs}")
+    print(f"有效样本: {len(valid_ids)}")
+    print(f"无效样本: {total_dirs - len(valid_ids)}")
+    if missing_stats:
+        print(f"\n缺失文件统计:")
+        for f, count in sorted(missing_stats.items(), key=lambda x: -x[1]):
+            print(f"  {f}: {count} 个样本缺失")
     
     # Write index.json
     with (data_dir / "index.json").open("w") as f:
