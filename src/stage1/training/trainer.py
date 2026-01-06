@@ -232,6 +232,17 @@ class Stage1Trainer:
             # 用 FK 从 holo backbone + torsion_holo 动态生成
             target_atom14, _ = self._generate_atom14_holo_with_fk(batch)
         
+        # 调试 FAPE 输入
+        if step < 5:
+            if torch.isnan(pred_atom14).any():
+                print(f"[FAPE DEBUG] pred_atom14 has NaN: {torch.isnan(pred_atom14).sum().item()}")
+            if torch.isnan(target_atom14).any():
+                print(f"[FAPE DEBUG] target_atom14 has NaN: {torch.isnan(target_atom14).sum().item()}")
+            if torch.isnan(pred_R).any() or torch.isnan(pred_t).any():
+                print(f"[FAPE DEBUG] pred frames has NaN: R={torch.isnan(pred_R).any()}, t={torch.isnan(pred_t).any()}")
+            if torch.isnan(true_R).any() or torch.isnan(true_t).any():
+                print(f"[FAPE DEBUG] true frames has NaN: R={torch.isnan(true_R).any()}, t={torch.isnan(true_t).any()}")
+        
         loss_fape = fape_loss(
             pred_atom14,
             target_atom14,
