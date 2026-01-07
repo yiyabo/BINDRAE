@@ -52,6 +52,11 @@ class TrainingConfig:
     device: str = 'cuda:1'
     mixed_precision: bool = True  # fp16混合精度
     
+    # 分布式训练 (DDP)
+    distributed: bool = False  # 是否启用分布式训练
+    local_rank: int = -1  # 本地 GPU rank（由 torchrun 自动设置）
+    world_size: int = 1  # 总 GPU 数量
+    
     # 其他
     seed: int = 2025
     resume_from: Optional[str] = None  # checkpoint路径

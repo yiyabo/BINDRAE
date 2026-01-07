@@ -1,32 +1,38 @@
 """
 Stage-1 trainer (apo + ligand -> holo-like prior).
+
+支持单卡和多卡 DDP 训练。
 """
 
 import math
 import time
+import os
+import sys
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
+import torch.distributed as dist
 from torch.cuda.amp import autocast, GradScaler
 from torch.utils.data import DataLoader
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 from .config import TrainingConfig
 from ..models import Stage1Model, Stage1ModelConfig
-from ..datasets import create_stage1_dataloader
+from ..datasets import create_stage1_dataloader, ApoHoloTripletDataset, collate_stage1_batch
 from ..modules.losses import fape_loss, torsion_loss, clash_penalty
 from utils.metrics import compute_pocket_irmsd, compute_chi1_accuracy, compute_clash_percentage
 
 # FlashIPA Rigid (与 FK 模块一致)
-import os
-import sys
 from pathlib import Path
 project_root = Path(__file__).resolve().parent.parent.parent.parent
 flash_ipa_path = str(project_root / 'vendor' / 'flash_ipa' / 'src')
 if os.path.exists(flash_ipa_path) and flash_ipa_path not in sys.path:
     sys.path.insert(0, flash_ipa_path)
 from flash_ipa.rigid import Rigid, Rotation
+from functools import partial
 
 
 # ---------------------------------------------------------------------
@@ -53,50 +59,139 @@ def sequences_to_aatype(sequences, max_len: int, device: torch.device) -> torch.
 
 
 class Stage1Trainer:
-    """Stage-1 trainer."""
+    """Stage-1 trainer with DDP support."""
 
     def __init__(self, config: TrainingConfig):
         self.config = config
-        self.device = torch.device(config.device)
+        
+        # ========== 分布式初始化 ==========
+        self.distributed = config.distributed
+        self.local_rank = 0
+        self.world_size = 1
+        self.is_main_process = True
+        
+        if self.distributed:
+            # 初始化分布式进程组
+            if not dist.is_initialized():
+                dist.init_process_group(backend='nccl')
+            self.local_rank = int(os.environ.get('LOCAL_RANK', 0))
+            self.world_size = dist.get_world_size()
+            self.is_main_process = (self.local_rank == 0)
+            torch.cuda.set_device(self.local_rank)
+            self.device = torch.device(f'cuda:{self.local_rank}')
+            if self.is_main_process:
+                print(f"[DDP] Initialized: world_size={self.world_size}, local_rank={self.local_rank}")
+        else:
+            self.device = torch.device(config.device)
 
-        torch.manual_seed(config.seed)
+        # 设置随机种子（每个 rank 不同以获得不同的数据增强）
+        seed = config.seed + self.local_rank
+        torch.manual_seed(seed)
         if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(config.seed)
+            torch.cuda.manual_seed_all(seed)
 
-        # Model
-        print("Creating model...")
+        # ========== 创建模型 ==========
+        if self.is_main_process:
+            print("Creating model...")
         model_config = Stage1ModelConfig()
         self.model = Stage1Model(model_config).to(self.device)
+        
+        # DDP 包装模型
+        if self.distributed:
+            self.model = DDP(
+                self.model, 
+                device_ids=[self.local_rank],
+                output_device=self.local_rank,
+                find_unused_parameters=False,
+            )
+            if self.is_main_process:
+                print(f"[DDP] Model wrapped with DistributedDataParallel")
 
-        # Data
-        print("Creating dataloaders...")
-        self.train_loader = create_stage1_dataloader(
-            config.data_dir,
-            split='train',
-            batch_size=config.batch_size,
-            shuffle=True,
-            num_workers=config.num_workers,
-            max_n_res=config.max_n_res,
-            valid_samples_file=config.valid_samples_file,
-            require_atom14=False,  # atom14_holo 可选，缺失时跳过 FAPE
-        )
-        # 验证阶段使用较少的 workers 避免 shm 问题
-        val_num_workers = min(config.num_workers, 2)  # 验证最多用 2 workers
-        self.val_loader = create_stage1_dataloader(
-            config.data_dir,
-            split='val',
-            batch_size=config.batch_size,
-            shuffle=False,
-            num_workers=val_num_workers,
-            max_n_res=config.max_n_res,
-            valid_samples_file=config.valid_samples_file,
-            require_atom14=False,
-        )
+        # ========== 创建数据加载器 ==========
+        if self.is_main_process:
+            print("Creating dataloaders...")
+        
+        self.train_sampler: Optional[DistributedSampler] = None
+        self.val_sampler: Optional[DistributedSampler] = None
+        
+        if self.distributed:
+            # 分布式模式：手动创建 dataset 和 sampler
+            train_dataset = ApoHoloTripletDataset(
+                config.data_dir,
+                split='train',
+                valid_samples_file=config.valid_samples_file,
+                require_atom14=False,
+            )
+            self.train_sampler = DistributedSampler(
+                train_dataset, 
+                num_replicas=self.world_size,
+                rank=self.local_rank,
+                shuffle=True,
+            )
+            collate_fn = partial(collate_stage1_batch, max_n_res=config.max_n_res)
+            self.train_loader = DataLoader(
+                train_dataset,
+                batch_size=config.batch_size,
+                sampler=self.train_sampler,
+                num_workers=config.num_workers,
+                collate_fn=collate_fn,
+                pin_memory=True,
+                drop_last=True,  # DDP 需要保证每个 rank batch 数相同
+            )
+            
+            val_dataset = ApoHoloTripletDataset(
+                config.data_dir,
+                split='val',
+                valid_samples_file=config.valid_samples_file,
+                require_atom14=False,
+            )
+            self.val_sampler = DistributedSampler(
+                val_dataset,
+                num_replicas=self.world_size,
+                rank=self.local_rank,
+                shuffle=False,
+            )
+            val_num_workers = min(config.num_workers, 2)
+            self.val_loader = DataLoader(
+                val_dataset,
+                batch_size=config.batch_size,
+                sampler=self.val_sampler,
+                num_workers=val_num_workers,
+                collate_fn=collate_fn,
+                pin_memory=True,
+            )
+        else:
+            # 单卡模式：使用原有的工厂函数
+            self.train_loader = create_stage1_dataloader(
+                config.data_dir,
+                split='train',
+                batch_size=config.batch_size,
+                shuffle=True,
+                num_workers=config.num_workers,
+                max_n_res=config.max_n_res,
+                valid_samples_file=config.valid_samples_file,
+                require_atom14=False,
+            )
+            val_num_workers = min(config.num_workers, 2)
+            self.val_loader = create_stage1_dataloader(
+                config.data_dir,
+                split='val',
+                batch_size=config.batch_size,
+                shuffle=False,
+                num_workers=val_num_workers,
+                max_n_res=config.max_n_res,
+                valid_samples_file=config.valid_samples_file,
+                require_atom14=False,
+            )
 
-        # Optimizer
-        print("Creating optimizer...")
+        # ========== 优化器 ==========
+        if self.is_main_process:
+            print("Creating optimizer...")
+        
+        # 获取模型参数（DDP 模式下需要访问 .module）
+        model_params = self.model.module.parameters() if self.distributed else self.model.parameters()
         self.optimizer = torch.optim.AdamW(
-            self.model.parameters(),
+            model_params,
             lr=config.lr,
             weight_decay=config.weight_decay,
         )
@@ -116,14 +211,20 @@ class Stage1Trainer:
         self.best_val_metric = float('inf')
         self.patience_counter = 0
 
-        Path(config.save_dir).mkdir(parents=True, exist_ok=True)
-        Path(config.log_dir).mkdir(parents=True, exist_ok=True)
+        # 只在主进程创建目录
+        if self.is_main_process:
+            Path(config.save_dir).mkdir(parents=True, exist_ok=True)
+            Path(config.log_dir).mkdir(parents=True, exist_ok=True)
 
-        print("✓ Trainer initialized")
-        print(f"  - params: {sum(p.numel() for p in self.model.parameters()):,}")
-        print(f"  - train samples: {len(self.train_loader.dataset)}")
-        print(f"  - val samples: {len(self.val_loader.dataset)}")
-        print(f"  - total steps: {total_steps:,}")
+            print("✓ Trainer initialized")
+            n_params = sum(p.numel() for p in model_params)
+            print(f"  - params: {n_params:,}")
+            print(f"  - train samples: {len(self.train_loader.dataset)}")
+            print(f"  - val samples: {len(self.val_loader.dataset)}")
+            print(f"  - total steps: {total_steps:,}")
+            if self.distributed:
+                print(f"  - world_size: {self.world_size}")
+                print(f"  - effective batch: {config.batch_size * self.world_size}")
 
     def compute_pocket_warmup(self, step: int) -> float:
         if step >= self.config.pocket_warmup_steps:
@@ -182,6 +283,11 @@ class Stage1Trainer:
         rotation = Rotation(rot_mats=R)
         return Rigid(rots=rotation, trans=t)
 
+    @property
+    def _model(self):
+        """获取实际模型（DDP 模式下返回 .module）"""
+        return self.model.module if self.distributed else self.model
+
     def _generate_atom14_holo_with_fk(self, batch) -> torch.Tensor:
         """
         用 FK 从 holo backbone + torsion_holo 生成 atom14_holo
@@ -203,8 +309,8 @@ class Stage1Trainer:
         B, N = batch.torsion_holo.shape[:2]
         aatype = sequences_to_aatype(batch.sequences, N, self.device)
         
-        # 4. 调用 FK 生成 atom14
-        fk_result = self.model.fk_module(torsion_sincos, holo_rigids, aatype)
+        # 4. 调用 FK 生成 atom14（使用实际模型）
+        fk_result = self._model.fk_module(torsion_sincos, holo_rigids, aatype)
         
         return fk_result['atom14_pos'], fk_result['atom14_mask']
 
@@ -385,15 +491,16 @@ class Stage1Trainer:
             return {k: float('nan') for k in losses.keys()}
 
         # Backward pass (只有 loss 正常时才执行)
+        model_params = self._model.parameters()
         if self.scaler is not None:
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
+            torch.nn.utils.clip_grad_norm_(model_params, self.config.grad_clip)
             self.scaler.step(self.optimizer)
             self.scaler.update()
         else:
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
+            torch.nn.utils.clip_grad_norm_(model_params, self.config.grad_clip)
             self.optimizer.step()
 
         if self.global_step >= self.config.warmup_steps:
@@ -428,6 +535,10 @@ class Stage1Trainer:
 
     def train_epoch(self) -> Dict[str, float]:
         self.model.train()
+        
+        # DDP: 每个 epoch 更新 sampler 以获得不同的 shuffle
+        if self.train_sampler is not None:
+            self.train_sampler.set_epoch(self.current_epoch)
 
         epoch_losses = {
             'total': 0.0,
@@ -436,7 +547,12 @@ class Stage1Trainer:
             'fape': 0.0,
         }
 
-        pbar = tqdm(self.train_loader, desc=f'Epoch {self.current_epoch:3d}', ncols=120, leave=True)
+        # 只在主进程显示进度条
+        if self.is_main_process:
+            pbar = tqdm(self.train_loader, desc=f'Epoch {self.current_epoch:3d}', ncols=120, leave=True)
+        else:
+            pbar = self.train_loader
+            
         n_batches = 0
         n_skipped = 0
         for batch in pbar:
@@ -447,26 +563,28 @@ class Stage1Trainer:
             # 跳过 NaN batch（不计入平均）
             if math.isnan(step_losses['total']):
                 n_skipped += 1
-                pbar.set_postfix({
-                    'loss': 'nan',
-                    'skipped': n_skipped,
-                    'lr': f"{self.optimizer.param_groups[0]['lr']:.1e}",
-                }, refresh=True)
+                if self.is_main_process and hasattr(pbar, 'set_postfix'):
+                    pbar.set_postfix({
+                        'loss': 'nan',
+                        'skipped': n_skipped,
+                        'lr': f"{self.optimizer.param_groups[0]['lr']:.1e}",
+                    }, refresh=True)
                 continue
                 
             for k in epoch_losses:
                 epoch_losses[k] += step_losses[k]
             n_batches += 1
 
-            pbar.set_postfix({
-                'loss': f"{step_losses['total']:.3f}",
-                'chi': f"{step_losses['chi']:.3f}",
-                'fape': f"{step_losses['fape']:.3f}",
-                'clash': f"{step_losses['clash']:.3f}",
-                'lr': f"{self.optimizer.param_groups[0]['lr']:.1e}",
-            }, refresh=True)
+            if self.is_main_process and hasattr(pbar, 'set_postfix'):
+                pbar.set_postfix({
+                    'loss': f"{step_losses['total']:.3f}",
+                    'chi': f"{step_losses['chi']:.3f}",
+                    'fape': f"{step_losses['fape']:.3f}",
+                    'clash': f"{step_losses['clash']:.3f}",
+                    'lr': f"{self.optimizer.param_groups[0]['lr']:.1e}",
+                }, refresh=True)
 
-        if n_skipped > 0:
+        if n_skipped > 0 and self.is_main_process:
             print(f"  [INFO] Epoch {self.current_epoch}: skipped {n_skipped} NaN batches")
         
         n_batches = max(n_batches, 1)
@@ -475,6 +593,12 @@ class Stage1Trainer:
     @torch.no_grad()
     def validate(self) -> Dict[str, float]:
         self.model.eval()
+        
+        # DDP: 同步开始验证
+        if self.distributed:
+            dist.barrier()
+            if self.val_sampler is not None:
+                self.val_sampler.set_epoch(self.current_epoch)
 
         val_losses = {
             'total': 0.0,
@@ -490,7 +614,11 @@ class Stage1Trainer:
         clash_pct_sum = 0.0
         n_structures = 0
 
-        pbar = tqdm(self.val_loader, desc='  Validating', ncols=120, leave=False)
+        # 只在主进程显示进度条
+        if self.is_main_process:
+            pbar = tqdm(self.val_loader, desc='  Validating', ncols=120, leave=False)
+        else:
+            pbar = self.val_loader
         n_batches = 0
         for batch in pbar:
             if batch is None:
@@ -530,10 +658,11 @@ class Stage1Trainer:
                     clash_pct_sum += clash_pct
                 n_structures += 1
 
-            pbar.set_postfix({
-                'v_loss': f"{losses['total'].item():.3f}",
-                'chi1': f"{chi1_acc:5.1%}",
-            }, refresh=False)
+            if self.is_main_process and hasattr(pbar, 'set_postfix'):
+                pbar.set_postfix({
+                    'v_loss': f"{losses['total'].item():.3f}",
+                    'chi1': f"{chi1_acc:5.1%}",
+                }, refresh=False)
 
         if n_batches == 0:
             return {
@@ -558,10 +687,16 @@ class Stage1Trainer:
         return {**val_losses, **val_metrics}
 
     def save_checkpoint(self, filepath: str, verbose: bool = True):
+        """保存 checkpoint（只在主进程执行）"""
+        if not self.is_main_process:
+            return
+            
+        # DDP 模式下保存 .module 的状态
+        model_state = self._model.state_dict()
         torch.save({
             'epoch': self.current_epoch,
             'global_step': self.global_step,
-            'model_state_dict': self.model.state_dict(),
+            'model_state_dict': model_state,
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'best_val_metric': self.best_val_metric,
@@ -571,14 +706,22 @@ class Stage1Trainer:
             print(f"  ✓ Saved: {Path(filepath).name}")
 
     def train(self):
-        print(f"\n{'='*80}")
-        print("Start training - Stage-1")
-        print(f"{'='*80}\n")
+        if self.is_main_process:
+            print(f"\n{'='*80}")
+            print("Start training - Stage-1")
+            if self.distributed:
+                print(f"  [DDP] {self.world_size} GPUs, effective batch size: {self.config.batch_size * self.world_size}")
+            print(f"{'='*80}\n")
 
         for epoch in range(self.current_epoch, self.config.max_epochs):
             self.current_epoch = epoch
 
             train_losses = self.train_epoch()
+            
+            # DDP: 同步后再验证
+            if self.distributed:
+                dist.barrier()
+            
             train_info = (
                 f"Epoch {epoch:3d} | "
                 f"Loss: {train_losses['total']:.4f} "
@@ -589,6 +732,10 @@ class Stage1Trainer:
 
             if epoch % self.config.val_interval == 0:
                 val_results = self.validate()
+                
+                # DDP: 验证后同步
+                if self.distributed:
+                    dist.barrier()
 
                 val_info = (
                     f" | Val Loss: {val_results['total']:.4f} "
@@ -609,10 +756,17 @@ class Stage1Trainer:
                     self.patience_counter += 1
                     val_info += f" | Patience {self.patience_counter}/{self.config.early_stop_patience}"
 
-                print(train_info + val_info)
+                if self.is_main_process:
+                    print(train_info + val_info)
 
                 if self.patience_counter >= self.config.early_stop_patience:
-                    print("Early stopping triggered")
+                    if self.is_main_process:
+                        print("Early stopping triggered")
                     break
             else:
-                print(train_info)
+                if self.is_main_process:
+                    print(train_info)
+        
+        # DDP: 训练结束时清理
+        if self.distributed:
+            dist.destroy_process_group()

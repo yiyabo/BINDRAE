@@ -3,12 +3,17 @@
 Stage-1 训练启动脚本
 
 Usage:
+    # 单卡训练
     python scripts/train_stage1.py [--options]
+    
+    # 多卡 DDP 训练
+    torchrun --nproc_per_node=2 scripts/train_stage1.py --distributed [--options]
 
 Author: BINDRAE Team
 Date: 2025-10-28
 """
 
+import os
 import sys
 from pathlib import Path
 import argparse
@@ -66,20 +71,34 @@ def parse_args():
     
     # 设备
     parser.add_argument('--device', type=str, default='cuda',
-                       help='训练设备')
+                       help='训练设备（单卡模式）')
     parser.add_argument('--no_mixed_precision', action='store_true',
                        help='禁用混合精度')
+    
+    # 分布式训练
+    parser.add_argument('--distributed', action='store_true',
+                       help='启用 DDP 分布式训练（配合 torchrun 使用）')
     
     # 恢复训练
     parser.add_argument('--resume_from', type=str, default=None,
                        help='从checkpoint恢复')
     
-    return parser.parse_args()
+    args = parser.parse_args()
+    
+    # 自动检测 torchrun 环境
+    if 'LOCAL_RANK' in os.environ:
+        args.distributed = True
+    
+    return args
 
 
 def main():
     """主函数"""
     args = parse_args()
+    
+    # 分布式训练时，local_rank 从环境变量获取
+    local_rank = int(os.environ.get('LOCAL_RANK', 0)) if args.distributed else 0
+    is_main_process = (local_rank == 0)
     
     # 创建配置
     config = TrainingConfig(
@@ -96,22 +115,26 @@ def main():
         log_dir=args.log_dir,
         device=args.device,
         mixed_precision=not args.no_mixed_precision,
+        distributed=args.distributed,
         resume_from=args.resume_from,
     )
     
-    print(f"\n{'='*80}")
-    print(f"BINDRAE Stage-1 训练")
-    print(f"{'='*80}")
-    print(f"\n配置:")
-    print(f"  - 数据目录: {config.data_dir}")
-    print(f"  - 批大小: {config.batch_size}")
-    print(f"  - 最大残基数: {config.max_n_res}")
-    print(f"  - 学习率: {config.lr}")
-    print(f"  - 最大轮数: {config.max_epochs}")
-    print(f"  - 早停patience: {config.early_stop_patience}")
-    print(f"  - 设备: {config.device}")
-    print(f"  - 混合精度: {config.mixed_precision}")
-    print(f"\n{'='*80}\n")
+    # 只在主进程打印配置
+    if is_main_process:
+        print(f"\n{'='*80}")
+        print(f"BINDRAE Stage-1 训练")
+        print(f"{'='*80}")
+        print(f"\n配置:")
+        print(f"  - 数据目录: {config.data_dir}")
+        print(f"  - 批大小: {config.batch_size}")
+        print(f"  - 最大残基数: {config.max_n_res}")
+        print(f"  - 学习率: {config.lr}")
+        print(f"  - 最大轮数: {config.max_epochs}")
+        print(f"  - 早停patience: {config.early_stop_patience}")
+        print(f"  - 设备: {config.device}")
+        print(f"  - 混合精度: {config.mixed_precision}")
+        print(f"  - 分布式训练: {config.distributed}")
+        print(f"\n{'='*80}\n")
     
     # 创建训练器
     trainer = Stage1Trainer(config)
