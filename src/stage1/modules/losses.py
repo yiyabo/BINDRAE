@@ -30,7 +30,7 @@ def fape_loss(pred_coords: torch.Tensor,
              clamp_distance: float = 10.0,
              eps: float = 1e-8) -> torch.Tensor:
     """
-    FAPE损失（可微分版本）
+    FAPE损失（可微分版本，增强数值稳定性）
     
     公式：对每个残基i，将坐标变换到局部帧后计算L2误差
     
@@ -49,6 +49,12 @@ def fape_loss(pred_coords: torch.Tensor,
     pred_R, pred_t = pred_frames
     true_R, true_t = true_frames
     
+    # NaN/Inf 输入检查
+    if torch.isnan(pred_coords).any() or torch.isinf(pred_coords).any():
+        return pred_coords.new_tensor(0.0)
+    if torch.isnan(true_coords).any() or torch.isinf(true_coords).any():
+        return pred_coords.new_tensor(0.0)
+    
     # 如果是[B, N, n_atoms, 3]，重塑为[B, N*n_atoms, 3]
     if pred_coords.ndim == 4:
         B, N, n_atoms, _ = pred_coords.shape
@@ -63,24 +69,41 @@ def fape_loss(pred_coords: torch.Tensor,
         if w_res is not None:
             w_res = w_res.unsqueeze(2).expand(-1, -1, n_atoms).reshape(B, N * n_atoms)
     
+    # 在 fp32 下计算以避免 fp16 溢出
+    orig_dtype = pred_coords.dtype
+    pred_coords = pred_coords.float()
+    true_coords = true_coords.float()
+    pred_R = pred_R.float()
+    pred_t = pred_t.float()
+    true_R = true_R.float()
+    true_t = true_t.float()
+    
     # 变换到真实帧的局部坐标系
     # x_local = R_true^T @ (x - t_true)
     pred_local = torch.einsum('bnik,bnk->bni', true_R.transpose(-2, -1), pred_coords - true_t)
     true_local = torch.einsum('bnik,bnk->bni', true_R.transpose(-2, -1), true_coords - true_t)
     
-    # 计算误差
-    diff = torch.sqrt(torch.sum((pred_local - true_local) ** 2, dim=-1) + eps)  # [B, N]
+    # 计算误差（数值稳定：先 clamp 差值再求平方）
+    coord_diff = pred_local - true_local
+    coord_diff = torch.clamp(coord_diff, min=-clamp_distance * 10, max=clamp_distance * 10)  # 防止极端值
+    diff_sq = torch.sum(coord_diff ** 2, dim=-1)  # [B, N]
+    diff = torch.sqrt(diff_sq + eps)
     
-    # Clamp
+    # Clamp 最终距离
     diff = torch.clamp(diff, max=clamp_distance)
     
     # 应用权重
     if w_res is not None:
+        w_res = w_res.float()
         loss = (diff * w_res).sum() / (w_res.sum() + eps)
     else:
         loss = diff.mean()
     
-    return loss
+    # 最终 NaN 检查
+    if torch.isnan(loss) or torch.isinf(loss):
+        return pred_coords.new_tensor(0.0)
+    
+    return loss.to(orig_dtype)
 
 
 # ============================================================================
@@ -238,7 +261,7 @@ def clash_penalty(coords: torch.Tensor,
                  eps: float = 1e-8,
                  sample_size: int = 512) -> torch.Tensor:
     """
-    碰撞惩罚（随机采样，实验验证最优）
+    碰撞惩罚（随机采样，实验验证最优，增强数值稳定性）
     
     方法：
     - 当N>1000时，随机采样sample_size个原子
@@ -259,6 +282,10 @@ def clash_penalty(coords: torch.Tensor,
     Returns:
         loss: scalar tensor
     """
+    # NaN/Inf 输入检查
+    if torch.isnan(coords).any() or torch.isinf(coords).any():
+        return coords.new_tensor(0.0)
+    
     B, N, _ = coords.shape
     
     # 如果N太大，随机采样（实验验证的最优方法）
@@ -267,8 +294,14 @@ def clash_penalty(coords: torch.Tensor,
         coords = coords[:, indices, :]
         N = sample_size
     
+    # 在 fp32 下计算以避免 fp16 溢出
+    orig_dtype = coords.dtype
+    coords = coords.float()
+    
     # 计算成对距离
     diff = coords.unsqueeze(2) - coords.unsqueeze(1)  # [B, N, N, 3]
+    # 先 clamp 差值，防止极端坐标导致溢出
+    diff = torch.clamp(diff, min=-1000.0, max=1000.0)
     dist = torch.sqrt(torch.sum(diff ** 2, dim=-1) + eps)  # [B, N, N]
     
     # 创建上三角掩码
@@ -288,8 +321,16 @@ def clash_penalty(coords: torch.Tensor,
     penalty = torch.clamp(penetration, min=0.0) ** 2
     
     # 只计算有效对
-    loss = (penalty * triu_mask.float()).sum() / (triu_mask.float().sum() + eps)
+    mask_sum = triu_mask.float().sum()
+    if mask_sum < eps:
+        return coords.new_tensor(0.0)
     
-    return loss
+    loss = (penalty * triu_mask.float()).sum() / (mask_sum + eps)
+    
+    # 最终 NaN 检查
+    if torch.isnan(loss) or torch.isinf(loss):
+        return coords.new_tensor(0.0)
+    
+    return loss.to(orig_dtype)
 
 

@@ -80,12 +80,14 @@ class Stage1Trainer:
             valid_samples_file=config.valid_samples_file,
             require_atom14=False,  # atom14_holo 可选，缺失时跳过 FAPE
         )
+        # 验证阶段使用较少的 workers 避免 shm 问题
+        val_num_workers = min(config.num_workers, 2)  # 验证最多用 2 workers
         self.val_loader = create_stage1_dataloader(
             config.data_dir,
             split='val',
             batch_size=config.batch_size,
             shuffle=False,
-            num_workers=config.num_workers,
+            num_workers=val_num_workers,
             max_n_res=config.max_n_res,
             valid_samples_file=config.valid_samples_file,
             require_atom14=False,
@@ -336,17 +338,44 @@ class Stage1Trainer:
         self.optimizer.zero_grad()
 
         batch = self._batch_to_device(batch)
+        
+        # === 输入检查：提前检测异常数据 ===
+        def has_bad_values(t, name=None):
+            if torch.isnan(t).any() or torch.isinf(t).any():
+                return True
+            # 检查坐标是否有极端值（超过 1000 Å）
+            if t.abs().max() > 10000:
+                return True
+            return False
+        
+        input_bad = (
+            has_bad_values(batch.Ca_apo) or 
+            has_bad_values(batch.Ca_holo) or
+            has_bad_values(batch.esm) or
+            has_bad_values(batch.lig_points)
+        )
+        if input_bad:
+            print(f"[WARN] Bad input data at step {self.global_step}, skipping batch (pdb_ids: {batch.pdb_ids[:3]}...)")
+            self.global_step += 1
+            return {'total': float('nan'), 'chi': float('nan'), 'fape': float('nan'), 'clash': float('nan')}
 
         # Forward pass
-        if self.scaler is not None:
-            with autocast():
+        try:
+            if self.scaler is not None:
+                with autocast():
+                    outputs = self.model(batch, self.global_step)
+                    losses = self.compute_loss(outputs, batch, self.global_step)
+                    loss = losses['total']
+            else:
                 outputs = self.model(batch, self.global_step)
                 losses = self.compute_loss(outputs, batch, self.global_step)
                 loss = losses['total']
-        else:
-            outputs = self.model(batch, self.global_step)
-            losses = self.compute_loss(outputs, batch, self.global_step)
-            loss = losses['total']
+        except RuntimeError as e:
+            # 捕获 CUDA 错误等
+            print(f"[WARN] Runtime error at step {self.global_step}: {str(e)[:80]}, skipping batch")
+            self.optimizer.zero_grad()
+            self.global_step += 1
+            return {'total': float('nan'), 'chi': float('nan'), 'fape': float('nan'), 'clash': float('nan')}
 
         # === NaN/Inf 检查：跳过坏 batch，防止污染模型参数 ===
         if torch.isnan(loss) or torch.isinf(loss):
