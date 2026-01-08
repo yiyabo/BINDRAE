@@ -139,10 +139,12 @@ class Stage1Trainer:
                 drop_last=True,  # DDP 需要保证每个 rank batch 数相同
             )
             
+            # 验证集使用 val_samples_file（如果指定），否则使用 valid_samples_file
+            val_samples = config.val_samples_file if config.val_samples_file else config.valid_samples_file
             val_dataset = ApoHoloTripletDataset(
                 config.data_dir,
                 split='val',
-                valid_samples_file=config.valid_samples_file,
+                valid_samples_file=val_samples,
                 require_atom14=False,
             )
             self.val_sampler = DistributedSampler(
@@ -175,6 +177,8 @@ class Stage1Trainer:
                 require_atom14=False,
             )
             val_num_workers = min(config.num_workers, 2)
+            # 验证集使用 val_samples_file（如果指定），否则使用 valid_samples_file
+            val_samples = config.val_samples_file if config.val_samples_file else config.valid_samples_file
             self.val_loader = create_stage1_dataloader(
                 config.data_dir,
                 split='val',
@@ -182,9 +186,9 @@ class Stage1Trainer:
                 shuffle=False,
                 num_workers=val_num_workers,
                 max_n_res=config.max_n_res,
-                valid_samples_file=config.valid_samples_file,
+                valid_samples_file=val_samples,
                 require_atom14=False,
-        )
+            )
 
         # ========== 优化器 ==========
         if self.is_main_process:

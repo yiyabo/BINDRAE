@@ -18,7 +18,8 @@ class TrainingConfig:
     batch_size: int = 4
     num_workers: int = 4
     max_n_res: Optional[int] = None  # 限制每个batch的最大残基数（None=不限制）
-    valid_samples_file: Optional[str] = None  # 有效样本列表文件（由validate_triplets_data.py生成）
+    valid_samples_file: Optional[str] = None  # 训练集有效样本列表（由validate_triplets_data.py生成）
+    val_samples_file: Optional[str] = None  # 验证集样本列表（可选，不指定则使用完整验证集）
     
     # 优化器
     lr: float = 5e-4  # 折中值（1e-4太慢，1e-3可能不稳定）
