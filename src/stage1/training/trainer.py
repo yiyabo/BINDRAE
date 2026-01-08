@@ -625,6 +625,7 @@ class Stage1Trainer:
             pbar = tqdm(self.val_loader, desc='  Validating', ncols=120, leave=False)
         else:
             pbar = self.val_loader
+        
         n_batches = 0
         for batch in pbar:
             if batch is None:
@@ -669,6 +670,10 @@ class Stage1Trainer:
                     'v_loss': f"{losses['total'].item():.3f}",
                     'chi1': f"{chi1_acc:5.1%}",
                 }, refresh=False)
+
+        # DDP: 验证结束同步
+        if self.distributed:
+            dist.barrier()
 
         if n_batches == 0:
             return {
