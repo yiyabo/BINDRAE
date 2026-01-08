@@ -82,7 +82,7 @@ class Stage1Trainer:
             if self.is_main_process:
                 print(f"[DDP] Initialized: world_size={self.world_size}, local_rank={self.local_rank}")
         else:
-            self.device = torch.device(config.device)
+        self.device = torch.device(config.device)
 
         # 设置随机种子（每个 rank 不同以获得不同的数据增强）
         seed = config.seed + self.local_rank
@@ -92,10 +92,10 @@ class Stage1Trainer:
 
         # ========== 创建模型 ==========
         if self.is_main_process:
-            print("Creating model...")
+        print("Creating model...")
         model_config = Stage1ModelConfig()
         self.model = Stage1Model(model_config).to(self.device)
-        
+
         # DDP 包装模型
         if self.distributed:
             self.model = DDP(
@@ -109,7 +109,7 @@ class Stage1Trainer:
 
         # ========== 创建数据加载器 ==========
         if self.is_main_process:
-            print("Creating dataloaders...")
+        print("Creating dataloaders...")
         
         self.train_sampler: Optional[DistributedSampler] = None
         self.val_sampler: Optional[DistributedSampler] = None
@@ -150,6 +150,7 @@ class Stage1Trainer:
                 num_replicas=self.world_size,
                 rank=self.local_rank,
                 shuffle=False,
+                drop_last=True,  # 确保所有 rank 处理相同数量的 batch
             )
             val_num_workers = min(config.num_workers, 2)
             self.val_loader = DataLoader(
@@ -159,6 +160,7 @@ class Stage1Trainer:
                 num_workers=val_num_workers,
                 collate_fn=collate_fn,
                 pin_memory=True,
+                drop_last=True,  # 配合 sampler 的 drop_last
             )
         else:
             # 单卡模式：使用原有的工厂函数
@@ -182,11 +184,11 @@ class Stage1Trainer:
                 max_n_res=config.max_n_res,
                 valid_samples_file=config.valid_samples_file,
                 require_atom14=False,
-            )
+        )
 
         # ========== 优化器 ==========
         if self.is_main_process:
-            print("Creating optimizer...")
+        print("Creating optimizer...")
         
         # 获取模型参数（DDP 模式下需要访问 .module）
         model_params = self.model.module.parameters() if self.distributed else self.model.parameters()
@@ -213,15 +215,15 @@ class Stage1Trainer:
 
         # 只在主进程创建目录
         if self.is_main_process:
-            Path(config.save_dir).mkdir(parents=True, exist_ok=True)
-            Path(config.log_dir).mkdir(parents=True, exist_ok=True)
+        Path(config.save_dir).mkdir(parents=True, exist_ok=True)
+        Path(config.log_dir).mkdir(parents=True, exist_ok=True)
 
-            print("✓ Trainer initialized")
+        print("✓ Trainer initialized")
             n_params = sum(p.numel() for p in model_params)
             print(f"  - params: {n_params:,}")
-            print(f"  - train samples: {len(self.train_loader.dataset)}")
-            print(f"  - val samples: {len(self.val_loader.dataset)}")
-            print(f"  - total steps: {total_steps:,}")
+        print(f"  - train samples: {len(self.train_loader.dataset)}")
+        print(f"  - val samples: {len(self.val_loader.dataset)}")
+        print(f"  - total steps: {total_steps:,}")
             if self.distributed:
                 print(f"  - world_size: {self.world_size}")
                 print(f"  - effective batch: {config.batch_size * self.world_size}")
@@ -444,7 +446,7 @@ class Stage1Trainer:
         self.optimizer.zero_grad()
 
         batch = self._batch_to_device(batch)
-        
+
         # === 输入检查：提前检测异常数据 ===
         def has_bad_values(t, name=None):
             if torch.isnan(t).any() or torch.isinf(t).any():
@@ -467,8 +469,8 @@ class Stage1Trainer:
 
         # Forward pass
         try:
-            if self.scaler is not None:
-                with autocast():
+        if self.scaler is not None:
+            with autocast():
                     outputs = self.model(batch, self.global_step)
                     losses = self.compute_loss(outputs, batch, self.global_step)
                     loss = losses['total']
@@ -586,7 +588,7 @@ class Stage1Trainer:
 
         if n_skipped > 0 and self.is_main_process:
             print(f"  [INFO] Epoch {self.current_epoch}: skipped {n_skipped} NaN batches")
-        
+
         n_batches = max(n_batches, 1)
         return {k: v / n_batches for k, v in epoch_losses.items()}
 
