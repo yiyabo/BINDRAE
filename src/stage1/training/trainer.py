@@ -82,7 +82,7 @@ class Stage1Trainer:
             if self.is_main_process:
                 print(f"[DDP] Initialized: world_size={self.world_size}, local_rank={self.local_rank}")
         else:
-        self.device = torch.device(config.device)
+            self.device = torch.device(config.device)
 
         # 设置随机种子（每个 rank 不同以获得不同的数据增强）
         seed = config.seed + self.local_rank
@@ -92,7 +92,7 @@ class Stage1Trainer:
 
         # ========== 创建模型 ==========
         if self.is_main_process:
-        print("Creating model...")
+            print("Creating model...")
         model_config = Stage1ModelConfig()
         self.model = Stage1Model(model_config).to(self.device)
 
@@ -109,7 +109,7 @@ class Stage1Trainer:
 
         # ========== 创建数据加载器 ==========
         if self.is_main_process:
-        print("Creating dataloaders...")
+            print("Creating dataloaders...")
         
         self.train_sampler: Optional[DistributedSampler] = None
         self.val_sampler: Optional[DistributedSampler] = None
@@ -192,7 +192,7 @@ class Stage1Trainer:
 
         # ========== 优化器 ==========
         if self.is_main_process:
-        print("Creating optimizer...")
+            print("Creating optimizer...")
         
         # 获取模型参数（DDP 模式下需要访问 .module）
         model_params = self.model.module.parameters() if self.distributed else self.model.parameters()
@@ -217,17 +217,17 @@ class Stage1Trainer:
         self.best_val_metric = float('inf')
         self.patience_counter = 0
 
-        # 只在主进程创建目录
+        # 只在主进程创建目录和打印信息
         if self.is_main_process:
-        Path(config.save_dir).mkdir(parents=True, exist_ok=True)
-        Path(config.log_dir).mkdir(parents=True, exist_ok=True)
+            Path(config.save_dir).mkdir(parents=True, exist_ok=True)
+            Path(config.log_dir).mkdir(parents=True, exist_ok=True)
 
-        print("✓ Trainer initialized")
+            print("✓ Trainer initialized")
             n_params = sum(p.numel() for p in model_params)
             print(f"  - params: {n_params:,}")
-        print(f"  - train samples: {len(self.train_loader.dataset)}")
-        print(f"  - val samples: {len(self.val_loader.dataset)}")
-        print(f"  - total steps: {total_steps:,}")
+            print(f"  - train samples: {len(self.train_loader.dataset)}")
+            print(f"  - val samples: {len(self.val_loader.dataset)}")
+            print(f"  - total steps: {total_steps:,}")
             if self.distributed:
                 print(f"  - world_size: {self.world_size}")
                 print(f"  - effective batch: {config.batch_size * self.world_size}")
@@ -473,8 +473,8 @@ class Stage1Trainer:
 
         # Forward pass
         try:
-        if self.scaler is not None:
-            with autocast():
+            if self.scaler is not None:
+                with autocast():
                     outputs = self.model(batch, self.global_step)
                     losses = self.compute_loss(outputs, batch, self.global_step)
                     loss = losses['total']

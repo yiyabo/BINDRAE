@@ -124,20 +124,20 @@ def main():
     
     # 只在主进程打印配置
     if is_main_process:
-    print(f"\n{'='*80}")
-    print(f"BINDRAE Stage-1 训练")
-    print(f"{'='*80}")
-    print(f"\n配置:")
-    print(f"  - 数据目录: {config.data_dir}")
-    print(f"  - 批大小: {config.batch_size}")
-    print(f"  - 最大残基数: {config.max_n_res}")
-    print(f"  - 学习率: {config.lr}")
-    print(f"  - 最大轮数: {config.max_epochs}")
-    print(f"  - 早停patience: {config.early_stop_patience}")
-    print(f"  - 设备: {config.device}")
-    print(f"  - 混合精度: {config.mixed_precision}")
+        print(f"\n{'='*80}")
+        print(f"BINDRAE Stage-1 训练")
+        print(f"{'='*80}")
+        print(f"\n配置:")
+        print(f"  - 数据目录: {config.data_dir}")
+        print(f"  - 批大小: {config.batch_size}")
+        print(f"  - 最大残基数: {config.max_n_res}")
+        print(f"  - 学习率: {config.lr}")
+        print(f"  - 最大轮数: {config.max_epochs}")
+        print(f"  - 早停patience: {config.early_stop_patience}")
+        print(f"  - 设备: {config.device}")
+        print(f"  - 混合精度: {config.mixed_precision}")
         print(f"  - 分布式训练: {config.distributed}")
-    print(f"\n{'='*80}\n")
+        print(f"\n{'='*80}\n")
     
     # 创建训练器
     trainer = Stage1Trainer(config)
