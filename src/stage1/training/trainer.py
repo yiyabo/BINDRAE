@@ -460,18 +460,29 @@ class Stage1Trainer:
                 return True
             return False
         
-        input_bad = (
+        input_bad_local = (
             has_bad_values(batch.Ca_apo) or 
             has_bad_values(batch.Ca_holo) or
             has_bad_values(batch.esm) or
             has_bad_values(batch.lig_points)
         )
+        
+        # DDP 模式：同步输入检查状态，任一 rank 有问题则所有 rank 都跳过
+        if self.distributed:
+            bad_flag = torch.tensor([1.0 if input_bad_local else 0.0], device=self.device)
+            dist.all_reduce(bad_flag, op=dist.ReduceOp.MAX)
+            input_bad = bad_flag.item() > 0
+        else:
+            input_bad = input_bad_local
+        
         if input_bad:
-            print(f"[WARN] Bad input data at step {self.global_step}, skipping batch (pdb_ids: {batch.pdb_ids[:3]}...)")
+            if self.is_main_process and input_bad_local:
+                print(f"[WARN] Bad input data at step {self.global_step}, skipping batch (pdb_ids: {batch.pdb_ids[:3]}...)")
             self.global_step += 1
             return {'total': float('nan'), 'chi': float('nan'), 'fape': float('nan'), 'clash': float('nan')}
 
         # Forward pass
+        forward_error = False
         try:
             if self.scaler is not None:
                 with autocast():
@@ -484,19 +495,31 @@ class Stage1Trainer:
                 loss = losses['total']
         except RuntimeError as e:
             # 捕获 CUDA 错误等
-            print(f"[WARN] Runtime error at step {self.global_step}: {str(e)[:80]}, skipping batch")
-            self.optimizer.zero_grad()
-            self.global_step += 1
-            return {'total': float('nan'), 'chi': float('nan'), 'fape': float('nan'), 'clash': float('nan')}
+            if self.is_main_process:
+                print(f"[WARN] Runtime error at step {self.global_step}: {str(e)[:80]}, skipping batch")
+            forward_error = True
+            loss = torch.tensor(float('nan'), device=self.device)
+            losses = {'total': loss, 'chi': loss, 'fape': loss, 'clash': loss}
 
-        # === NaN/Inf 检查：跳过坏 batch，防止污染模型参数 ===
-        if torch.isnan(loss) or torch.isinf(loss):
-            print(f"[WARN] NaN/Inf loss detected at step {self.global_step}, skipping batch (pdb_ids: {batch.pdb_ids[:3]}...)")
+        # === NaN/Inf 检查：DDP 模式下同步跳过状态 ===
+        loss_is_bad_local = forward_error or torch.isnan(loss) or torch.isinf(loss)
+        
+        # DDP 模式：同步 NaN 状态，任一 rank 有 NaN 则所有 rank 都跳过 backward
+        if self.distributed:
+            nan_flag = torch.tensor([1.0 if loss_is_bad_local else 0.0], device=self.device)
+            dist.all_reduce(nan_flag, op=dist.ReduceOp.MAX)
+            skip_backward = nan_flag.item() > 0
+        else:
+            skip_backward = loss_is_bad_local
+        
+        if skip_backward:
+            if self.is_main_process and loss_is_bad_local:
+                print(f"[WARN] NaN/Inf loss detected at step {self.global_step}, skipping batch (pdb_ids: {batch.pdb_ids[:3]}...)")
             self.optimizer.zero_grad()  # 清除任何残留梯度
             self.global_step += 1
             return {k: float('nan') for k in losses.keys()}
 
-        # Backward pass (只有 loss 正常时才执行)
+        # Backward pass (所有 rank 同时执行)
         model_params = self._model.parameters()
         if self.scaler is not None:
             self.scaler.scale(loss).backward()
@@ -620,18 +643,32 @@ class Stage1Trainer:
         clash_pct_sum = 0.0
         n_structures = 0
 
+        # DDP 模式：同步预期的 batch 数量，确保所有 rank 处理相同次数
+        n_batches_expected = len(self.val_loader)
+        if self.distributed:
+            n_batches_tensor = torch.tensor([n_batches_expected], device=self.device, dtype=torch.long)
+            dist.all_reduce(n_batches_tensor, op=dist.ReduceOp.MIN)
+            n_batches_expected = int(n_batches_tensor.item())
+
         # 只在主进程显示进度条
         if self.is_main_process:
-            pbar = tqdm(self.val_loader, desc='  Validating', ncols=120, leave=False)
+            pbar = tqdm(self.val_loader, desc='  Validating', ncols=120, leave=False, total=n_batches_expected)
         else:
             pbar = self.val_loader
         
+        # 验证时使用原始模型（不带 DDP 包装），避免隐式 collective 操作
+        eval_model = self._model
+        
         n_batches = 0
-        for batch in pbar:
+        for batch_idx, batch in enumerate(pbar):
+            # DDP 模式：确保所有 rank 处理相同数量的 batch
+            if self.distributed and batch_idx >= n_batches_expected:
+                break
+            
             if batch is None:
                 continue
             batch = self._batch_to_device(batch)
-            outputs = self.model(batch, self.global_step)
+            outputs = eval_model(batch, self.global_step)
             losses = self.compute_loss(outputs, batch, self.global_step)
             n_batches += 1
 
