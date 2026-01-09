@@ -141,29 +141,25 @@ class Stage1Trainer:
             
             # 验证集使用 val_samples_file（如果指定），否则使用 valid_samples_file
             val_samples = config.val_samples_file if config.val_samples_file else config.valid_samples_file
-            val_dataset = ApoHoloTripletDataset(
-                config.data_dir,
-                split='val',
-                valid_samples_file=val_samples,
-                require_atom14=False,
-            )
-            self.val_sampler = DistributedSampler(
-                val_dataset,
-                num_replicas=self.world_size,
-                rank=self.local_rank,
-                shuffle=False,
-                drop_last=True,  # 确保所有 rank 处理相同数量的 batch
-            )
-            val_num_workers = min(config.num_workers, 2)
-            self.val_loader = DataLoader(
-                val_dataset,
-                batch_size=config.batch_size,
-                sampler=self.val_sampler,
-                num_workers=val_num_workers,
-                collate_fn=collate_fn,
-                pin_memory=True,
-                drop_last=True,  # 配合 sampler 的 drop_last
-            )
+            if self.is_main_process:
+                val_dataset = ApoHoloTripletDataset(
+                    config.data_dir,
+                    split='val',
+                    valid_samples_file=val_samples,
+                    require_atom14=False,
+                )
+                val_num_workers = min(config.num_workers, 2)
+                self.val_loader = DataLoader(
+                    val_dataset,
+                    batch_size=config.batch_size,
+                    shuffle=False,
+                    num_workers=val_num_workers,
+                    collate_fn=collate_fn,
+                    pin_memory=True,
+                    drop_last=False,
+                )
+            else:
+                self.val_loader = None
         else:
             # 单卡模式：使用原有的工厂函数
             self.train_loader = create_stage1_dataloader(
@@ -778,32 +774,39 @@ class Stage1Trainer:
                 # DDP: 验证后同步
                 if self.distributed:
                     dist.barrier()
-
-                val_info = (
-                    f" | Val Loss: {val_results['total']:.4f} "
-                    f"chi1:{val_results['chi1_acc']:5.1%} "
-                    f"FAPE:{val_results['fape']:.3f} "
-                    f"iRMSD:{val_results['pocket_irmsd']:.2f} "
-                    f"Clash:{val_results['clash_pct']*100:.1f}%"
-                )
-
-                current_metric = val_results['total']
-                if current_metric < self.best_val_metric:
-                    self.best_val_metric = current_metric
-                    self.patience_counter = 0
-                    save_path = Path(self.config.save_dir) / 'best_model.pt'
-                    self.save_checkpoint(str(save_path), verbose=False)
-                    val_info += " | ⭐ Best"
-                else:
-                    self.patience_counter += 1
-                    val_info += f" | Patience {self.patience_counter}/{self.config.early_stop_patience}"
-
+                should_stop = False
                 if self.is_main_process:
+                    val_info = (
+                        f" | Val Loss: {val_results['total']:.4f} "
+                        f"chi1:{val_results['chi1_acc']:5.1%} "
+                        f"FAPE:{val_results['fape']:.3f} "
+                        f"iRMSD:{val_results['pocket_irmsd']:.2f} "
+                        f"Clash:{val_results['clash_pct']*100:.1f}%"
+                    )
+
+                    current_metric = val_results['total']
+                    if current_metric < self.best_val_metric:
+                        self.best_val_metric = current_metric
+                        self.patience_counter = 0
+                        save_path = Path(self.config.save_dir) / 'best_model.pt'
+                        self.save_checkpoint(str(save_path), verbose=False)
+                        val_info += " | ⭐ Best"
+                    else:
+                        self.patience_counter += 1
+                        val_info += f" | Patience {self.patience_counter}/{self.config.early_stop_patience}"
+
                     print(train_info + val_info)
 
-                if self.patience_counter >= self.config.early_stop_patience:
-                    if self.is_main_process:
+                    if self.patience_counter >= self.config.early_stop_patience:
                         print("Early stopping triggered")
+                        should_stop = True
+
+                if self.distributed:
+                    stop_flag = torch.tensor([1 if should_stop else 0], device=self.device)
+                    dist.broadcast(stop_flag, src=0)
+                    should_stop = stop_flag.item() > 0
+
+                if should_stop:
                     break
             else:
                 if self.is_main_process:
