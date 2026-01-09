@@ -621,14 +621,24 @@ class Stage1Trainer:
 
     @torch.no_grad()
     def validate(self) -> Dict[str, float]:
+        """
+        验证函数。
+        
+        DDP 模式下只在主进程执行验证，其他进程等待 barrier。
+        这样可以完全避免验证阶段的 collective 同步问题。
+        """
         self.model.eval()
         
-        # DDP: 同步开始验证
-        if self.distributed:
-            dist.barrier()
-            if self.val_sampler is not None:
-                self.val_sampler.set_epoch(self.current_epoch)
+        # DDP 模式：非主进程只等待 barrier，不执行验证
+        if self.distributed and not self.is_main_process:
+            dist.barrier()  # 等待主进程完成验证
+            # 返回空结果，train 函数中只有主进程会使用验证结果
+            return {
+                'total': 0.0, 'chi': 0.0, 'clash': 0.0, 'fape': 0.0,
+                'chi1_acc': 0.0, 'pocket_irmsd': 0.0, 'clash_pct': 0.0,
+            }
 
+        # === 以下只在主进程执行 ===
         val_losses = {
             'total': 0.0,
             'chi': 0.0,
@@ -643,28 +653,13 @@ class Stage1Trainer:
         clash_pct_sum = 0.0
         n_structures = 0
 
-        # DDP 模式：同步预期的 batch 数量，确保所有 rank 处理相同次数
-        n_batches_expected = len(self.val_loader)
-        if self.distributed:
-            n_batches_tensor = torch.tensor([n_batches_expected], device=self.device, dtype=torch.long)
-            dist.all_reduce(n_batches_tensor, op=dist.ReduceOp.MIN)
-            n_batches_expected = int(n_batches_tensor.item())
-
-        # 只在主进程显示进度条
-        if self.is_main_process:
-            pbar = tqdm(self.val_loader, desc='  Validating', ncols=120, leave=False, total=n_batches_expected)
-        else:
-            pbar = self.val_loader
-        
-        # 验证时使用原始模型（不带 DDP 包装），避免隐式 collective 操作
+        # 验证时使用原始模型（不带 DDP 包装）
         eval_model = self._model
         
+        pbar = tqdm(self.val_loader, desc='  Validating', ncols=120, leave=False)
+        
         n_batches = 0
-        for batch_idx, batch in enumerate(pbar):
-            # DDP 模式：确保所有 rank 处理相同数量的 batch
-            if self.distributed and batch_idx >= n_batches_expected:
-                break
-            
+        for batch in pbar:
             if batch is None:
                 continue
             batch = self._batch_to_device(batch)
@@ -702,13 +697,12 @@ class Stage1Trainer:
                     clash_pct_sum += clash_pct
                 n_structures += 1
 
-            if self.is_main_process and hasattr(pbar, 'set_postfix'):
-                pbar.set_postfix({
-                    'v_loss': f"{losses['total'].item():.3f}",
-                    'chi1': f"{chi1_acc:5.1%}",
-                }, refresh=False)
+            pbar.set_postfix({
+                'v_loss': f"{losses['total'].item():.3f}",
+                'chi1': f"{chi1_acc:5.1%}",
+            }, refresh=False)
 
-        # DDP: 验证结束同步
+        # DDP: 通知其他进程验证完成
         if self.distributed:
             dist.barrier()
 
