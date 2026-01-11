@@ -8,6 +8,7 @@ import math
 import time
 import os
 import sys
+from datetime import timedelta
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -73,7 +74,11 @@ class Stage1Trainer:
         if self.distributed:
             # 初始化分布式进程组
             if not dist.is_initialized():
-                dist.init_process_group(backend='nccl')
+                timeout_sec = int(os.environ.get("DDP_TIMEOUT", "7200"))
+                dist.init_process_group(
+                    backend='nccl',
+                    timeout=timedelta(seconds=timeout_sec),
+                )
             self.local_rank = int(os.environ.get('LOCAL_RANK', 0))
             self.world_size = dist.get_world_size()
             self.is_main_process = (self.local_rank == 0)
