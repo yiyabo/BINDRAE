@@ -195,14 +195,38 @@ class ApoHoloBridgeDataset(Dataset):
                  split: str = 'train',
                  index_file: Optional[str] = None,
                  max_lig_tokens: int = 128,
-                 require_nma: bool = False):
+                 require_nma: bool = False,
+                 valid_samples_file: Optional[str] = None):
         self.data_dir = Path(data_dir)
         self.split = split
         self.max_lig_tokens = max_lig_tokens
         self.require_nma = require_nma
 
         self.samples = self._load_index(index_file)
+        
+        # Filter by valid_samples_file if provided
+        if valid_samples_file:
+            self.samples = self._filter_by_valid_samples(valid_samples_file)
+        
         print(f"✓ Stage-2 {split} samples: {len(self.samples)}")
+
+    def _filter_by_valid_samples(self, valid_samples_file: str) -> List[Dict]:
+        """Filter samples by a list of valid sample IDs."""
+        valid_path = Path(valid_samples_file)
+        if not valid_path.is_absolute():
+            valid_path = self.data_dir / valid_path
+        
+        if not valid_path.exists():
+            print(f"[WARN] valid_samples_file not found: {valid_path}")
+            return self.samples
+        
+        with open(valid_path, 'r') as f:
+            valid_ids = {line.strip() for line in f if line.strip()}
+        
+        before = len(self.samples)
+        filtered = [s for s in self.samples if s.get('id', '') in valid_ids]
+        print(f"  Filtered {before - len(filtered)} samples using {valid_path.name}")
+        return filtered
 
     def _load_index(self, index_file: Optional[str]) -> List[Dict]:
         if index_file is not None:
@@ -492,10 +516,16 @@ def create_stage2_dataloader(data_dir: str,
                              batch_size: int = 2,
                              shuffle: bool = True,
                              num_workers: int = 0,
+                             valid_samples_file: Optional[str] = None,
                              **kwargs):
     from torch.utils.data import DataLoader
 
-    dataset = ApoHoloBridgeDataset(data_dir, split=split, **kwargs)
+    dataset = ApoHoloBridgeDataset(
+        data_dir, 
+        split=split, 
+        valid_samples_file=valid_samples_file,
+        **kwargs
+    )
     return DataLoader(
         dataset,
         batch_size=batch_size,

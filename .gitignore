@@ -40,6 +40,7 @@ wandb/
 *.swo
 *.code-workspace
 .spec-workflow
+.opencode/
 
 # 临时文件
 *.tmp

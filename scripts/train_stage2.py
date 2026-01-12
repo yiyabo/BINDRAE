@@ -33,6 +33,10 @@ def parse_args():
                         help='数据目录')
     parser.add_argument('--batch_size', type=int, default=2,
                         help='批大小')
+    parser.add_argument('--valid_samples_file', type=str, default=None,
+                        help='训练样本筛选文件')
+    parser.add_argument('--val_samples_file', type=str, default=None,
+                        help='验证样本筛选文件')
 
     # 训练
     parser.add_argument('--lr', type=float, default=1e-4,
@@ -75,6 +79,8 @@ def main():
     config = TrainingConfig(
         data_dir=args.data_dir,
         batch_size=args.batch_size,
+        valid_samples_file=args.valid_samples_file,
+        val_samples_file=args.val_samples_file,
         lr=args.lr,
         max_epochs=args.max_epochs,
         grad_clip=args.grad_clip,

@@ -9,6 +9,8 @@ class TrainingConfig:
     data_dir: str = "data/apo_holo_triplets"
     batch_size: int = 2
     num_workers: int = 0
+    valid_samples_file: str = None  # Filter train samples
+    val_samples_file: str = None    # Filter val samples
 
     # Training
     lr: float = 1e-4

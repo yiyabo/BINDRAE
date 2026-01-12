@@ -77,6 +77,7 @@ class Stage2Trainer:
             shuffle=True,
             num_workers=config.num_workers,
             require_nma=config.use_nma,
+            valid_samples_file=config.valid_samples_file,
         )
         self.val_loader = create_stage2_dataloader(
             config.data_dir,
@@ -85,6 +86,7 @@ class Stage2Trainer:
             shuffle=False,
             num_workers=config.num_workers,
             require_nma=config.use_nma,
+            valid_samples_file=config.val_samples_file,
         )
 
         # Optimizer
