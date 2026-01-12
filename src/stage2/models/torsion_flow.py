@@ -247,8 +247,8 @@ class TorsionFlowNet(nn.Module):
         if self.config.nma_dim > 0:
             rigid_input = torch.cat([rigid_input, nma_features], dim=-1)
         rigid_vel = self.rigid_head(rigid_input)
-        d_rot = rigid_vel[..., :3] * gate.squeeze(-1)
-        d_trans = rigid_vel[..., 3:] * gate.squeeze(-1)
+        d_rot = rigid_vel[..., :3] * gate  # gate: [B, N, 1] broadcasts to [B, N, 3]
+        d_trans = rigid_vel[..., 3:] * gate
 
         # mask padded residues
         if node_mask is not None:
