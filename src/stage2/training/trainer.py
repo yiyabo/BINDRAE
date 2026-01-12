@@ -123,7 +123,7 @@ class Stage2Trainer:
     def _load_stage1_model(self, ckpt_path: str) -> Stage1Model:
         model_config = Stage1ModelConfig()
         model = Stage1Model(model_config).to(self.device)
-        ckpt = torch.load(ckpt_path, map_location=self.device)
+        ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
         state_dict = ckpt.get('model_state_dict', ckpt)
         model.load_state_dict(state_dict, strict=False)
         model.eval()
