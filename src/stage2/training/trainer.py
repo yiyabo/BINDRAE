@@ -2,7 +2,7 @@
 
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 from torch.cuda.amp import autocast, GradScaler
