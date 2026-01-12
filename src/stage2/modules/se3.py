@@ -94,23 +94,22 @@ def se3_log(R: torch.Tensor, t: torch.Tensor, eps: float = 1e-8) -> torch.Tensor
     Returns xi: [..., 6] (omega, v).
     """
     omega = so3_log(R, eps=eps)
-    theta = torch.norm(omega, dim=-1, keepdim=True)
+    theta = torch.norm(omega, dim=-1, keepdim=True)  # [..., 1]
+    theta_squeezed = theta.squeeze(-1)  # [...]
     K = _skew(omega / theta.clamp(min=eps))
     eye = torch.eye(3, device=R.device, dtype=R.dtype).expand_as(K)
     theta2 = theta * theta
 
     A = torch.where(theta < 1e-4, 1.0 - theta2 / 6.0, torch.sin(theta) / theta)
     B = torch.where(theta < 1e-4, 0.5 - theta2 / 24.0, (1.0 - torch.cos(theta)) / theta2.clamp(min=eps))
-    C = torch.where(theta < 1e-4, 1.0 / 6.0 - theta2 / 120.0, (1.0 - A) / theta2.clamp(min=eps))
-
-    V = eye + B[..., None] * K + C[..., None] * (K @ K)
 
     # V_inv ≈ I - 0.5 K + (1/theta^2)*(1 - A/(2B)) K^2
     B_safe = B.clamp(min=eps)
     factor = (1.0 - A / (2.0 * B_safe)) / theta2.clamp(min=eps)
     V_inv = eye - 0.5 * K + factor[..., None] * (K @ K)
 
-    small = theta < 1e-4
+    # Handle small theta case
+    small = theta_squeezed < 1e-4  # [...]
     if small.any():
         V_inv_small = eye - 0.5 * K + (1.0 / 12.0) * (K @ K)
         V_inv = torch.where(small[..., None, None], V_inv_small, V_inv)
