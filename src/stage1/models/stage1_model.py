@@ -18,10 +18,14 @@ import torch.nn as nn
 
 # FlashIPA路径 (项目内 vendor 目录)
 from pathlib import Path
-_project_root = Path(__file__).resolve().parent.parent.parent.parent
-flash_ipa_path = str(_project_root / 'vendor' / 'flash_ipa' / 'src')
-if os.path.exists(flash_ipa_path) and flash_ipa_path not in sys.path:
-    sys.path.insert(0, flash_ipa_path)
+
+_current_file = Path(__file__).resolve()
+_project_root = _current_file.parents[3]  # 向上3级到项目根目录
+flash_ipa_path = _project_root / 'vendor' / 'flash_ipa' / 'src'
+
+# 统一使用 pathlib 进行路径检查和添加
+if flash_ipa_path.exists() and str(flash_ipa_path) not in sys.path:
+    sys.path.insert(0, str(flash_ipa_path))
 
 from flash_ipa.rigid import Rigid, Rotation
 
