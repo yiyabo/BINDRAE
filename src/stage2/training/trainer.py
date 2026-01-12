@@ -361,8 +361,8 @@ class Stage2Trainer:
         fm_chi_denom = (chi_mask * w_pow.unsqueeze(-1)).sum().clamp(min=1e-8)
         L_fm_chi = fm_chi.sum() / fm_chi_denom
 
-        fm_rot = ((d_rot_pred - d_rot_ref) ** 2) * w_pow
-        fm_trans = ((d_trans_pred - d_trans_ref) ** 2) * w_pow
+        fm_rot = ((d_rot_pred - d_rot_ref) ** 2) * w_pow.unsqueeze(-1)
+        fm_trans = ((d_trans_pred - d_trans_ref) ** 2) * w_pow.unsqueeze(-1)
         L_fm_rigid = (fm_rot.sum() + fm_trans.sum()) / (w_pow.sum() + 1e-8)
 
         # Background stability
