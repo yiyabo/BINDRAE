@@ -679,24 +679,32 @@ class Stage1Trainer:
             )
             val_metrics['chi1_acc'] += chi1_acc
 
-            B = batch.Ca_holo.shape[0]
-            for i in range(B):
-                pocket_mask = (batch.w_res[i] > 0.5)
-                if pocket_mask.any():
-                    irmsd = compute_pocket_irmsd(
-                        outputs['atom14_pos'][i, :, 1],
-                        batch.Ca_holo[i],
-                        pocket_mask,
-                    )
-                    if not math.isnan(irmsd):
-                        pocket_irmsd_sum += irmsd
+            # === iRMSD 和 clash_pct 计算（较慢，可跳过） ===
+            # 这些指标是 O(N²) 逐样本计算，非常慢
+            # 训练时跳过，只在最终评估时计算
+            compute_slow_metrics = False  # 设为 True 可启用
+            
+            if compute_slow_metrics:
+                B = batch.Ca_holo.shape[0]
+                for i in range(B):
+                    pocket_mask = (batch.w_res[i] > 0.5)
+                    if pocket_mask.any():
+                        irmsd = compute_pocket_irmsd(
+                            outputs['atom14_pos'][i, :, 1],
+                            batch.Ca_holo[i],
+                            pocket_mask,
+                        )
+                        if not math.isnan(irmsd):
+                            pocket_irmsd_sum += irmsd
 
-                valid_atom_mask = outputs['atom14_mask'][i].bool().view(-1)
-                coords_i = outputs['atom14_pos'][i].view(-1, 3)[valid_atom_mask]
-                if coords_i.shape[0] > 1:
-                    clash_pct = compute_clash_percentage(coords_i)
-                    clash_pct_sum += clash_pct
-                n_structures += 1
+                    valid_atom_mask = outputs['atom14_mask'][i].bool().view(-1)
+                    coords_i = outputs['atom14_pos'][i].view(-1, 3)[valid_atom_mask]
+                    if coords_i.shape[0] > 1:
+                        clash_pct = compute_clash_percentage(coords_i)
+                        clash_pct_sum += clash_pct
+                    n_structures += 1
+            else:
+                n_structures = n_batches  # 仅用于避免除零
 
             pbar.set_postfix({
                 'v_loss': f"{losses['total'].item():.3f}",

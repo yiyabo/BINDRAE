@@ -19,7 +19,8 @@ from torch.utils.data import Dataset
 from Bio.PDB import PDBParser
 
 # Add project root
-project_root = Path(__file__).resolve().parent.parent.parent.parent
+_current_file = Path(__file__).resolve()
+project_root = _current_file.parents[3]
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
