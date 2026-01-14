@@ -300,7 +300,7 @@ class ApoHoloTripletDataset(Dataset):
                     valid_set = set(line.strip() for line in f if line.strip())
                 self.samples = [s for s in self.samples if s.get('id', '') in valid_set]
                 filtered_count = original_count - len(self.samples)
-                print(f"  Filtered {filtered_count} invalid samples using {valid_path.name}")
+                print(f"  Filtered {filtered_count} samples (not in {valid_path.name})")
             else:
                 print(f"  [WARN] valid_samples_file not found: {valid_path}")
         

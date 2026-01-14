@@ -13,6 +13,9 @@ from typing import Optional
 class TrainingConfig:
     """Stage-1训练配置"""
     
+    # 模型规模
+    model_size: str = 'small'  # 'small', 'medium', 'large', 'wide_shallow'
+    
     # 数据
     data_dir: str = 'data/apo_holo_triplets'
     batch_size: int = 4

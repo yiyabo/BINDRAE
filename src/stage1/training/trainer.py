@@ -97,8 +97,21 @@ class Stage1Trainer:
 
         # ========== 创建模型 ==========
         if self.is_main_process:
-            print("Creating model...")
-        model_config = Stage1ModelConfig()
+            print(f"Creating model (size={config.model_size})...")
+        
+        # 根据配置选择模型规模
+        model_size = config.model_size.lower()
+        if model_size == 'small':
+            model_config = Stage1ModelConfig.small()
+        elif model_size == 'medium':
+            model_config = Stage1ModelConfig.medium()
+        elif model_size == 'large':
+            model_config = Stage1ModelConfig.large()
+        elif model_size == 'wide_shallow':
+            model_config = Stage1ModelConfig.wide_shallow()
+        else:
+            raise ValueError(f"Unknown model_size: {model_size}. Use 'small', 'medium', 'large', or 'wide_shallow'")
+        
         self.model = Stage1Model(model_config).to(self.device)
 
         # DDP 包装模型

@@ -37,6 +37,11 @@ def parse_args():
     """解析命令行参数"""
     parser = argparse.ArgumentParser(description='Stage-1 训练')
     
+    # 模型规模
+    parser.add_argument('--model_size', type=str, default='small',
+                       choices=['small', 'medium', 'large', 'wide_shallow'],
+                       help='模型规模: small(5M), medium(15M), large(40M), wide_shallow(25M)')
+    
     # 数据
     parser.add_argument('--data_dir', type=str, default='data/apo_holo_triplets',
                        help='数据目录')
@@ -104,6 +109,7 @@ def main():
     
     # 创建配置
     config = TrainingConfig(
+        model_size=args.model_size,
         data_dir=args.data_dir,
         batch_size=args.batch_size,
         max_n_res=args.max_n_res,
@@ -128,6 +134,7 @@ def main():
         print(f"BINDRAE Stage-1 训练")
         print(f"{'='*80}")
         print(f"\n配置:")
+        print(f"  - 模型规模: {config.model_size}")
         print(f"  - 数据目录: {config.data_dir}")
         print(f"  - 批大小: {config.batch_size}")
         print(f"  - 最大残基数: {config.max_n_res}")

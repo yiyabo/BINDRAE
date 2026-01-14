@@ -72,6 +72,57 @@ class Stage1ModelConfig:
     
     # 通用
     dropout: float = 0.1
+    
+    @classmethod
+    def small(cls) -> 'Stage1ModelConfig':
+        """小型配置 (原始配置) - 约5M参数"""
+        return cls()
+    
+    @classmethod
+    def medium(cls) -> 'Stage1ModelConfig':
+        """中型配置 - 约15M参数，对齐AlphaFold深度"""
+        return cls(
+            c_s=384,
+            c_p=128,
+            c_hidden=192,
+            no_heads=12,
+            depth=8,  # AlphaFold IPA 深度
+            no_qk_points=8,
+            no_v_points=12,
+            torsion_hidden=192,
+        )
+    
+    @classmethod
+    def large(cls) -> 'Stage1ModelConfig':
+        """大型配置 - 约40M参数，宽而深"""
+        return cls(
+            c_s=512,
+            c_p=192,
+            c_hidden=256,
+            no_heads=16,
+            depth=8,
+            no_qk_points=12,
+            no_v_points=16,
+            d_lig=96,
+            num_heads_cross=12,
+            torsion_hidden=256,
+        )
+    
+    @classmethod
+    def wide_shallow(cls) -> 'Stage1ModelConfig':
+        """宽而浅配置 (RAE风格) - 约25M参数"""
+        return cls(
+            c_s=768,  # 2x 宽度
+            c_p=256,
+            c_hidden=256,
+            no_heads=12,
+            depth=4,  # 保持较浅
+            no_qk_points=8,
+            no_v_points=12,
+            d_lig=128,
+            num_heads_cross=12,
+            torsion_hidden=256,
+        )
 
 
 # ============================================================================

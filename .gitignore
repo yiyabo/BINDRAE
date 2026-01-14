@@ -51,3 +51,6 @@ tmp
 .env
 .env.localtodo_stage2.md
 .aider*
+
+# reference
+reference/
