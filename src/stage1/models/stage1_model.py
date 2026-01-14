@@ -80,11 +80,15 @@ class Stage1ModelConfig:
     
     @classmethod
     def medium(cls) -> 'Stage1ModelConfig':
-        """中型配置 - 约15M参数，对齐AlphaFold深度"""
+        """中型配置 - 约15M参数，对齐AlphaFold深度
+        
+        Note: headdim_eff = c_hidden + 36 + z_factor_rank*32 <= 256
+              128 + 36 + 2*32 = 228 ✓
+        """
         return cls(
             c_s=384,
             c_p=128,
-            c_hidden=192,
+            c_hidden=128,  # 保持128以满足FlashAttn限制
             no_heads=12,
             depth=8,  # AlphaFold IPA 深度
             no_qk_points=8,
@@ -94,11 +98,16 @@ class Stage1ModelConfig:
     
     @classmethod
     def large(cls) -> 'Stage1ModelConfig':
-        """大型配置 - 约40M参数，宽而深"""
+        """大型配置 - 约40M参数，宽而深
+        
+        Note: headdim_eff = c_hidden + 36 + z_factor_rank*32 <= 256
+              使用 z_factor_rank=1: 152 + 36 + 32 = 220 ✓
+        """
         return cls(
             c_s=512,
             c_p=192,
-            c_hidden=256,
+            c_hidden=152,  # 限制以满足FlashAttn
+            z_factor_rank=1,  # 降低以允许更大c_hidden
             no_heads=16,
             depth=8,
             no_qk_points=12,
@@ -110,11 +119,16 @@ class Stage1ModelConfig:
     
     @classmethod
     def wide_shallow(cls) -> 'Stage1ModelConfig':
-        """宽而浅配置 (RAE风格) - 约25M参数"""
+        """宽而浅配置 (RAE风格) - 约25M参数
+        
+        Note: headdim_eff = c_hidden + 36 + z_factor_rank*32 <= 256
+              使用 z_factor_rank=1: 152 + 36 + 32 = 220 ✓
+        """
         return cls(
             c_s=768,  # 2x 宽度
             c_p=256,
-            c_hidden=256,
+            c_hidden=152,  # 限制以满足FlashAttn
+            z_factor_rank=1,  # 降低以允许更大c_hidden
             no_heads=12,
             depth=4,  # 保持较浅
             no_qk_points=8,
