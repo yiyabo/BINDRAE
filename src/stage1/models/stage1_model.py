@@ -80,7 +80,7 @@ class Stage1ModelConfig:
     
     @classmethod
     def medium(cls) -> 'Stage1ModelConfig':
-        """中型配置 - 约15M参数，对齐AlphaFold深度
+        """中型配置 - 约10M参数，平衡深度与稳定性
         
         Note: headdim_eff = c_hidden + 36 + z_factor_rank*32 <= 256
               128 + 36 + 2*32 = 228 ✓
@@ -90,7 +90,7 @@ class Stage1ModelConfig:
             c_p=128,
             c_hidden=128,  # 保持128以满足FlashAttn限制
             no_heads=12,
-            depth=8,  # AlphaFold IPA 深度
+            depth=5,  # 从8降到5，更稳定
             no_qk_points=8,
             no_v_points=12,
             torsion_hidden=192,
