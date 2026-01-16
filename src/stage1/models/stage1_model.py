@@ -75,8 +75,28 @@ class Stage1ModelConfig:
     
     @classmethod
     def small(cls) -> 'Stage1ModelConfig':
-        """小型配置 (原始配置) - 约5M参数"""
+        """小型配置 (原始配置) - 约5M参数，depth=3，最稳定"""
         return cls()
+    
+    @classmethod
+    def stable_wide(cls) -> 'Stage1ModelConfig':
+        """稳定宽配置 - 约12M参数，depth=3但更宽
+        
+        保持稳定的3层深度，但增加宽度来提升容量。
+        headdim_eff = 128 + 36 + 2*32 = 228 ✓
+        """
+        return cls(
+            c_s=512,         # 384 → 512
+            c_p=192,         # 128 → 192
+            c_hidden=128,    # 保持128
+            no_heads=12,     # 8 → 12
+            depth=3,         # 保持3层！稳定
+            no_qk_points=8,
+            no_v_points=12,
+            d_lig=96,        # 64 → 96
+            num_heads_cross=12,  # 8 → 12
+            torsion_hidden=192,  # 128 → 192
+        )
     
     @classmethod
     def medium(cls) -> 'Stage1ModelConfig':

@@ -103,6 +103,8 @@ class Stage1Trainer:
         model_size = config.model_size.lower()
         if model_size == 'small':
             model_config = Stage1ModelConfig.small()
+        elif model_size == 'stable_wide':
+            model_config = Stage1ModelConfig.stable_wide()
         elif model_size == 'medium':
             model_config = Stage1ModelConfig.medium()
         elif model_size == 'large':
@@ -110,7 +112,7 @@ class Stage1Trainer:
         elif model_size == 'wide_shallow':
             model_config = Stage1ModelConfig.wide_shallow()
         else:
-            raise ValueError(f"Unknown model_size: {model_size}. Use 'small', 'medium', 'large', or 'wide_shallow'")
+            raise ValueError(f"Unknown model_size: {model_size}. Use 'small', 'stable_wide', 'medium', 'large', or 'wide_shallow'")
         
         self.model = Stage1Model(model_config).to(self.device)
 

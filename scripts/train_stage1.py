@@ -39,8 +39,8 @@ def parse_args():
     
     # 模型规模
     parser.add_argument('--model_size', type=str, default='small',
-                       choices=['small', 'medium', 'large', 'wide_shallow'],
-                       help='模型规模: small(5M), medium(15M), large(40M), wide_shallow(25M)')
+                       choices=['small', 'stable_wide', 'medium', 'large', 'wide_shallow'],
+                       help='模型规模: small(5M), stable_wide(12M,推荐), medium(10M), large(40M), wide_shallow(25M)')
     
     # 数据
     parser.add_argument('--data_dir', type=str, default='data/apo_holo_triplets',
