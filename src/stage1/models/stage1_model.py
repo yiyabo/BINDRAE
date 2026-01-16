@@ -80,23 +80,24 @@ class Stage1ModelConfig:
     
     @classmethod
     def stable_wide(cls) -> 'Stage1ModelConfig':
-        """稳定宽配置 - 约10M参数，depth=3但更宽
+        """稳定增强配置 - 约7M参数
         
-        保持稳定的3层深度，只增加节点维度和输出头。
-        保持 c_p=128, c_hidden=128 以满足 FlashIPA 限制。
-        headdim_eff = 128 + 36 + 2*32 = 228 ✓
+        完全保持 small 的 IPA 配置，只增强输出部分。
+        这是最稳定的增强方式。
         """
         return cls(
-            c_s=512,         # 384 → 512 (只增加节点表示)
-            c_p=128,         # 保持128！不改
-            c_hidden=128,    # 保持128！不改
-            no_heads=8,      # 保持8！不改
-            depth=3,         # 保持3层！稳定
+            # 完全保持 small 的 IPA 配置
+            c_s=384,
+            c_p=128,
+            c_hidden=128,
+            no_heads=8,
+            depth=3,
             no_qk_points=8,
             no_v_points=12,
-            d_lig=96,        # 64 → 96
-            num_heads_cross=12,  # 8 → 12
-            torsion_hidden=256,  # 128 → 256 (增加输出头容量)
+            # 只增强这些不影响 IPA 的部分
+            d_lig=96,            # 64 → 96 (配体编码)
+            num_heads_cross=12,  # 8 → 12 (交叉注意力)
+            torsion_hidden=256,  # 128 → 256 (输出头)
         )
     
     @classmethod
