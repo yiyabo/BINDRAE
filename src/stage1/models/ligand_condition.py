@@ -6,16 +6,19 @@
 2. Cross-Attention（蛋白Q × 配体KV）
 3. 残基级FiLM调制（gamma/beta）
 4. 门控warmup（λ: 0→1）
+5. [NEW] 增强配体编码器（RBF距离 + 自注意力）
 
 Author: BINDRAE Team
 Date: 2025-10-28
+Updated: 2026-01-18 - 添加 EnhancedLigandEncoder
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 LIGAND_TYPE_DIM = 20
 
@@ -34,12 +37,21 @@ class LigandConditionerConfig:
         num_heads: Cross-Attention头数
         dropout: Dropout概率
         warmup_steps: 门控λ的warmup步数
+        use_enhanced_encoder: 是否使用增强配体编码器
+        enhanced_num_layers: 增强编码器自注意力层数
+        enhanced_num_heads: 增强编码器自注意力头数
+        num_rbf: RBF距离编码核数量
     """
     c_s: int = 384
     d_lig: int = 64
     num_heads: int = 8
     dropout: float = 0.1
     warmup_steps: int = 2000
+    # 增强编码器配置
+    use_enhanced_encoder: bool = False
+    enhanced_num_layers: int = 2
+    enhanced_num_heads: int = 4
+    num_rbf: int = 16
 
 
 # ============================================================================
@@ -50,7 +62,7 @@ class LigandTokenEmbedding(nn.Module):
     """
     配体Token嵌入层
     
-    输入: concat([xyz(3), types(12)]) = 15维
+    输入: concat([xyz(3), types(20)]) = 23维
     输出: d_lig维嵌入
     """
     
@@ -64,7 +76,7 @@ class LigandTokenEmbedding(nn.Module):
         
         self.d_lig = d_lig
         
-        # 嵌入网络: 15维 (3+12) → d_lig维
+        # 嵌入网络: 23维 (3+20) → d_lig维
         self.embed = nn.Sequential(
             nn.Linear(3 + LIGAND_TYPE_DIM, d_lig),
             nn.LayerNorm(d_lig),
@@ -75,22 +87,247 @@ class LigandTokenEmbedding(nn.Module):
     
     def forward(self, 
                 lig_points: torch.Tensor,
-                lig_types: torch.Tensor) -> torch.Tensor:
+                lig_types: torch.Tensor,
+                lig_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         配体Token嵌入
         
         Args:
             lig_points: [B, M, 3] 配体坐标（重原子+探针）
-            lig_types: [B, M, 12] 配体类型
+            lig_types: [B, M, 20] 配体类型
+            lig_mask: [B, M] 配体掩码（可选，兼容增强编码器接口）
             
         Returns:
             lig_embed: [B, M, d_lig] 配体嵌入
         """
         # 拼接坐标和类型
-        lig_features = torch.cat([lig_points, lig_types], dim=-1)  # [B, M, 15] (3+12)
+        lig_features = torch.cat([lig_points, lig_types], dim=-1)  # [B, M, 23] (3+20)
         
         # 嵌入
         lig_embed = self.embed(lig_features)  # [B, M, d_lig]
+        
+        return lig_embed
+
+
+# ============================================================================
+# RBF 距离编码
+# ============================================================================
+
+class RBFDistanceEncoding(nn.Module):
+    """
+    RBF (Radial Basis Function) 距离编码
+    
+    将标量距离编码为高斯核特征向量。
+    
+    公式: φ_k(d) = exp(-γ * (d - μ_k)²)
+    
+    其中 μ_k 是等间距的中心点，γ 控制宽度。
+    """
+    
+    def __init__(self, 
+                 num_rbf: int = 16, 
+                 d_min: float = 0.0, 
+                 d_max: float = 20.0,
+                 trainable: bool = True):
+        """
+        Args:
+            num_rbf: RBF核数量
+            d_min: 距离最小值
+            d_max: 距离最大值
+            trainable: 中心和宽度是否可训练
+        """
+        super().__init__()
+        
+        self.num_rbf = num_rbf
+        self.d_min = d_min
+        self.d_max = d_max
+        
+        # 初始化等间距中心点
+        centers = torch.linspace(d_min, d_max, num_rbf)
+        
+        # gamma = 1 / (2 * sigma²), 其中 sigma = (d_max - d_min) / (num_rbf - 1)
+        sigma = (d_max - d_min) / (num_rbf - 1) if num_rbf > 1 else 1.0
+        gamma = 1.0 / (2 * sigma ** 2)
+        
+        if trainable:
+            self.centers = nn.Parameter(centers)
+            self.gamma = nn.Parameter(torch.tensor(gamma))
+        else:
+            self.register_buffer('centers', centers)
+            self.register_buffer('gamma', torch.tensor(gamma))
+    
+    def forward(self, distances: torch.Tensor) -> torch.Tensor:
+        """
+        RBF编码
+        
+        Args:
+            distances: [...] 任意形状的距离张量
+            
+        Returns:
+            rbf_features: [..., num_rbf] RBF编码
+        """
+        # 扩展维度以广播
+        d = distances.unsqueeze(-1)  # [..., 1]
+        centers = self.centers.view(*([1] * (d.ndim - 1)), -1)  # [1, ..., num_rbf]
+        
+        # 高斯核: exp(-γ * (d - μ)²)
+        rbf = torch.exp(-self.gamma * (d - centers) ** 2)
+        
+        return rbf
+
+
+# ============================================================================
+# 增强配体编码器
+# ============================================================================
+
+class EnhancedLigandEncoder(nn.Module):
+    """
+    增强版配体编码器
+    
+    改进点：
+    1. RBF距离编码：捕捉配体内原子间距离关系
+    2. 自注意力：让配体原子相互交互
+    
+    相比原始 LigandTokenEmbedding 的简单 MLP，
+    该编码器能更好地理解配体的3D几何结构。
+    """
+    
+    def __init__(self, 
+                 d_lig: int = 128, 
+                 num_heads: int = 4, 
+                 num_layers: int = 2,
+                 num_rbf: int = 16,
+                 dropout: float = 0.1):
+        """
+        Args:
+            d_lig: 配体嵌入维度
+            num_heads: 自注意力头数
+            num_layers: 自注意力层数
+            num_rbf: RBF核数量
+            dropout: Dropout概率
+        """
+        super().__init__()
+        
+        self.d_lig = d_lig
+        self.num_rbf = num_rbf
+        
+        # 1. 原子特征嵌入 (坐标 + 类型)
+        # 输入: xyz(3) + types(20) = 23维
+        self.atom_embed = nn.Sequential(
+            nn.Linear(3 + LIGAND_TYPE_DIM, d_lig),
+            nn.LayerNorm(d_lig),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_lig, d_lig)
+        )
+        
+        # 2. RBF 距离编码
+        self.dist_rbf = RBFDistanceEncoding(
+            num_rbf=num_rbf,
+            d_min=0.0,
+            d_max=20.0,  # 配体内原子距离通常 < 20Å
+            trainable=True
+        )
+        
+        # 3. 距离特征投影（加到原子特征上）
+        self.dist_proj = nn.Sequential(
+            nn.Linear(num_rbf, d_lig),
+            nn.LayerNorm(d_lig),
+            nn.GELU(),
+        )
+        
+        # 4. 配体内自注意力（核心改进！）
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_lig,
+            nhead=num_heads,
+            dim_feedforward=d_lig * 4,
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True  # Pre-LN for stability
+        )
+        self.self_attn = nn.TransformerEncoder(
+            encoder_layer, 
+            num_layers=num_layers
+        )
+        
+        # 5. 输出层归一化
+        self.out_norm = nn.LayerNorm(d_lig)
+        
+        print(f"✓ EnhancedLigandEncoder 初始化完成")
+        print(f"  - d_lig: {d_lig}, num_rbf: {num_rbf}")
+        print(f"  - self_attn: {num_layers} layers, {num_heads} heads")
+    
+    def _compute_pairwise_distances(self, points: torch.Tensor) -> torch.Tensor:
+        """
+        计算配体原子间的成对距离
+        
+        Args:
+            points: [B, M, 3] 配体坐标
+            
+        Returns:
+            distances: [B, M, M] 成对距离矩阵
+        """
+        # 使用欧氏距离
+        diff = points.unsqueeze(2) - points.unsqueeze(1)  # [B, M, M, 3]
+        distances = torch.sqrt((diff ** 2).sum(dim=-1) + 1e-8)  # [B, M, M]
+        return distances
+    
+    def forward(self,
+                lig_points: torch.Tensor,
+                lig_types: torch.Tensor,
+                lig_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        增强配体编码
+        
+        Args:
+            lig_points: [B, M, 3] 配体坐标
+            lig_types: [B, M, 20] 配体类型
+            lig_mask: [B, M] 配体掩码
+            
+        Returns:
+            lig_embed: [B, M, d_lig] 配体嵌入
+        """
+        B, M, _ = lig_points.shape
+        
+        # 1. 原子特征嵌入
+        lig_features = torch.cat([lig_points, lig_types], dim=-1)  # [B, M, 23]
+        atom_feat = self.atom_embed(lig_features)  # [B, M, d_lig]
+        
+        # 2. 计算成对距离并编码
+        distances = self._compute_pairwise_distances(lig_points)  # [B, M, M]
+        dist_rbf = self.dist_rbf(distances)  # [B, M, M, num_rbf]
+        
+        # 3. 聚合距离信息：对每个原子，求其与其他原子的平均距离特征
+        if lig_mask is not None:
+            # 扩展掩码 [B, M] -> [B, M, M]
+            pair_mask = lig_mask.unsqueeze(1) & lig_mask.unsqueeze(2)  # [B, M, M]
+            dist_rbf = dist_rbf * pair_mask.unsqueeze(-1).float()
+            
+            # 加权平均（避免除零）
+            mask_sum = pair_mask.float().sum(dim=-1, keepdim=True).clamp(min=1)  # [B, M, 1]
+            dist_agg = dist_rbf.sum(dim=2) / mask_sum  # [B, M, num_rbf]
+        else:
+            dist_agg = dist_rbf.mean(dim=2)  # [B, M, num_rbf]
+        
+        # 4. 投影距离特征并融合
+        dist_feat = self.dist_proj(dist_agg)  # [B, M, d_lig]
+        atom_feat = atom_feat + dist_feat  # 残差融合
+        
+        # 5. 自注意力（配体原子交互）
+        if lig_mask is not None:
+            # TransformerEncoder期望 True 表示需要 mask 的位置
+            src_key_padding_mask = ~lig_mask
+        else:
+            src_key_padding_mask = None
+        
+        atom_feat = self.self_attn(
+            atom_feat, 
+            src_key_padding_mask=src_key_padding_mask
+        )  # [B, M, d_lig]
+        
+        # 6. 输出归一化
+        lig_embed = self.out_norm(atom_feat)
         
         return lig_embed
 
@@ -290,6 +527,10 @@ class LigandConditioner(nn.Module):
         配体Token嵌入 → Cross-Attention → FiLM调制
         
     支持门控warmup（训练初期λ=0，逐渐到λ=1）
+    
+    支持两种配体编码器:
+        - LigandTokenEmbedding: 简单2层MLP（默认）
+        - EnhancedLigandEncoder: RBF距离 + 自注意力（推荐）
     """
     
     def __init__(self, config: LigandConditionerConfig):
@@ -301,11 +542,22 @@ class LigandConditioner(nn.Module):
         
         self.config = config
         
-        # 1. 配体Token嵌入
-        self.ligand_embed = LigandTokenEmbedding(
-            d_lig=config.d_lig,
-            dropout=config.dropout
-        )
+        # 1. 配体Token嵌入（支持增强版）
+        if config.use_enhanced_encoder:
+            self.ligand_embed = EnhancedLigandEncoder(
+                d_lig=config.d_lig,
+                num_heads=config.enhanced_num_heads,
+                num_layers=config.enhanced_num_layers,
+                num_rbf=config.num_rbf,
+                dropout=config.dropout
+            )
+            print(f"  Using EnhancedLigandEncoder")
+        else:
+            self.ligand_embed = LigandTokenEmbedding(
+                d_lig=config.d_lig,
+                dropout=config.dropout
+            )
+            print(f"  Using LigandTokenEmbedding (basic)")
         
         # 2. Cross-Attention
         self.cross_attn = ProteinLigandCrossAttention(
@@ -351,7 +603,7 @@ class LigandConditioner(nn.Module):
         Args:
             protein_features: [B, N, c_s] 蛋白节点表示
             lig_points: [B, M, 3] 配体坐标
-            lig_types: [B, M, 12] 配体类型
+            lig_types: [B, M, 20] 配体类型
             protein_mask: [B, N] 蛋白掩码
             ligand_mask: [B, M] 配体掩码
             gate_lambda: 门控系数（可选，优先于current_step）
@@ -360,8 +612,8 @@ class LigandConditioner(nn.Module):
         Returns:
             conditioned_features: [B, N, c_s] 配体条件化后的特征
         """
-        # 1. 配体Token嵌入
-        lig_embed = self.ligand_embed(lig_points, lig_types)  # [B, M, d_lig]
+        # 1. 配体Token嵌入（传递mask给增强编码器）
+        lig_embed = self.ligand_embed(lig_points, lig_types, ligand_mask)  # [B, M, d_lig]
         
         # 2. Cross-Attention
         cross_features = self.cross_attn(
@@ -389,6 +641,10 @@ def create_ligand_conditioner(c_s: int = 384,
                               d_lig: int = 64,
                               num_heads: int = 8,
                               warmup_steps: int = 2000,
+                              use_enhanced_encoder: bool = False,
+                              enhanced_num_layers: int = 2,
+                              enhanced_num_heads: int = 4,
+                              num_rbf: int = 16,
                               **kwargs) -> LigandConditioner:
     """
     创建配体条件化模块
@@ -396,23 +652,35 @@ def create_ligand_conditioner(c_s: int = 384,
     Args:
         c_s: 蛋白节点维度
         d_lig: 配体嵌入维度
-        num_heads: 注意力头数
+        num_heads: Cross-Attention注意力头数
         warmup_steps: 门控warmup步数
+        use_enhanced_encoder: 是否使用增强编码器
+        enhanced_num_layers: 增强编码器自注意力层数
+        enhanced_num_heads: 增强编码器自注意力头数
+        num_rbf: RBF核数量
         **kwargs: 其他配置参数
         
     Returns:
         LigandConditioner实例
         
     Example:
+        >>> # 基础版
         >>> conditioner = create_ligand_conditioner(c_s=384, d_lig=64)
-        >>> s_cond = conditioner(s, lig_points, lig_types, p_mask, l_mask, 
-        ...                      current_step=1000)
+        
+        >>> # 增强版
+        >>> conditioner = create_ligand_conditioner(
+        ...     c_s=384, d_lig=128, use_enhanced_encoder=True
+        ... )
     """
     config = LigandConditionerConfig(
         c_s=c_s,
         d_lig=d_lig,
         num_heads=num_heads,
         warmup_steps=warmup_steps,
+        use_enhanced_encoder=use_enhanced_encoder,
+        enhanced_num_layers=enhanced_num_layers,
+        enhanced_num_heads=enhanced_num_heads,
+        num_rbf=num_rbf,
         **kwargs
     )
     return LigandConditioner(config)

@@ -65,6 +65,11 @@ class Stage1ModelConfig:
     d_lig: int = 64
     num_heads_cross: int = 8
     warmup_steps: int = 2000
+    # 增强配体编码器
+    use_enhanced_ligand: bool = False
+    enhanced_ligand_layers: int = 2
+    enhanced_ligand_heads: int = 4
+    ligand_num_rbf: int = 16
     
     # Chi Head
     torsion_hidden: int = 128
@@ -159,6 +164,37 @@ class Stage1ModelConfig:
             num_heads_cross=12,
             torsion_hidden=256,
         )
+    
+    @classmethod
+    def enhanced_ligand(cls) -> 'Stage1ModelConfig':
+        """增强配体编码器配置 - 基于 stable_wide + 增强配体编码
+        
+        核心改进：
+        - 使用 EnhancedLigandEncoder (RBF距离 + 自注意力)
+        - d_lig: 64 → 128 (更大配体表示)
+        - 2层自注意力，4头
+        
+        预期效果: Chi1 +5-10%
+        """
+        return cls(
+            # 保持 stable_wide 的 IPA 配置
+            c_s=384,
+            c_p=128,
+            c_hidden=128,
+            no_heads=8,
+            depth=3,
+            no_qk_points=8,
+            no_v_points=12,
+            # 增强配体编码器（核心改进）
+            d_lig=128,  # 64 → 128
+            num_heads_cross=12,
+            use_enhanced_ligand=True,  # 启用增强编码器
+            enhanced_ligand_layers=2,
+            enhanced_ligand_heads=4,
+            ligand_num_rbf=16,
+            # 输出头
+            torsion_hidden=256,
+        )
 
 
 # ============================================================================
@@ -219,6 +255,11 @@ class Stage1Model(nn.Module):
             num_heads=config.num_heads_cross,
             dropout=config.dropout,
             warmup_steps=config.warmup_steps,
+            # 增强编码器配置
+            use_enhanced_encoder=config.use_enhanced_ligand,
+            enhanced_num_layers=config.enhanced_ligand_layers,
+            enhanced_num_heads=config.enhanced_ligand_heads,
+            num_rbf=config.ligand_num_rbf,
         )
         self.ligand_conditioner = LigandConditioner(ligand_config)
         

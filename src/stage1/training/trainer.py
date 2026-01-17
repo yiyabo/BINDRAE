@@ -111,8 +111,10 @@ class Stage1Trainer:
             model_config = Stage1ModelConfig.large()
         elif model_size == 'wide_shallow':
             model_config = Stage1ModelConfig.wide_shallow()
+        elif model_size == 'enhanced_ligand':
+            model_config = Stage1ModelConfig.enhanced_ligand()
         else:
-            raise ValueError(f"Unknown model_size: {model_size}. Use 'small', 'stable_wide', 'medium', 'large', or 'wide_shallow'")
+            raise ValueError(f"Unknown model_size: {model_size}. Use 'small', 'stable_wide', 'enhanced_ligand', 'medium', 'large', or 'wide_shallow'")
         
         self.model = Stage1Model(model_config).to(self.device)
 
