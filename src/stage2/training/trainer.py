@@ -5,7 +5,10 @@ from types import SimpleNamespace
 from typing import Dict, List, Tuple
 
 import torch
+import torch.distributed as dist
 from torch.cuda.amp import autocast, GradScaler
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 import sys
@@ -42,11 +45,26 @@ class Stage2Trainer:
 
     def __init__(self, config: TrainingConfig):
         self.config = config
-        self.device = torch.device(config.device)
+        self.distributed = config.distributed
+        self.local_rank = 0
+        self.world_size = 1
+        self.is_main_process = True
 
-        torch.manual_seed(config.seed)
+        if self.distributed:
+            dist.init_process_group(backend='nccl')
+            self.local_rank = int(os.environ.get('LOCAL_RANK', 0))
+            self.world_size = dist.get_world_size()
+            self.is_main_process = (self.local_rank == 0)
+            torch.cuda.set_device(self.local_rank)
+            self.device = torch.device(f'cuda:{self.local_rank}')
+            if self.is_main_process:
+                print(f"[DDP] Initialized: world_size={self.world_size}, local_rank={self.local_rank}")
+        else:
+            self.device = torch.device(config.device)
+
+        torch.manual_seed(config.seed + self.local_rank)
         if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(config.seed)
+            torch.cuda.manual_seed_all(config.seed + self.local_rank)
 
         if config.use_nma and config.nma_dim <= 0:
             raise ValueError("use_nma=True but nma_dim <= 0")
@@ -69,12 +87,13 @@ class Stage2Trainer:
         self.fk_module = create_openfold_fk().to(self.device)
 
         # Data
-        print("Creating dataloaders...")
+        if self.is_main_process:
+            print("Creating dataloaders...")
         self.train_loader = create_stage2_dataloader(
             config.data_dir,
             split='train',
             batch_size=config.batch_size,
-            shuffle=True,
+            shuffle=not self.distributed,
             num_workers=config.num_workers,
             require_nma=config.use_nma,
             valid_samples_file=config.valid_samples_file,
@@ -89,10 +108,23 @@ class Stage2Trainer:
             valid_samples_file=config.val_samples_file,
         )
 
+        # Wrap model with DDP
+        if self.distributed:
+            self.model = DDP(
+                self.model,
+                device_ids=[self.local_rank],
+                output_device=self.local_rank,
+                find_unused_parameters=True,
+            )
+            if self.is_main_process:
+                print(f"[DDP] Model wrapped with DistributedDataParallel")
+
         # Optimizer
-        print("Creating optimizer...")
+        if self.is_main_process:
+            print("Creating optimizer...")
+        model_params = self.model.module.parameters() if self.distributed else self.model.parameters()
         self.optimizer = torch.optim.AdamW(
-            self.model.parameters(),
+            model_params,
             lr=config.lr,
             weight_decay=config.weight_decay,
         )
@@ -111,14 +143,17 @@ class Stage2Trainer:
         self.best_val_metric = float('inf')
         self.patience_counter = 0
 
-        Path(config.save_dir).mkdir(parents=True, exist_ok=True)
-        Path(config.log_dir).mkdir(parents=True, exist_ok=True)
+        if self.is_main_process:
+            Path(config.save_dir).mkdir(parents=True, exist_ok=True)
+            Path(config.log_dir).mkdir(parents=True, exist_ok=True)
 
-        print("✓ Stage-2 Trainer initialized")
-        print(f"  - params: {sum(p.numel() for p in self.model.parameters()):,}")
-        print(f"  - train samples: {len(self.train_loader.dataset)}")
-        print(f"  - val samples: {len(self.val_loader.dataset)}")
-        print(f"  - total steps: {total_steps:,}")
+            print("✓ Stage-2 Trainer initialized")
+            print(f"  - params: {sum(p.numel() for p in self.model.parameters()):,}")
+            print(f"  - train samples: {len(self.train_loader.dataset)}")
+            print(f"  - val samples: {len(self.val_loader.dataset)}")
+            print(f"  - total steps: {total_steps:,}")
+            print(f"  - world_size: {self.world_size}")
+            print(f"  - effective batch_size: {config.batch_size * self.world_size}")
 
     def _load_stage1_model(self, ckpt_path: str) -> Stage1Model:
         model_config = Stage1ModelConfig()
@@ -222,6 +257,11 @@ class Stage2Trainer:
 
         d_rot_ref = xi[..., :3] * dgamma
         d_trans_ref = xi[..., 3:] * dgamma
+
+        # Clip reference velocities to prevent explosion
+        d_chi_ref = d_chi_ref.clamp(min=-5.0, max=5.0)
+        d_rot_ref = d_rot_ref.clamp(min=-5.0, max=5.0)
+        d_trans_ref = d_trans_ref.clamp(min=-5.0, max=5.0)
 
         return chi_ref, rigids_ref, d_chi_ref, d_rot_ref, d_trans_ref, rigids_apo, rigids_holo
 
@@ -373,18 +413,8 @@ class Stage2Trainer:
             (bg_w.unsqueeze(-1) * (d_chi_pred ** 2) * chi_mask).sum()
         ) / (bg_w.sum() + 1e-8)
 
-        # Integrate path for geometry
-        rigids_list, chi_list, t_list = self.integrate_path(
-            batch,
-            rigids_apo,
-            batch.torsion_apo[..., 3:7],
-            stage1_chi=stage1_chi,
-            stage1_rigids=stage1_rigids,
-        )
-
-        # Select geometry steps
-        n_geom = min(self.config.n_geom_steps, len(t_list))
-        geom_indices = torch.linspace(0, len(t_list) - 1, steps=n_geom).long().tolist()
+        # Integrate path for geometry (only every N steps for performance)
+        compute_geom = (self.global_step % self.config.geom_loss_every_n_steps == 0)
 
         L_smooth = chi_ref.new_tensor(0.0)
         L_clash = chi_ref.new_tensor(0.0)
@@ -394,153 +424,171 @@ class Stage2Trainer:
 
         contact_scores = []
 
-        # Precompute holo atom14 for endpoint FAPE
-        torsion_holo = batch.torsion_holo
-        phi_psi_omega_holo = torsion_holo[..., :3]
-        phi_psi_omega_sincos = torch.stack(
-            [torch.sin(phi_psi_omega_holo), torch.cos(phi_psi_omega_holo)], dim=-1
-        )
-        chi_holo = torsion_holo[..., 3:7]
-        chi_holo_sincos = torch.stack([torch.sin(chi_holo), torch.cos(chi_holo)], dim=-1)
-        torsions_holo_sincos = torch.cat([phi_psi_omega_sincos, chi_holo_sincos], dim=2)
-        atom14_holo = self.fk_module(torsions_holo_sincos, rigids_holo, batch.aatype)
+        # Initialize endpoint losses to zero
+        L_end = chi_ref.new_tensor(0.0)
+        L_end_chi = chi_ref.new_tensor(0.0)
+        L_end_fape = chi_ref.new_tensor(0.0)
+        L_end_rigid = chi_ref.new_tensor(0.0)
 
-        # Geometry losses along path
-        prev_R, prev_t = None, None
-        prev_chi = None
-        prev_C = None
-
-        phi_psi_omega = batch.torsion_apo[..., :3]
-        phi_psi_omega_sincos = torch.stack(
-            [torch.sin(phi_psi_omega), torch.cos(phi_psi_omega)], dim=-1
-        )
-
-        for idx in geom_indices:
-            rigids_t = rigids_list[idx]
-            chi_t = chi_list[idx]
-            t_val = t_list[idx]
-
-            # FK decode
-            chi_sincos = torch.stack([torch.sin(chi_t), torch.cos(chi_t)], dim=-1)
-            torsions_sincos = torch.cat([phi_psi_omega_sincos, chi_sincos], dim=2)
-            atom14 = self.fk_module(torsions_sincos, rigids_t, batch.aatype)
-
-            atom14_pos = atom14['atom14_pos']
-            atom14_mask = atom14['atom14_mask'].bool()
-
-            # Smoothness (between consecutive geometry steps)
-            R_t, t_t = self._rigid_to_rt(rigids_t)
-            if prev_R is not None:
-                R_inv, t_inv = rigid_inverse(prev_R, prev_t)
-                R_delta, t_delta = rigid_compose(R_inv, t_inv, R_t, t_t)
-                xi_delta = se3_log(R_delta, t_delta)
-                L_smooth = L_smooth + ((xi_delta ** 2).sum(dim=-1) * w_pow).sum() / (w_pow.sum() + 1e-8)
-
-                d_chi = wrap_to_pi(chi_t - prev_chi)
-                chi_smooth = ((d_chi ** 2) * chi_mask) * w_pow.unsqueeze(-1)
-                chi_smooth_denom = (chi_mask * w_pow.unsqueeze(-1)).sum().clamp(min=1e-8)
-                L_smooth = L_smooth + chi_smooth.sum() / chi_smooth_denom
-
-            prev_R, prev_t = R_t, t_t
-            prev_chi = chi_t
-
-            # Clash (mask invalid atoms to avoid padded clashes)
-            valid_atom = atom14_mask & batch.node_mask.unsqueeze(-1)
-            atom14_pos_masked = atom14_pos.masked_fill(~valid_atom.unsqueeze(-1), 1e6)
-            flat_atoms = atom14_pos_masked.reshape(atom14_pos.shape[0], -1, 3)
-            L_clash = L_clash + clash_penalty(flat_atoms, clash_threshold=2.2)
-
-            # Peptide geometry
-            L_pep = L_pep + compute_peptide_loss(
-                atom14_pos,
-                atom14_mask,
-                batch.node_mask,
-                bond_len=self.config.pep_bond_len,
-                angle_cacn=self.config.pep_angle_cacn,
-                angle_cnca=self.config.pep_angle_cnca,
-                angle_weight=self.config.pep_angle_weight,
+        if compute_geom:
+            rigids_list, chi_list, t_list = self.integrate_path(
+                batch,
+                rigids_apo,
+                batch.torsion_apo[..., 3:7],
+                stage1_chi=stage1_chi,
+                stage1_rigids=stage1_rigids,
             )
 
-            # Contact score
-            C_t = compute_contact_score(
-                atom14_pos,
-                valid_atom,
-                batch.lig_points,
-                batch.lig_mask,
-                w_eff,
-                pocket_threshold=self.config.pocket_threshold,
-                d_c=self.config.contact_d0,
-                tau=self.config.contact_tau,
+            # Select geometry steps
+            n_geom = min(self.config.n_geom_steps, len(t_list))
+            geom_indices = torch.linspace(0, len(t_list) - 1, steps=n_geom).long().tolist()
+
+            # Geometry losses along path
+            prev_R, prev_t = None, None
+            prev_chi = None
+
+            phi_psi_omega = batch.torsion_apo[..., :3]
+            phi_psi_omega_sincos = torch.stack(
+                [torch.sin(phi_psi_omega), torch.cos(phi_psi_omega)], dim=-1
             )
-            contact_scores.append(C_t)
 
-            # Prior (late time)
-            if stage1_chi is not None and t_val >= self.config.t_mid:
-                d_chi_prior = wrap_to_pi(chi_t - stage1_chi)
-                prior_term = ((d_chi_prior ** 2) * chi_mask) * w_pow.unsqueeze(-1)
-                prior_denom = (chi_mask * w_pow.unsqueeze(-1)).sum().clamp(min=1e-8)
-                L_prior = L_prior + prior_term.sum() / prior_denom
+            for idx in geom_indices:
+                rigids_t = rigids_list[idx]
+                chi_t = chi_list[idx]
+                t_val = t_list[idx]
 
+                # FK decode
+                chi_sincos = torch.stack([torch.sin(chi_t), torch.cos(chi_t)], dim=-1)
+                torsions_sincos = torch.cat([phi_psi_omega_sincos, chi_sincos], dim=2)
+                atom14 = self.fk_module(torsions_sincos, rigids_t, batch.aatype)
+
+                atom14_pos = atom14['atom14_pos'].clamp(min=-1000.0, max=1000.0)
+                atom14_mask = atom14['atom14_mask'].bool()
+
+                # Smoothness (between consecutive geometry steps)
                 R_t, t_t = self._rigid_to_rt(rigids_t)
-                R1, t1 = self._rigid_to_rt(stage1_rigids)
-                R_inv, t_inv = rigid_inverse(R_t, t_t)
-                R_delta, t_delta = rigid_compose(R_inv, t_inv, R1, t1)
-                xi_prior = se3_log(R_delta, t_delta)
-                prior_rigid = ((xi_prior ** 2).sum(dim=-1) * w_pow).sum() / (w_pow.sum() + 1e-8)
-                L_prior = L_prior + prior_rigid
+                if prev_R is not None:
+                    R_inv, t_inv = rigid_inverse(prev_R, prev_t)
+                    R_delta, t_delta = rigid_compose(R_inv, t_inv, R_t, t_t)
+                    xi_delta = se3_log(R_delta, t_delta)
+                    L_smooth = L_smooth + ((xi_delta ** 2).sum(dim=-1) * w_pow).sum() / (w_pow.sum() + 1e-8)
 
-        # Contact monotonicity
-        for k in range(len(contact_scores) - 1):
-            delta = contact_scores[k] - contact_scores[k + 1] - self.config.contact_eps
-            L_contact = L_contact + torch.relu(delta).pow(2).mean()
+                    d_chi = wrap_to_pi(chi_t - prev_chi)
+                    chi_smooth = ((d_chi ** 2) * chi_mask) * w_pow.unsqueeze(-1)
+                    chi_smooth_denom = (chi_mask * w_pow.unsqueeze(-1)).sum().clamp(min=1e-8)
+                    L_smooth = L_smooth + chi_smooth.sum() / chi_smooth_denom
 
-        # Endpoint loss
-        rigids_final = rigids_list[-1]
-        chi_final = chi_list[-1]
-        R_final, t_final = self._rigid_to_rt(rigids_final)
-        R_holo, t_holo = self._rigid_to_rt(rigids_holo)
-        R_inv, t_inv = rigid_inverse(R_final, t_final)
-        R_delta, t_delta = rigid_compose(R_inv, t_inv, R_holo, t_holo)
-        xi_end = se3_log(R_delta, t_delta)
-        L_end_rigid = ((xi_end ** 2).sum(dim=-1) * w_pow).sum() / (w_pow.sum() + 1e-8)
+                prev_R, prev_t = R_t, t_t
+                prev_chi = chi_t
 
-        d_chi_end = wrap_to_pi(chi_final - batch.torsion_holo[..., 3:7])
-        end_chi_term = ((d_chi_end ** 2) * chi_mask) * w_pow.unsqueeze(-1)
-        end_chi_denom = (chi_mask * w_pow.unsqueeze(-1)).sum().clamp(min=1e-8)
-        L_end_chi = end_chi_term.sum() / end_chi_denom
+                # Clash (mask invalid atoms to avoid padded clashes)
+                valid_atom = atom14_mask & batch.node_mask.unsqueeze(-1)
+                atom14_pos_masked = atom14_pos.masked_fill(~valid_atom.unsqueeze(-1), 1e6)
+                flat_atoms = atom14_pos_masked.reshape(atom14_pos.shape[0], -1, 3)
+                L_clash = L_clash + clash_penalty(flat_atoms, clash_threshold=2.2, aatype=batch.aatype)
 
-        # FAPE endpoint
-        chi_sincos = torch.stack([torch.sin(chi_final), torch.cos(chi_final)], dim=-1)
-        torsions_final_sincos = torch.cat([phi_psi_omega_sincos, chi_sincos], dim=2)
-        atom14_final = self.fk_module(torsions_final_sincos, rigids_final, batch.aatype)
+                # Peptide geometry
+                L_pep = L_pep + compute_peptide_loss(
+                    atom14_pos,
+                    atom14_mask,
+                    batch.node_mask,
+                    bond_len=self.config.pep_bond_len,
+                    angle_cacn=self.config.pep_angle_cacn,
+                    angle_cnca=self.config.pep_angle_cnca,
+                    angle_weight=self.config.pep_angle_weight,
+                )
 
-        pred_R = rigids_final.get_rots().get_rot_mats()
-        pred_t = atom14_final['atom14_pos'][:, :, 1]
-        true_R = rigids_holo.get_rots().get_rot_mats()
-        true_t = atom14_holo['atom14_pos'][:, :, 1]
+                # Contact score
+                C_t = compute_contact_score(
+                    atom14_pos,
+                    valid_atom,
+                    batch.lig_points,
+                    batch.lig_mask,
+                    w_eff,
+                    pocket_threshold=self.config.pocket_threshold,
+                    d_c=self.config.contact_d0,
+                    tau=self.config.contact_tau,
+                )
+                contact_scores.append(C_t)
 
-        L_end_fape = fape_loss(
-            atom14_final['atom14_pos'],
-            atom14_holo['atom14_pos'],
-            (pred_R, pred_t),
-            (true_R, true_t),
-            w_res=None,
-        )
+                # Prior (late time)
+                if stage1_chi is not None and t_val >= self.config.t_mid:
+                    d_chi_prior = wrap_to_pi(chi_t - stage1_chi)
+                    prior_term = ((d_chi_prior ** 2) * chi_mask) * w_pow.unsqueeze(-1)
+                    prior_denom = (chi_mask * w_pow.unsqueeze(-1)).sum().clamp(min=1e-8)
+                    L_prior = L_prior + prior_term.sum() / prior_denom
 
-        L_end = (self.config.w_end_chi * L_end_chi +
-                 self.config.w_end_fape * L_end_fape +
-                 L_end_rigid)
+                    R_t, t_t = self._rigid_to_rt(rigids_t)
+                    R1, t1 = self._rigid_to_rt(stage1_rigids)
+                    R_inv, t_inv = rigid_inverse(R_t, t_t)
+                    R_delta, t_delta = rigid_compose(R_inv, t_inv, R1, t1)
+                    xi_prior = se3_log(R_delta, t_delta)
+                    prior_rigid = ((xi_prior ** 2).sum(dim=-1) * w_pow).sum() / (w_pow.sum() + 1e-8)
+                    L_prior = L_prior + prior_rigid
+
+            # Contact monotonicity
+            for k in range(len(contact_scores) - 1):
+                delta = contact_scores[k] - contact_scores[k + 1] - self.config.contact_eps
+                L_contact = L_contact + torch.relu(delta).pow(2).mean()
+
+            # Endpoint loss
+            # Precompute holo atom14 for FAPE
+            torsion_holo = batch.torsion_holo
+            phi_psi_omega_holo = torsion_holo[..., :3]
+            phi_psi_omega_holo_sincos = torch.stack(
+                [torch.sin(phi_psi_omega_holo), torch.cos(phi_psi_omega_holo)], dim=-1
+            )
+            chi_holo = torsion_holo[..., 3:7]
+            chi_holo_sincos = torch.stack([torch.sin(chi_holo), torch.cos(chi_holo)], dim=-1)
+            torsions_holo_sincos = torch.cat([phi_psi_omega_holo_sincos, chi_holo_sincos], dim=2)
+            atom14_holo = self.fk_module(torsions_holo_sincos, rigids_holo, batch.aatype)
+
+            rigids_final = rigids_list[-1]
+            chi_final = chi_list[-1]
+            R_final, t_final = self._rigid_to_rt(rigids_final)
+            R_holo, t_holo = self._rigid_to_rt(rigids_holo)
+            R_inv, t_inv = rigid_inverse(R_final, t_final)
+            R_delta, t_delta = rigid_compose(R_inv, t_inv, R_holo, t_holo)
+            xi_end = se3_log(R_delta, t_delta)
+            L_end_rigid = ((xi_end ** 2).sum(dim=-1) * w_pow).sum() / (w_pow.sum() + 1e-8)
+
+            d_chi_end = wrap_to_pi(chi_final - batch.torsion_holo[..., 3:7])
+            end_chi_term = ((d_chi_end ** 2) * chi_mask) * w_pow.unsqueeze(-1)
+            end_chi_denom = (chi_mask * w_pow.unsqueeze(-1)).sum().clamp(min=1e-8)
+            L_end_chi = end_chi_term.sum() / end_chi_denom
+
+            # FAPE endpoint
+            chi_sincos = torch.stack([torch.sin(chi_final), torch.cos(chi_final)], dim=-1)
+            torsions_final_sincos = torch.cat([phi_psi_omega_sincos, chi_sincos], dim=2)
+            atom14_final = self.fk_module(torsions_final_sincos, rigids_final, batch.aatype)
+
+            pred_R = rigids_final.get_rots().get_rot_mats()
+            pred_t = atom14_final['atom14_pos'][:, :, 1]
+            true_R = rigids_holo.get_rots().get_rot_mats()
+            true_t = atom14_holo['atom14_pos'][:, :, 1]
+
+            L_end_fape = fape_loss(
+                atom14_final['atom14_pos'],
+                atom14_holo['atom14_pos'],
+                (pred_R, pred_t),
+                (true_R, true_t),
+                w_res=None,
+            )
+
+            L_end = (self.config.w_end_chi * L_end_chi +
+                     self.config.w_end_fape * L_end_fape +
+                     L_end_rigid)
 
         total = (
-            self.config.w_fm_chi * L_fm_chi +
-            self.config.w_fm_rigid * L_fm_rigid +
-            self.config.w_bg * L_bg +
-            self.config.w_smooth * L_smooth +
-            self.config.w_clash * L_clash +
-            self.config.w_pep * L_pep +
-            self.config.w_contact * L_contact +
-            self.config.w_prior * L_prior +
-            self.config.w_end * L_end
+            self.config.w_fm_chi * L_fm_chi.clamp(max=100.0) +
+            self.config.w_fm_rigid * L_fm_rigid.clamp(max=100.0) +
+            self.config.w_bg * L_bg.clamp(max=100.0) +
+            self.config.w_smooth * L_smooth.clamp(max=100.0) +
+            self.config.w_clash * L_clash.clamp(max=100.0) +
+            self.config.w_pep * L_pep.clamp(max=100.0) +
+            self.config.w_contact * L_contact.clamp(max=100.0) +
+            self.config.w_prior * L_prior.clamp(max=100.0) +
+            self.config.w_end * L_end.clamp(max=100.0)
         )
 
         return {
@@ -567,6 +615,10 @@ class Stage2Trainer:
             with autocast():
                 losses = self.compute_losses(batch, t)
                 loss = losses['total']
+
+            if torch.isnan(loss) or torch.isinf(loss):
+                return {k: 0.0 for k in losses}
+
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
@@ -575,6 +627,10 @@ class Stage2Trainer:
         else:
             losses = self.compute_losses(batch, t)
             loss = losses['total']
+
+            if torch.isnan(loss) or torch.isinf(loss):
+                return {k: 0.0 for k in losses}
+
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
             self.optimizer.step()
@@ -626,7 +682,11 @@ class Stage2Trainer:
             'end': 0.0,
         }
 
-        pbar = tqdm(self.train_loader, desc=f'Epoch {self.current_epoch:3d}', ncols=120, leave=True)
+        # Set DistributedSampler epoch
+        if self.distributed and hasattr(self.train_loader, 'sampler') and hasattr(self.train_loader.sampler, 'set_epoch'):
+            self.train_loader.sampler.set_epoch(self.current_epoch)
+
+        pbar = tqdm(self.train_loader, desc=f'Epoch {self.current_epoch:3d}', ncols=120, leave=True, disable=not self.is_main_process)
         for batch in pbar:
             step_losses = self.train_step(batch)
             for k in epoch_losses:
@@ -680,41 +740,48 @@ class Stage2Trainer:
             print(f"  ✓ Saved: {Path(filepath).name}")
 
     def train(self):
-        print(f"\n{'='*80}")
-        print("Start training - Stage-2")
-        print(f"{'='*80}\n")
+        if self.is_main_process:
+            print(f"\n{'='*80}")
+            print("Start training - Stage-2")
+            print(f"{'='*80}\n")
 
         for epoch in range(self.current_epoch, self.config.max_epochs):
             self.current_epoch = epoch
 
             train_losses = self.train_epoch()
-            train_info = (
-                f"Epoch {epoch:3d} | Loss: {train_losses['total']:.4f} "
-                f"FM:{train_losses['fm_chi'] + train_losses['fm_rigid']:.2f} "
-                f"Smooth:{train_losses['smooth']:.2f}"
-            )
-            print(train_info)
+            if self.is_main_process:
+                train_info = (
+                    f"Epoch {epoch:3d} | Loss: {train_losses['total']:.4f} "
+                    f"FM:{train_losses['fm_chi'] + train_losses['fm_rigid']:.2f} "
+                    f"Smooth:{train_losses['smooth']:.2f}"
+                )
+                print(train_info)
 
             if epoch % 1 == 0:
                 val_results = self.validate()
-                val_info = (
-                    f" | Val Loss: {val_results['total']:.4f} "
-                    f"FM:{val_results['fm_chi'] + val_results['fm_rigid']:.2f} "
-                    f"Contact:{val_results['contact']:.3f}"
-                )
-                print(val_info)
+                if self.is_main_process:
+                    val_info = (
+                        f" | Val Loss: {val_results['total']:.4f} "
+                        f"FM:{val_results['fm_chi'] + val_results['fm_rigid']:.2f} "
+                        f"Contact:{val_results['contact']:.3f}"
+                    )
+                    print(val_info)
 
-                current_metric = val_results['total']
-                if current_metric < self.best_val_metric:
-                    self.best_val_metric = current_metric
-                    self.patience_counter = 0
-                    save_path = Path(self.config.save_dir) / 'best_model.pt'
-                    self.save_checkpoint(str(save_path), verbose=False)
-                else:
-                    self.patience_counter += 1
-                    if self.patience_counter >= self.config.early_stop_patience:
-                        print("Early stopping triggered")
-                        break
+                    current_metric = val_results['total']
+                    if current_metric < self.best_val_metric:
+                        self.best_val_metric = current_metric
+                        self.patience_counter = 0
+                        save_path = Path(self.config.save_dir) / 'best_model.pt'
+                        self.save_checkpoint(str(save_path), verbose=False)
+                    else:
+                        self.patience_counter += 1
+                        if self.patience_counter >= self.config.early_stop_patience:
+                            print("Early stopping triggered")
+                            break
 
-        final_path = Path(self.config.save_dir) / 'final_model.pt'
-        self.save_checkpoint(str(final_path))
+        if self.is_main_process:
+            final_path = Path(self.config.save_dir) / 'final_model.pt'
+            self.save_checkpoint(str(final_path))
+
+        if self.distributed:
+            dist.destroy_process_group()

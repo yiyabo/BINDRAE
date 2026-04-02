@@ -9,14 +9,14 @@ class TrainingConfig:
     data_dir: str = "data/apo_holo_triplets"
     batch_size: int = 2
     num_workers: int = 0
-    valid_samples_file: str = None  # Filter train samples
-    val_samples_file: str = None    # Filter val samples
+    valid_samples_file: str = None
+    val_samples_file: str = None
 
     # Training
-    lr: float = 1e-4
+    lr: float = 2e-5
     weight_decay: float = 1e-6
     max_epochs: int = 50
-    grad_clip: float = 1.0
+    grad_clip: float = 0.3
     warmup_steps: int = 1000
     early_stop_patience: int = 20
 
@@ -50,7 +50,7 @@ class TrainingConfig:
     w_end: float = 0.1
     w_end_chi: float = 1.0
     w_end_fape: float = 0.1
-    w_smooth: float = 0.1
+    w_smooth: float = 0.05
     w_clash: float = 0.1
     w_pep: float = 0.1
     w_contact: float = 0.1
@@ -69,10 +69,17 @@ class TrainingConfig:
     # Contact
     contact_d0: float = 6.0
     contact_tau: float = 1.0
-    contact_eps: float = 0.05
+    contact_eps: float = 0.1
     pocket_threshold: float = 0.5
 
     # Integration / geometry sampling
-    n_integration_steps: int = 8
+    n_integration_steps: int = 5
     n_geom_steps: int = 4
     t_mid: float = 0.5
+
+    # Geometry loss frequency (call integrate_path every N steps)
+    geom_loss_every_n_steps: int = 5
+
+    # Distributed training
+    distributed: bool = False
+    local_rank: int = -1

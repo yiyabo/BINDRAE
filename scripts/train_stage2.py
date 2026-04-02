@@ -70,6 +70,10 @@ def parse_args():
     parser.add_argument('--no_mixed_precision', action='store_true',
                         help='禁用混合精度')
 
+    # 分布式
+    parser.add_argument('--distributed', action='store_true',
+                        help='启用 DDP 分布式训练')
+
     return parser.parse_args()
 
 
@@ -92,6 +96,7 @@ def main():
         log_dir=args.log_dir,
         device=args.device,
         mixed_precision=not args.no_mixed_precision,
+        distributed=args.distributed,
     )
 
     print(f"\n{'='*80}")
