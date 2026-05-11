@@ -2,38 +2,39 @@
 # BINDRAE .gitignore
 # ============================================================================
 
-# 数据目录（太大，使用 GitHub Release 分发）
+# 数据目录
 data/
+processed_data/
 
-#legacy
-legacy
+# Legacy & historical code
+legacy/
 
-# RP 图表/产物
+# RP / proposal (presentation material)
 RP/
 docs/RP/
 proposal/
 
-# Python 编译文件
+# Python compiled files
 *.pyc
 __pycache__/
 *.egg-info/
 .pytest_cache/
 
-# 系统文件
+# System files
 .DS_Store
 Thumbs.db
 
-# 日志文件
+# Logs
 *.log
 logs/
 
-# 训练输出
+# Training outputs
 outputs/
 checkpoints/
 runs/
 wandb/
 
-# IDE 配置
+# IDE configs
 .vscode/
 .idea/
 *.swp
@@ -42,15 +43,33 @@ wandb/
 .spec-workflow
 .opencode/
 
-# 临时文件
+# Temp files
 *.tmp
 *.bak
 *~
-tmp
-# 环境变量
-.env
-.env.localtodo_stage2.md
-.aider*
+tmp/
+*.sh.tmp
+._*
 
-# reference
+# Environment & secrets
+.env
+.env.local
+
+# Binary / generated files
+*.pdf
+*.zip
+*.png
+*.jpg
+*.jpeg
+*.gif
+package-lock.json
+
+# Reference / vendor code (external repos, not ours)
 reference/
+vendor/
+
+# Agent tool configs (not project code)
+.aider*
+.qwen/
+.sisyphus/
+.claude/
