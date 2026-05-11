@@ -10,7 +10,7 @@ Date: 2025-10-28
 
 import sys
 import os
-from typing import Dict, Tuple, Optional, List
+from typing import Dict, Tuple, Optional, List, Any
 from dataclasses import dataclass
 
 import torch
@@ -32,8 +32,8 @@ from flash_ipa.rigid import Rigid, Rotation
 from .adapter import ESMAdapter
 from .ipa import FlashIPAModule, FlashIPAModuleConfig
 from .ligand_condition import LigandConditioner, LigandConditionerConfig
-from .torsion_head import TorsionHead
-from .fk_openfold import OpenFoldFK, create_openfold_fk
+from .torsion_head import CandidateChi1Scorer, ContactHead, Chi1RotamerHead, TorsionHead
+from .fk_openfold import OpenFoldFK, create_openfold_fk, reorder_torsions_to_openfold
 from ..modules.edge_embed import EdgeEmbedderAdapter, ProjectEdgeConfig
 from ..data.residue_constants import restype_order
 
@@ -74,6 +74,34 @@ class Stage1ModelConfig:
     # Chi Head
     torsion_hidden: int = 128
     chi_angles: int = 4
+    use_pocket_chi1_expert: bool = False
+    pocket_chi1_expert_hidden: int = 128
+    pocket_chi1_expert_layers: int = 2
+    pocket_chi1_gate_threshold: float = 0.5
+    pocket_chi1_residual_scale: float = 0.25
+    use_chi1_rotamer_posterior: bool = False
+    chi1_rotamer_hidden: int = 128
+    use_candidate_chi1_scorer: bool = False
+    candidate_chi1_hidden: int = 128
+    use_geometry_candidate_scorer: bool = False
+    geometry_scorer_hidden: int = 64
+    geometry_scorer_num_rbf: int = 16
+    geometry_scorer_use_sgeo: bool = False
+    geometry_scorer_sgeo_dim: int = 32
+    geometry_scorer_use_typed_energy: bool = False
+    geometry_scorer_lig_type_dim: int = 20
+    geometry_scorer_typed_pair_dim: int = 64
+    geometry_scorer_typed_cutoff: float = 6.0
+    geometry_scorer_typed_init_scale: float = 0.1
+    use_contact_posterior: bool = False
+    contact_hidden: int = 128
+    
+    # Pocket Routing Adapter (early/mid-trunk ligand→pocket intervention)
+    use_pocket_routing_adapter: bool = False
+    pocket_routing_hidden: int = 128
+    pocket_routing_layers: int = 2
+    pocket_routing_gate_threshold: float = 0.3  # w_res threshold for pocket gating
+    pocket_routing_residual_scale: float = 0.5  # scale of adapter residual
     
     # 通用
     dropout: float = 0.1
@@ -110,7 +138,7 @@ class Stage1ModelConfig:
         """中型配置 - 约10M参数，平衡深度与稳定性
         
         Note: headdim_eff = c_hidden + 36 + z_factor_rank*32 <= 256
-              128 + 36 + 2*32 = 228 ✓
+            128 + 36 + 2*32 = 228 ✓
         """
         return cls(
             c_s=384,
@@ -128,7 +156,7 @@ class Stage1ModelConfig:
         """大型配置 - 约40M参数，宽而深
         
         Note: headdim_eff = c_hidden + 36 + z_factor_rank*32 <= 256
-              使用 z_factor_rank=1: 152 + 36 + 32 = 220 ✓
+            使用 z_factor_rank=1: 152 + 36 + 32 = 220 ✓
         """
         return cls(
             c_s=512,
@@ -149,7 +177,7 @@ class Stage1ModelConfig:
         """宽而浅配置 (RAE风格) - 约25M参数
         
         Note: headdim_eff = c_hidden + 36 + z_factor_rank*32 <= 256
-              使用 z_factor_rank=1: 152 + 36 + 32 = 220 ✓
+            使用 z_factor_rank=1: 152 + 36 + 32 = 220 ✓
         """
         return cls(
             c_s=768,  # 2x 宽度
@@ -197,9 +225,38 @@ class Stage1ModelConfig:
         )
 
 
-# ============================================================================
-# Stage-1 模型
-# ============================================================================
+class PocketRoutingAdapter(nn.Module):
+    """Pocket-gated residual MLP applied between LigandConditioner and EdgeEmbedder.
+    
+    Selectively amplifies ligand-conditioned representations for pocket residues
+    (w_res > threshold) while leaving non-pocket residues unchanged.
+    """
+
+    def __init__(self, c_s: int, hidden: int = 128, n_layers: int = 2,
+                 dropout: float = 0.1):
+        super().__init__()
+        layers = [nn.LayerNorm(c_s)]
+        in_dim = c_s
+        for _ in range(n_layers - 1):
+            layers.extend([nn.Linear(in_dim, hidden), nn.GELU(), nn.Dropout(dropout)])
+            in_dim = hidden
+        layers.append(nn.Linear(in_dim, c_s))
+        self.mlp = nn.Sequential(*layers)
+        nn.init.normal_(self.mlp[-1].weight, mean=0.0, std=0.01)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(self, s: torch.Tensor, gate: torch.Tensor, scale: float = 0.5) -> torch.Tensor:
+        """
+        Args:
+            s: [B, N, c_s] node representations (post ligand conditioning)
+            gate: [B, N] continuous or binary pocket gate (0 for non-pocket)
+            scale: residual scaling factor
+        Returns:
+            s + scale * gate * MLP(s)
+        """
+        delta = self.mlp(s)
+        return s + scale * gate.unsqueeze(-1) * delta
+
 
 class Stage1Model(nn.Module):
     """
@@ -270,6 +327,83 @@ class Stage1Model(nn.Module):
             dropout=config.dropout,
             n_angles=config.chi_angles
         )
+
+        # 5b. Optional late pocket-only chi1 residual expert
+        self.pocket_chi1_expert = None
+
+        # 5b. Optional posterior heads for Stage-2 soft guidance experiments
+        self.chi1_rotamer_head = None
+        if config.use_chi1_rotamer_posterior:
+            self.chi1_rotamer_head = Chi1RotamerHead(
+                c_s=config.c_s,
+                c_hidden=config.chi1_rotamer_hidden,
+                dropout=config.dropout,
+            )
+
+        self.contact_head = None
+        if config.use_contact_posterior:
+            self.contact_head = ContactHead(
+                c_s=config.c_s,
+                c_hidden=config.contact_hidden,
+                dropout=config.dropout,
+            )
+
+        self.candidate_chi1_scorer = None
+        if config.use_candidate_chi1_scorer:
+            self.candidate_chi1_scorer = CandidateChi1Scorer(
+                c_s=config.c_s,
+                c_hidden=config.candidate_chi1_hidden,
+                dropout=config.dropout,
+            )
+
+        self.geometry_candidate_scorer = None
+        if config.use_geometry_candidate_scorer:
+            from .torsion_head import GeometryCandidateScorer
+            self.geometry_candidate_scorer = GeometryCandidateScorer(
+                c_hidden=config.geometry_scorer_hidden,
+                num_rbf=config.geometry_scorer_num_rbf,
+                dropout=config.dropout,
+                use_sgeo=config.geometry_scorer_use_sgeo,
+                c_s=config.c_s,
+                sgeo_proj_dim=config.geometry_scorer_sgeo_dim,
+                bounded_residual=getattr(config, 'geometry_scorer_bounded_residual', False),
+                residual_max=getattr(config, 'geometry_scorer_residual_max', 5.0),
+                residual_tau=getattr(config, 'geometry_scorer_residual_tau', 2.0),
+                gate_norm=getattr(config, 'geometry_scorer_gate_norm', False),
+                gate_clamp=getattr(config, 'geometry_scorer_gate_clamp', 6.0),
+                gate_init_bias=getattr(config, 'geometry_scorer_gate_init_bias', 0.0),
+                use_typed_energy=getattr(config, 'geometry_scorer_use_typed_energy', False),
+                lig_type_dim=getattr(config, 'geometry_scorer_lig_type_dim', 20),
+                typed_pair_dim=getattr(config, 'geometry_scorer_typed_pair_dim', 64),
+                typed_cutoff=getattr(config, 'geometry_scorer_typed_cutoff', 6.0),
+                typed_init_scale=getattr(config, 'geometry_scorer_typed_init_scale', 0.1),
+            )
+
+        # 5c. Optional pocket routing adapter (early/mid-trunk)
+        self.pocket_routing_adapter = None
+        if config.use_pocket_routing_adapter:
+            self.pocket_routing_adapter = PocketRoutingAdapter(
+                c_s=config.c_s,
+                hidden=config.pocket_routing_hidden,
+                n_layers=config.pocket_routing_layers,
+                dropout=config.dropout,
+            )
+        if config.use_pocket_chi1_expert:
+            expert_layers = [nn.LayerNorm(config.c_s)]
+            in_dim = config.c_s
+            hidden_dim = config.pocket_chi1_expert_hidden
+            n_layers = max(int(config.pocket_chi1_expert_layers), 1)
+            for _ in range(n_layers - 1):
+                expert_layers.extend([
+                    nn.Linear(in_dim, hidden_dim),
+                    nn.GELU(),
+                    nn.Dropout(config.dropout),
+                ])
+                in_dim = hidden_dim
+            expert_layers.append(nn.Linear(in_dim, 2))
+            self.pocket_chi1_expert = nn.Sequential(*expert_layers)
+            nn.init.normal_(self.pocket_chi1_expert[-1].weight, mean=0.0, std=0.01)
+            nn.init.zeros_(self.pocket_chi1_expert[-1].bias)
         
         # 6. FK模块（扭转角→全原子坐标）
         self.fk_module = create_openfold_fk()
@@ -303,14 +437,17 @@ class Stage1Model(nn.Module):
     
     def forward(self,
                 batch: 'Stage1Batch',
-                current_step: int = 0) -> Dict[str, torch.Tensor]:
+                current_step: int = 0,
+                geometry_scorer_kwargs: Optional[Dict[str, Any]] = None) -> Dict[str, torch.Tensor]:
         """
         前向传播
-        
+
         Args:
             batch: Stage1Batch数据
             current_step: 当前训练步数（用于warmup）
-            
+            geometry_scorer_kwargs: 透传给 GeometryCandidateScorer.forward 的额外参数
+                （如 base_detach, gate_override, beta），仅在该 scorer 启用时生效
+
         Returns:
             {
                 'pred_chi': [B, N, 4, 2] 预测的chi(sin, cos)
@@ -339,6 +476,13 @@ class Stage1Model(nn.Module):
             current_step=current_step
         )
         
+        # 3b. Pocket Routing Adapter (pocket-gated residual before IPA)
+        if self.pocket_routing_adapter is not None:
+            pocket_gate = ((batch.w_res > self.config.pocket_routing_gate_threshold) & batch.node_mask.bool()).float()
+            s_with_ligand = self.pocket_routing_adapter(
+                s_with_ligand, pocket_gate, self.config.pocket_routing_residual_scale
+            )
+        
         # 4. EdgeEmbedder
         edge_outputs = self.edge_embedder(s_with_ligand, batch.Ca_apo, batch.node_mask)
         z_f1 = edge_outputs['z_f1']
@@ -361,6 +505,58 @@ class Stage1Model(nn.Module):
         
         # 6. TorsionHead（使用IPA输出）
         pred_chi = self.chi_head(s_geo)  # [B, N, 4, 2]
+
+        chi1_rotamer_logits = None
+        chi1_rotamer_probs = None
+        if self.chi1_rotamer_head is not None:
+            chi1_rotamer_logits = self.chi1_rotamer_head(s_geo)  # [B, N, 3]
+            chi1_rotamer_probs = torch.softmax(chi1_rotamer_logits, dim=-1)
+
+        contact_logits = None
+        contact_probs = None
+        if self.contact_head is not None:
+            contact_logits = self.contact_head(s_geo)  # [B, N]
+            contact_probs = torch.sigmoid(contact_logits)
+
+        candidate_chi1_logits = None
+        candidate_chi1_probs = None
+        if self.candidate_chi1_scorer is not None:
+            candidate_chi1_logits = self.candidate_chi1_scorer(s_geo)  # [B, N, 3]
+            candidate_chi1_probs = torch.softmax(candidate_chi1_logits, dim=-1)
+
+        geometry_chi1_logits = None
+        geometry_chi1_probs = None
+        geometry_chi1_base_logits = None
+        geometry_chi1_residual_logits = None
+        geometry_chi1_gate = None
+        geometry_chi1_typed_energy = None
+        if self.geometry_candidate_scorer is not None:
+            aatype_for_geom = self._sequence_to_aatype(batch.sequences, N, device)
+            scorer_kwargs = dict(geometry_scorer_kwargs) if geometry_scorer_kwargs else {}
+            result = self.geometry_candidate_scorer(
+                self.fk_module, rigids_updated, aatype_for_geom,
+                batch.torsion_apo, batch.lig_points, batch.lig_types, batch.lig_mask, batch.node_mask,
+                s_geo=s_geo if self.config.geometry_scorer_use_sgeo else None,
+                return_decomposition=True,
+                **scorer_kwargs,
+            )
+            (
+                geometry_chi1_logits,
+                geometry_chi1_base_logits,
+                geometry_chi1_residual_logits,
+                geometry_chi1_gate,
+                geometry_chi1_typed_energy,
+            ) = result
+            geometry_chi1_probs = torch.softmax(geometry_chi1_logits, dim=-1)
+
+        pocket_chi1_delta = None
+        if self.pocket_chi1_expert is not None:
+            pocket_gate = ((batch.w_res > self.config.pocket_chi1_gate_threshold) & batch.node_mask.bool()).float()
+            pocket_chi1_delta = self.pocket_chi1_expert(s_geo) * pocket_gate.unsqueeze(-1)
+            base_chi1 = pred_chi[:, :, :1, :]
+            corrected_chi1 = base_chi1 + self.config.pocket_chi1_residual_scale * pocket_chi1_delta.unsqueeze(2)
+            corrected_chi1 = nn.functional.normalize(corrected_chi1, p=2, dim=-1, eps=1e-4)
+            pred_chi = torch.cat([corrected_chi1, pred_chi[:, :, 1:, :]], dim=2)
         
         # 7. FK重建全原子坐标
         # 将序列转换为aatype索引
@@ -374,11 +570,25 @@ class Stage1Model(nn.Module):
             [torch.sin(phi_psi_omega), torch.cos(phi_psi_omega)], dim=-1
         )  # [B, N, 3, 2]
         torsions_sincos = torch.cat([phi_psi_omega_sincos, pred_chi], dim=2)  # [B,N,7,2]
+        torsions_sincos = reorder_torsions_to_openfold(torsions_sincos)
 
         atom14_result = self.fk_module(torsions_sincos, rigids_updated, aatype)
         
         return {
             'pred_chi': pred_chi,
+            'chi1_rotamer_logits': chi1_rotamer_logits,
+            'chi1_rotamer_probs': chi1_rotamer_probs,
+            'contact_logits': contact_logits,
+            'contact_probs': contact_probs,
+            'candidate_chi1_logits': candidate_chi1_logits,
+            'candidate_chi1_probs': candidate_chi1_probs,
+            'geometry_chi1_logits': geometry_chi1_logits,
+            'geometry_chi1_probs': geometry_chi1_probs,
+            'geometry_chi1_base_logits': geometry_chi1_base_logits,
+            'geometry_chi1_residual_logits': geometry_chi1_residual_logits,
+            'geometry_chi1_gate': geometry_chi1_gate,
+            'geometry_chi1_typed_energy': geometry_chi1_typed_energy,
+            'pocket_chi1_delta': pocket_chi1_delta,
             's_final': s_geo,  # IPA输出（已含配体信息）
             'rigids_final': rigids_updated,
             'atom14_pos': atom14_result['atom14_pos'],      # [B, N, 14, 3]
