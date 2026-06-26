@@ -34,6 +34,9 @@ def compute_peptide_loss(atom14_pos: torch.Tensor,
     """
     Peptide geometry guard: C-N bond length + angles.
     """
+    if torch.isnan(atom14_pos).any() or torch.isinf(atom14_pos).any():
+        return atom14_pos.new_tensor(0.0)
+
     # [B, N-1, 3]
     C_i = atom14_pos[:, :-1, ATOM14_C]
     N_ip1 = atom14_pos[:, 1:, ATOM14_N]

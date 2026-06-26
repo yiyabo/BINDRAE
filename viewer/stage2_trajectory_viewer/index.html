@@ -1,0 +1,884 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BINDRAE Stage-2 Path Viewer</title>
+  <script src="https://3dmol.org/build/3Dmol-min.js"></script>
+  <style>
+    :root {
+      --paper: #f7f7f2;
+      --ink: #151713;
+      --muted: #667069;
+      --line: #d9ded6;
+      --panel: #ffffff;
+      --panel-2: #eef5f1;
+      --green: #198754;
+      --cyan: #0b7285;
+      --amber: #b26a00;
+      --red: #b42318;
+      --black: #0c0f0d;
+      --shadow: 0 18px 50px rgba(21, 23, 19, 0.12);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      width: 100%;
+      min-height: 100%;
+      margin: 0;
+      background: var(--paper);
+      color: var(--ink);
+      font-family: ui-monospace, "SFMono-Regular", "Menlo", "Consolas", monospace;
+      letter-spacing: 0;
+    }
+
+    body {
+      overflow-x: hidden;
+    }
+
+    button,
+    input,
+    select {
+      font: inherit;
+      letter-spacing: 0;
+    }
+
+    .app {
+      min-height: 100vh;
+      display: grid;
+      grid-template-rows: auto 1fr;
+    }
+
+    .topbar {
+      display: grid;
+      grid-template-columns: minmax(230px, 0.8fr) minmax(260px, 1.5fr) auto;
+      gap: 16px;
+      align-items: center;
+      padding: 14px 18px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(247, 247, 242, 0.92);
+      backdrop-filter: blur(12px);
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+
+    .brand {
+      display: flex;
+      align-items: baseline;
+      gap: 12px;
+      min-width: 0;
+    }
+
+    .brand-mark {
+      width: 18px;
+      height: 18px;
+      border: 2px solid var(--black);
+      border-radius: 50%;
+      box-shadow: inset 7px 0 0 var(--green);
+      flex: 0 0 auto;
+    }
+
+    .brand h1 {
+      margin: 0;
+      font-size: 17px;
+      line-height: 1;
+      font-weight: 800;
+      white-space: nowrap;
+    }
+
+    .brand span {
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    .manifest-bar {
+      display: grid;
+      grid-template-columns: minmax(120px, 1fr) auto;
+      gap: 8px;
+      min-width: 0;
+    }
+
+    .manifest-bar input {
+      height: 34px;
+      padding: 0 10px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      color: var(--ink);
+      border-radius: 6px;
+      min-width: 0;
+    }
+
+    .toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .button,
+    .seg button {
+      height: 34px;
+      border: 1px solid var(--black);
+      background: var(--black);
+      color: white;
+      border-radius: 6px;
+      padding: 0 12px;
+      cursor: pointer;
+    }
+
+    .button.secondary,
+    .seg button {
+      background: var(--panel);
+      color: var(--ink);
+      border-color: var(--line);
+    }
+
+    .button:hover,
+    .seg button:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 8px 18px rgba(21, 23, 19, 0.12);
+    }
+
+    .seg {
+      display: flex;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      overflow: hidden;
+      background: var(--panel);
+      height: 34px;
+    }
+
+    .seg button {
+      border: 0;
+      border-radius: 0;
+      height: 32px;
+      box-shadow: none;
+      min-width: 64px;
+    }
+
+    .seg button.active {
+      background: var(--black);
+      color: white;
+    }
+
+    .main {
+      display: grid;
+      grid-template-columns: 310px minmax(460px, 1fr) 340px;
+      gap: 14px;
+      padding: 14px;
+      min-height: 0;
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      min-width: 0;
+      box-shadow: var(--shadow);
+    }
+
+    .samples {
+      display: grid;
+      grid-template-rows: auto 1fr;
+      min-height: 0;
+      overflow: hidden;
+    }
+
+    .panel-head {
+      padding: 13px 14px;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .panel-title {
+      margin: 0;
+      font-size: 12px;
+      text-transform: uppercase;
+      color: var(--muted);
+      font-weight: 800;
+    }
+
+    .sample-count {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .sample-list {
+      overflow: auto;
+      padding: 10px;
+      display: grid;
+      gap: 8px;
+      align-content: start;
+    }
+
+    .sample-card {
+      border: 1px solid var(--line);
+      background: linear-gradient(180deg, #ffffff, #fbfcfa);
+      border-radius: 8px;
+      padding: 11px;
+      text-align: left;
+      cursor: pointer;
+      transition: border-color 140ms ease, background 140ms ease, transform 140ms ease;
+    }
+
+    .sample-card:hover {
+      transform: translateY(-1px);
+      border-color: var(--green);
+    }
+
+    .sample-card.active {
+      border-color: var(--black);
+      background: var(--panel-2);
+    }
+
+    .sample-id {
+      font-weight: 800;
+      font-size: 13px;
+      margin-bottom: 8px;
+      overflow-wrap: anywhere;
+    }
+
+    .mini-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 6px;
+    }
+
+    .mini-stat {
+      border-top: 2px solid var(--line);
+      padding-top: 5px;
+      min-width: 0;
+    }
+
+    .mini-stat strong {
+      display: block;
+      font-size: 13px;
+    }
+
+    .mini-stat span {
+      display: block;
+      color: var(--muted);
+      font-size: 10px;
+      text-transform: uppercase;
+      margin-top: 2px;
+    }
+
+    .stage {
+      display: grid;
+      grid-template-rows: 1fr auto;
+      min-height: 640px;
+      overflow: hidden;
+      position: relative;
+    }
+
+    #viewer {
+      width: 100%;
+      height: 100%;
+      min-height: 520px;
+      background:
+        linear-gradient(90deg, rgba(21, 23, 19, 0.035) 1px, transparent 1px),
+        linear-gradient(0deg, rgba(21, 23, 19, 0.035) 1px, transparent 1px),
+        #fdfdf9;
+      background-size: 34px 34px;
+    }
+
+    .viewer-status {
+      position: absolute;
+      top: 14px;
+      left: 14px;
+      right: 14px;
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      pointer-events: none;
+      z-index: 2;
+    }
+
+    .status-pill {
+      background: rgba(255, 255, 255, 0.88);
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 8px 10px;
+      font-size: 12px;
+      color: var(--muted);
+      box-shadow: 0 8px 24px rgba(21, 23, 19, 0.08);
+      max-width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .controls {
+      border-top: 1px solid var(--line);
+      background: var(--panel);
+      padding: 12px 14px;
+      display: grid;
+      grid-template-columns: auto minmax(160px, 1fr) auto;
+      gap: 12px;
+      align-items: center;
+    }
+
+    .frame-readout {
+      font-size: 12px;
+      color: var(--muted);
+      min-width: 96px;
+      text-align: right;
+    }
+
+    input[type="range"] {
+      width: 100%;
+      accent-color: var(--green);
+    }
+
+    .details {
+      display: grid;
+      grid-template-rows: auto auto 1fr;
+      min-height: 0;
+      overflow: hidden;
+    }
+
+    .summary-strip {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 8px;
+      padding: 12px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .big-stat {
+      background: #fbfcfa;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px;
+      min-width: 0;
+    }
+
+    .big-stat label {
+      display: block;
+      color: var(--muted);
+      font-size: 10px;
+      text-transform: uppercase;
+      margin-bottom: 7px;
+    }
+
+    .big-stat strong {
+      display: block;
+      font-size: 18px;
+    }
+
+    .bars {
+      padding: 12px;
+      border-bottom: 1px solid var(--line);
+      display: grid;
+      gap: 9px;
+    }
+
+    .bar-row {
+      display: grid;
+      grid-template-columns: 116px 1fr 58px;
+      gap: 8px;
+      align-items: center;
+      font-size: 11px;
+      color: var(--muted);
+    }
+
+    .bar-track {
+      height: 8px;
+      background: #e7ebe4;
+      border-radius: 99px;
+      overflow: hidden;
+    }
+
+    .bar-fill {
+      height: 100%;
+      width: 0;
+      background: var(--green);
+      border-radius: 99px;
+    }
+
+    .files {
+      padding: 12px;
+      overflow: auto;
+      display: grid;
+      gap: 8px;
+      align-content: start;
+    }
+
+    .file-link {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: center;
+      color: var(--ink);
+      text-decoration: none;
+      border: 1px solid var(--line);
+      background: #fbfcfa;
+      border-radius: 7px;
+      padding: 10px;
+      font-size: 12px;
+    }
+
+    .file-link:hover {
+      border-color: var(--cyan);
+      color: var(--cyan);
+    }
+
+    .toast {
+      position: fixed;
+      right: 16px;
+      bottom: 16px;
+      max-width: min(560px, calc(100vw - 32px));
+      background: var(--black);
+      color: white;
+      border-radius: 8px;
+      padding: 12px 14px;
+      font-size: 12px;
+      box-shadow: 0 20px 70px rgba(0, 0, 0, 0.26);
+      z-index: 99;
+      display: none;
+    }
+
+    .toast.show {
+      display: block;
+    }
+
+    @media (max-width: 1180px) {
+      .topbar {
+        grid-template-columns: 1fr;
+      }
+
+      .toolbar {
+        justify-content: flex-start;
+      }
+
+      .main {
+        grid-template-columns: 260px minmax(360px, 1fr);
+      }
+
+      .details {
+        grid-column: 1 / -1;
+        grid-template-rows: auto auto auto;
+      }
+    }
+
+    @media (max-width: 760px) {
+      .main {
+        grid-template-columns: 1fr;
+        padding: 10px;
+      }
+
+      .stage {
+        min-height: 520px;
+      }
+
+      #viewer {
+        min-height: 420px;
+      }
+
+      .controls {
+        grid-template-columns: 1fr;
+      }
+
+      .frame-readout {
+        text-align: left;
+      }
+
+      .summary-strip {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true"></div>
+        <h1>BINDRAE Path Viewer</h1>
+        <span id="runLabel">Stage-2 generated paths</span>
+      </div>
+      <div class="manifest-bar">
+        <input id="manifestInput" aria-label="Manifest path">
+        <button class="button" id="loadManifest">Load</button>
+      </div>
+      <div class="toolbar">
+        <div class="seg" aria-label="Render style">
+          <button data-style="cartoon" class="active">Trace</button>
+          <button data-style="sticks">Sticks</button>
+          <button data-style="surface">Pocket</button>
+        </div>
+        <button class="button secondary" id="resetView">Reset</button>
+      </div>
+    </header>
+
+    <main class="main">
+      <section class="panel samples">
+        <div class="panel-head">
+          <h2 class="panel-title">Samples</h2>
+          <div class="sample-count" id="sampleCount">0</div>
+        </div>
+        <div class="sample-list" id="sampleList"></div>
+      </section>
+
+      <section class="panel stage">
+        <div class="viewer-status">
+          <div class="status-pill" id="selectedSample">No sample</div>
+          <div class="status-pill" id="viewerState">Idle</div>
+        </div>
+        <div id="viewer"></div>
+        <div class="controls">
+          <button class="button" id="playPause">Play</button>
+          <input id="frameSlider" type="range" min="0" max="0" value="0" aria-label="Trajectory frame">
+          <div class="frame-readout" id="frameReadout">Frame 0 / 0</div>
+        </div>
+      </section>
+
+      <aside class="panel details">
+        <div class="panel-head">
+          <h2 class="panel-title">Run Metrics</h2>
+          <div class="sample-count" id="frameCount">0 frames</div>
+        </div>
+        <div class="summary-strip" id="summaryStrip"></div>
+        <div class="bars" id="metricBars"></div>
+        <div class="files" id="fileLinks"></div>
+      </aside>
+    </main>
+  </div>
+  <div class="toast" id="toast"></div>
+
+  <script>
+    const DEFAULT_MANIFEST = "/logs/stage2/generated_paths/lc_pgbf_seed44_correct_steps12_val4_20260622/manifest.json";
+    const state = {
+      manifest: null,
+      samples: [],
+      sampleIndex: 0,
+      frames: [],
+      ligandText: "",
+      frameIndex: 0,
+      timer: null,
+      style: "cartoon",
+      viewer: null
+    };
+
+    const els = {
+      manifestInput: document.getElementById("manifestInput"),
+      loadManifest: document.getElementById("loadManifest"),
+      sampleList: document.getElementById("sampleList"),
+      sampleCount: document.getElementById("sampleCount"),
+      selectedSample: document.getElementById("selectedSample"),
+      viewerState: document.getElementById("viewerState"),
+      frameSlider: document.getElementById("frameSlider"),
+      frameReadout: document.getElementById("frameReadout"),
+      playPause: document.getElementById("playPause"),
+      summaryStrip: document.getElementById("summaryStrip"),
+      metricBars: document.getElementById("metricBars"),
+      fileLinks: document.getElementById("fileLinks"),
+      frameCount: document.getElementById("frameCount"),
+      resetView: document.getElementById("resetView"),
+      runLabel: document.getElementById("runLabel"),
+      toast: document.getElementById("toast")
+    };
+
+    function showToast(message) {
+      els.toast.textContent = message;
+      els.toast.classList.add("show");
+      window.clearTimeout(showToast.timeout);
+      showToast.timeout = window.setTimeout(() => els.toast.classList.remove("show"), 3200);
+    }
+
+    function fmt(value, digits = 3) {
+      if (value === null || value === undefined || Number.isNaN(Number(value))) return "NA";
+      return Number(value).toFixed(digits);
+    }
+
+    function normalizePath(path) {
+      if (!path) return "";
+      if (/^https?:\/\//.test(path) || path.startsWith("/")) return path;
+      return "/" + path;
+    }
+
+    function dirname(path) {
+      return path.split("/").slice(0, -1).join("/");
+    }
+
+    function metric(sample, key) {
+      return sample && sample[key] !== undefined ? sample[key] : null;
+    }
+
+    function mean(samples, key) {
+      const vals = samples.map(s => metric(s, key)).filter(v => v !== null && v !== undefined && Number.isFinite(Number(v)));
+      return vals.length ? vals.reduce((a, b) => a + Number(b), 0) / vals.length : null;
+    }
+
+    function splitPdbModels(text) {
+      const lines = text.split(/\r?\n/);
+      const models = [];
+      let current = [];
+      let inModel = false;
+      for (const line of lines) {
+        if (line.startsWith("MODEL")) {
+          inModel = true;
+          current = [line];
+        } else if (line.startsWith("ENDMDL")) {
+          current.push(line);
+          models.push(current.join("\n") + "\n");
+          inModel = false;
+          current = [];
+        } else if (inModel) {
+          current.push(line);
+        }
+      }
+      if (!models.length && text.trim()) models.push(text);
+      return models;
+    }
+
+    function setStatus(text) {
+      els.viewerState.textContent = text;
+    }
+
+    async function fetchText(path) {
+      const res = await fetch(normalizePath(path), { cache: "no-cache" });
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}: ${path}`);
+      return await res.text();
+    }
+
+    function createViewer() {
+      const container = document.getElementById("viewer");
+      if (!window.$3Dmol) {
+        setStatus("3Dmol unavailable");
+        return null;
+      }
+      const viewer = $3Dmol.createViewer(container, {
+        backgroundColor: "0xfdfdf9",
+        antialias: true
+      });
+      return viewer;
+    }
+
+    function applyProteinStyle(model) {
+      if (!model) return;
+      if (state.style === "sticks") {
+        model.setStyle({}, { stick: { radius: 0.12, colorscheme: "Jmol" } });
+      } else if (state.style === "surface") {
+        model.setStyle({}, { cartoon: { color: "spectrum", opacity: 0.45 }, stick: { radius: 0.04, opacity: 0.2 } });
+        state.viewer.addSurface($3Dmol.SurfaceType.VDW, { opacity: 0.18, color: "white" }, {});
+      } else {
+        model.setStyle({}, { cartoon: { color: "spectrum", opacity: 0.92 }, stick: { radius: 0.045, opacity: 0.26 } });
+      }
+    }
+
+    function applyLigandStyle(model) {
+      if (!model) return;
+      model.setStyle({}, {
+        sphere: { radius: 0.42, color: "0xb26a00", opacity: 0.9 },
+        stick: { radius: 0.14, color: "0x0b7285", opacity: 0.9 }
+      });
+    }
+
+    function renderFrame(frameIndex, keepCamera = true) {
+      if (!state.viewer || !state.frames.length) return;
+      state.frameIndex = Math.max(0, Math.min(frameIndex, state.frames.length - 1));
+      els.frameSlider.value = String(state.frameIndex);
+      els.frameReadout.textContent = `Frame ${state.frameIndex} / ${state.frames.length - 1}`;
+      const viewer = state.viewer;
+      viewer.clear();
+      const protein = viewer.addModel(state.frames[state.frameIndex], "pdb");
+      applyProteinStyle(protein);
+      if (state.ligandText) {
+        const ligand = viewer.addModel(state.ligandText, "pdb");
+        applyLigandStyle(ligand);
+      }
+      if (!keepCamera) viewer.zoomTo();
+      viewer.render();
+    }
+
+    function stopPlayback() {
+      if (state.timer) {
+        window.clearInterval(state.timer);
+        state.timer = null;
+      }
+      els.playPause.textContent = "Play";
+    }
+
+    function togglePlayback() {
+      if (!state.frames.length) return;
+      if (state.timer) {
+        stopPlayback();
+        return;
+      }
+      els.playPause.textContent = "Pause";
+      state.timer = window.setInterval(() => {
+        const next = (state.frameIndex + 1) % state.frames.length;
+        renderFrame(next, true);
+      }, 260);
+    }
+
+    function statBlock(label, value, accent) {
+      return `<div class="big-stat" style="border-top:3px solid ${accent}"><label>${label}</label><strong>${value}</strong></div>`;
+    }
+
+    function renderRunSummary() {
+      const samples = state.samples;
+      els.summaryStrip.innerHTML = [
+        statBlock("active endpoint", fmt(mean(samples, "active/endpoint_abs_dist")), "var(--green)"),
+        statBlock("active path mae", fmt(mean(samples, "active/path_mae_dist")), "var(--cyan)"),
+        statBlock("active direction", fmt(mean(samples, "active/direction_acc")), "var(--amber)"),
+        statBlock("release path mae", fmt(mean(samples, "release/path_mae_dist")), "var(--red)")
+      ].join("");
+    }
+
+    function renderSampleList() {
+      els.sampleCount.textContent = `${state.samples.length} samples`;
+      els.sampleList.innerHTML = state.samples.map((sample, index) => {
+        const active = index === state.sampleIndex ? " active" : "";
+        const counts = sample.counts || {};
+        return `
+          <button class="sample-card${active}" data-sample-index="${index}">
+            <div class="sample-id">${sample.sample_id}</div>
+            <div class="mini-grid">
+              <div class="mini-stat"><strong>${fmt(sample["active/path_mae_dist"])}</strong><span>path</span></div>
+              <div class="mini-stat"><strong>${fmt(sample["active/direction_acc"])}</strong><span>dir</span></div>
+              <div class="mini-stat"><strong>${counts.active || 0}</strong><span>active</span></div>
+            </div>
+          </button>
+        `;
+      }).join("");
+      els.sampleList.querySelectorAll("[data-sample-index]").forEach(button => {
+        button.addEventListener("click", () => selectSample(Number(button.dataset.sampleIndex)));
+      });
+    }
+
+    function barRow(label, value, max, color) {
+      const width = value === null ? 0 : Math.max(0, Math.min(100, (Number(value) / max) * 100));
+      return `
+        <div class="bar-row">
+          <span>${label}</span>
+          <div class="bar-track"><div class="bar-fill" style="width:${width}%; background:${color}"></div></div>
+          <strong>${fmt(value)}</strong>
+        </div>
+      `;
+    }
+
+    function renderDetails(sample) {
+      const counts = sample.counts || {};
+      els.frameCount.textContent = `${sample.n_frames || state.frames.length} frames`;
+      els.metricBars.innerHTML = [
+        barRow("active endpoint", metric(sample, "active/endpoint_abs_dist"), 3.0, "var(--green)"),
+        barRow("active path mae", metric(sample, "active/path_mae_dist"), 1.6, "var(--cyan)"),
+        barRow("active direction", metric(sample, "active/direction_acc"), 1.0, "var(--amber)"),
+        barRow("approach path", metric(sample, "approach/path_mae_dist"), 1.6, "var(--green)"),
+        barRow("release path", metric(sample, "release/path_mae_dist"), 1.6, "var(--red)")
+      ].join("");
+      const base = dirname(sample.pdb || sample.npz || "");
+      const links = [
+        ["trajectory PDB", sample.pdb],
+        ["trajectory NPZ", sample.npz],
+        ["apo reference", `${base}/apo_atom14.pdb`],
+        ["holo reference", `${base}/holo_atom14.pdb`],
+        ["ligand tokens", `${base}/ligand_tokens.pdb`],
+        ["summary JSON", `${base}/summary.json`]
+      ];
+      els.fileLinks.innerHTML = [
+        `<div class="file-link"><span>active / approach / release</span><strong>${counts.active || 0} / ${counts.approach || 0} / ${counts.release || 0}</strong></div>`,
+        ...links.map(([label, path]) => `<a class="file-link" href="${normalizePath(path)}" target="_blank"><span>${label}</span><strong>open</strong></a>`)
+      ].join("");
+    }
+
+    async function selectSample(index) {
+      stopPlayback();
+      state.sampleIndex = index;
+      state.frameIndex = 0;
+      const sample = state.samples[index];
+      els.selectedSample.textContent = sample.sample_id;
+      renderSampleList();
+      renderDetails(sample);
+      setStatus("Loading structure");
+      try {
+        const pdbText = await fetchText(sample.pdb);
+        const base = dirname(sample.pdb || sample.npz || "");
+        let ligandText = "";
+        try {
+          ligandText = await fetchText(`${base}/ligand_tokens.pdb`);
+        } catch (err) {
+          ligandText = "";
+        }
+        state.frames = splitPdbModels(pdbText);
+        state.ligandText = ligandText;
+        els.frameSlider.max = String(Math.max(state.frames.length - 1, 0));
+        renderFrame(0, false);
+        setStatus(`Rendered ${state.frames.length} frames`);
+      } catch (err) {
+        state.frames = [];
+        state.ligandText = "";
+        setStatus("Load failed");
+        showToast(err.message);
+      }
+    }
+
+    async function loadManifest(path) {
+      stopPlayback();
+      setStatus("Loading manifest");
+      try {
+        const manifest = await fetch(normalizePath(path), { cache: "no-cache" }).then(res => {
+          if (!res.ok) throw new Error(`${res.status} ${res.statusText}: ${path}`);
+          return res.json();
+        });
+        state.manifest = manifest;
+        state.samples = Array.isArray(manifest.samples) ? manifest.samples : [];
+        state.sampleIndex = 0;
+        els.runLabel.textContent = manifest.feature_mode ? `feature=${manifest.feature_mode}` : "Stage-2 generated paths";
+        renderRunSummary();
+        renderSampleList();
+        if (state.samples.length) {
+          await selectSample(0);
+        } else {
+          setStatus("No samples");
+        }
+      } catch (err) {
+        setStatus("Manifest failed");
+        showToast(err.message);
+      }
+    }
+
+    function init() {
+      const params = new URLSearchParams(window.location.search);
+      const manifestPath = params.get("manifest") || DEFAULT_MANIFEST;
+      els.manifestInput.value = manifestPath;
+      state.viewer = createViewer();
+      els.loadManifest.addEventListener("click", () => loadManifest(els.manifestInput.value.trim()));
+      els.playPause.addEventListener("click", togglePlayback);
+      els.frameSlider.addEventListener("input", event => {
+        stopPlayback();
+        renderFrame(Number(event.target.value), true);
+      });
+      els.resetView.addEventListener("click", () => {
+        if (state.viewer) {
+          state.viewer.zoomTo();
+          state.viewer.render();
+        }
+      });
+      document.querySelectorAll("[data-style]").forEach(button => {
+        button.addEventListener("click", () => {
+          document.querySelectorAll("[data-style]").forEach(item => item.classList.remove("active"));
+          button.classList.add("active");
+          state.style = button.dataset.style;
+          renderFrame(state.frameIndex, true);
+        });
+      });
+      loadManifest(manifestPath);
+    }
+
+    window.addEventListener("load", init);
+  </script>
+</body>
+</html>

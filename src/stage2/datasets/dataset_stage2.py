@@ -8,7 +8,9 @@ Aligned to current Stage-2 spec:
 """
 
 import sys
+import hashlib
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -32,7 +34,7 @@ from src.stage1.data.residue_constants import restype_order
 class Stage2Batch:
     """Stage-2 batch (apo/holo/ligand)."""
     # ESM embeddings
-    esm: torch.Tensor            # [B, N, 1280]
+    esm: torch.Tensor            # [B, N, 1280] or [B, N, K, 1280]
 
     # Apo/Holo torsions
     torsion_apo: torch.Tensor    # [B, N, 7]
@@ -58,6 +60,9 @@ class Stage2Batch:
 
     # Pocket weights
     w_res: torch.Tensor          # [B, N]
+
+    # Optional Stage-1-v2 posterior scalar features
+    stage1v2_posterior_features: Optional[torch.Tensor]  # [B, N, D] or None
 
     # Optional NMA features
     nma_features: Optional[torch.Tensor]  # [B, N, K] or None
@@ -147,9 +152,20 @@ def align_by_residue_ids(
     C_holo_out = np.zeros((target_len, 3), dtype=np.float32)
     valid_mask = np.zeros(target_len, dtype=bool)
     
-    for out_idx, res_id in enumerate(sorted(common_ids)):
-        if out_idx >= target_len:
-            break
+    sorted_common = sorted(common_ids)
+    if sorted_common:
+        residue_min = sorted_common[0]
+        residue_max = sorted_common[-1]
+        residue_span = residue_max - residue_min + 1
+        residue_offset = residue_min if residue_span <= target_len else residue_max - target_len + 1
+    else:
+        residue_offset = 0
+
+    placed = 0
+    for res_id in sorted_common:
+        out_idx = res_id - residue_offset
+        if out_idx < 0 or out_idx >= target_len:
+            continue
         apo_idx = apo_id_to_idx[res_id]
         holo_idx = holo_id_to_idx[res_id]
         N_apo_out[out_idx] = N_apo[apo_idx]
@@ -159,6 +175,21 @@ def align_by_residue_ids(
         Ca_holo_out[out_idx] = Ca_holo[holo_idx]
         C_holo_out[out_idx] = C_holo[holo_idx]
         valid_mask[out_idx] = True
+        placed += 1
+
+    if placed == 0:
+        for out_idx, res_id in enumerate(sorted_common):
+            if out_idx >= target_len:
+                break
+            apo_idx = apo_id_to_idx[res_id]
+            holo_idx = holo_id_to_idx[res_id]
+            N_apo_out[out_idx] = N_apo[apo_idx]
+            Ca_apo_out[out_idx] = Ca_apo[apo_idx]
+            C_apo_out[out_idx] = C_apo[apo_idx]
+            N_holo_out[out_idx] = N_holo[holo_idx]
+            Ca_holo_out[out_idx] = Ca_holo[holo_idx]
+            C_holo_out[out_idx] = C_holo[holo_idx]
+            valid_mask[out_idx] = True
     
     return (
         (N_apo_out, Ca_apo_out, C_apo_out),
@@ -183,6 +214,332 @@ def compute_pocket_weights(ca_coords: np.ndarray,
     return w_res.astype(np.float32)
 
 
+def _safe_sample_id(sample_id: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", sample_id)
+
+
+def _parse_feature_names(raw: Optional[str]) -> List[str]:
+    if raw is None:
+        raw = (
+            "contact_prob,active_prob,approach_prob,release_prob,confidence,"
+            "teacher_min_dist_pred_norm,signed_delta_dist_pred_norm"
+        )
+    if isinstance(raw, (list, tuple)):
+        names = [str(x).strip() for x in raw if str(x).strip()]
+    else:
+        names = [x.strip() for x in str(raw).split(",") if x.strip()]
+    if not names:
+        raise ValueError("stage1v2_posterior_feature_names cannot be empty")
+    return names
+
+
+def _load_manifest_paths(cache_dir: Optional[str], data_dir: Path) -> Dict[str, Path]:
+    if not cache_dir:
+        return {}
+    root = Path(cache_dir)
+    if not root.is_absolute():
+        root = root if root.exists() else data_dir / root
+    manifest_path = root / "manifest.json"
+    mapping: Dict[str, Path] = {}
+    if manifest_path.exists():
+        with manifest_path.open("r") as f:
+            manifest = json.load(f)
+        for record in manifest.get("records", []):
+            sample_id = record.get("sample_id")
+            path = record.get("path")
+            if not sample_id or not path:
+                continue
+            p = Path(path)
+            if not p.is_absolute():
+                p = root / p
+            mapping[str(sample_id)] = p
+    return mapping
+
+
+def _resolve_stage1v2_path(cache_dir: Optional[str], cache_map: Dict[str, Path], data_dir: Path, sample_id: str) -> Path:
+    if sample_id in cache_map:
+        return cache_map[sample_id]
+    if not cache_dir:
+        return Path("")
+    root = Path(cache_dir)
+    if not root.is_absolute():
+        root = root if root.exists() else data_dir / root
+    return root / f"{_safe_sample_id(sample_id)}.npz"
+
+
+ORACLE_MOTION_FEATURE_MODES = {
+    "oracle_motion",
+    "oracle_motion_residue_shuffled",
+    "oracle_motion_sample_shuffled",
+}
+
+STAGE1V2_FILE_FEATURE_MODES = {
+    "student",
+    "student_shuffled",
+    "oracle_holo_truth",
+    "external_teacher_cached",
+    *ORACLE_MOTION_FEATURE_MODES,
+}
+
+SAMPLE_SHUFFLED_FEATURE_MODES = {
+    "student_shuffled",
+    "oracle_motion_sample_shuffled",
+}
+
+SCALAR_STAGE1V2_FEATURE_ALIASES = {
+    "active_prob": ("active_prob", "switch_prob"),
+    "switch_prob": ("switch_prob", "active_prob"),
+    "teacher_min_dist_pred": ("teacher_min_dist_pred", "teacher_min_dist"),
+    "teacher_min_dist": ("teacher_min_dist", "teacher_min_dist_pred"),
+    "signed_delta_dist_pred": ("signed_delta_dist_pred", "signed_delta_dist"),
+    "signed_delta_dist": ("signed_delta_dist", "signed_delta_dist_pred"),
+    "teacher_min_dist_pred_norm": ("teacher_min_dist_pred", "teacher_min_dist"),
+    "teacher_min_dist_norm": ("teacher_min_dist", "teacher_min_dist_pred"),
+    "signed_delta_dist_pred_norm": ("signed_delta_dist_pred", "signed_delta_dist"),
+    "signed_delta_dist_norm": ("signed_delta_dist", "signed_delta_dist_pred"),
+}
+
+
+def _scalar_string(value) -> str:
+    arr = np.asarray(value)
+    if arr.shape == ():
+        return str(arr.item())
+    if arr.size == 1:
+        return str(arr.reshape(-1)[0])
+    raise ValueError(f"Expected scalar string field, got shape={arr.shape}")
+
+
+def _scalar_int(value) -> int:
+    arr = np.asarray(value)
+    if arr.shape == ():
+        return int(arr.item())
+    if arr.size == 1:
+        return int(arr.reshape(-1)[0])
+    raise ValueError(f"Expected scalar int field, got shape={arr.shape}")
+
+
+def _validate_vector_len(name: str, arr: np.ndarray, n_res: int, path: Path) -> np.ndarray:
+    if arr.ndim != 1:
+        raise ValueError(f"{path} field {name} must be 1D, got shape={arr.shape}")
+    if arr.shape[0] != n_res:
+        raise ValueError(f"{path} field {name} length mismatch: {arr.shape[0]} != expected {n_res}")
+    return arr
+
+
+def _validate_feature_cache_metadata(
+    data,
+    path: Path,
+    *,
+    expected_sample_id: str,
+    expected_n_res: int,
+    expected_aatype: Optional[np.ndarray],
+    expected_node_mask: Optional[np.ndarray],
+) -> None:
+    missing_meta = [
+        key for key in ("sample_id", "n_residues")
+        if key not in data
+    ]
+    if missing_meta:
+        raise ValueError(f"{path} missing required feature-cache metadata: {missing_meta}")
+
+    sample_id = _scalar_string(data["sample_id"])
+    if sample_id != expected_sample_id:
+        raise ValueError(f"{path} sample_id={sample_id!r}, expected {expected_sample_id!r}")
+
+    n_res = _scalar_int(data["n_residues"])
+    if n_res != int(expected_n_res):
+        raise ValueError(f"{path} n_residues={n_res}, expected {expected_n_res}")
+
+    if expected_aatype is not None:
+        if "aatype" not in data:
+            raise ValueError(f"{path} missing required feature-cache metadata: ['aatype']")
+        cache_aatype = _validate_vector_len(
+            "aatype",
+            np.asarray(data["aatype"]).astype(np.int64),
+            int(expected_n_res),
+            path,
+        )
+        expected = np.asarray(expected_aatype).astype(np.int64)
+        _validate_vector_len("expected_aatype", expected, int(expected_n_res), path)
+        if not np.array_equal(cache_aatype, expected):
+            mismatch = np.flatnonzero(cache_aatype != expected)[:8].tolist()
+            raise ValueError(f"{path} aatype mismatch at residues {mismatch}")
+
+    if expected_node_mask is not None:
+        mask_key = "node_mask" if "node_mask" in data else ("valid_mask" if "valid_mask" in data else None)
+        if mask_key is not None:
+            cache_mask = _validate_vector_len(
+                mask_key,
+                np.asarray(data[mask_key]).astype(np.bool_),
+                int(expected_n_res),
+                path,
+            )
+            expected_mask = np.asarray(expected_node_mask).astype(np.bool_)
+            _validate_vector_len("expected_node_mask", expected_mask, int(expected_n_res), path)
+            invalid_claims = cache_mask & (~expected_mask)
+            if invalid_claims.any():
+                mismatch = np.flatnonzero(invalid_claims)[:8].tolist()
+                raise ValueError(
+                    f"{path} {mask_key} marks residues valid that Stage-2 marks invalid: {mismatch}"
+                )
+
+
+def _read_npz_vector(data, feature_name: str, n_res: int, path: Path) -> np.ndarray:
+    keys = SCALAR_STAGE1V2_FEATURE_ALIASES.get(feature_name, (feature_name,))
+    key = next((k for k in keys if k in data), None)
+    if key is None:
+        raise KeyError(f"{path} missing Stage-1-v2 posterior feature {feature_name!r}")
+    arr = np.asarray(data[key]).astype(np.float32)
+    arr = _validate_vector_len(feature_name, arr, n_res, path)
+    if feature_name in {"teacher_min_dist_pred_norm", "teacher_min_dist_norm"}:
+        arr = np.clip(arr, 0.0, 20.0) / 10.0
+    elif feature_name in {"signed_delta_dist_pred_norm", "signed_delta_dist_norm"}:
+        arr = np.clip(arr, -10.0, 10.0) / 5.0
+    if not np.isfinite(arr).all():
+        raise ValueError(f"{path} feature {feature_name} contains non-finite values")
+    return arr
+
+
+def load_stage1v2_posterior_features(
+    path: Path,
+    feature_names: List[str],
+    n_res: int,
+    *,
+    expected_sample_id: str,
+    expected_aatype: Optional[np.ndarray],
+    expected_node_mask: Optional[np.ndarray],
+) -> np.ndarray:
+    if not path.exists():
+        raise FileNotFoundError(path)
+    with np.load(path, allow_pickle=False) as data:
+        _validate_feature_cache_metadata(
+            data,
+            path,
+            expected_sample_id=expected_sample_id,
+            expected_n_res=n_res,
+            expected_aatype=expected_aatype,
+            expected_node_mask=expected_node_mask,
+        )
+        cols = [_read_npz_vector(data, name, n_res, path) for name in feature_names]
+    return np.stack(cols, axis=-1).astype(np.float32)
+
+
+def _npz_feature_names(data, path: Path) -> List[str]:
+    if "feature_names" not in data:
+        raise ValueError(f"{path} missing feature_names for oracle_motion_features")
+    return [str(x) for x in np.asarray(data["feature_names"]).tolist()]
+
+
+def load_oracle_motion_features(
+    path: Path,
+    feature_names: List[str],
+    n_res: int,
+    *,
+    expected_sample_id: str,
+    expected_aatype: Optional[np.ndarray],
+    expected_node_mask: Optional[np.ndarray],
+) -> np.ndarray:
+    if not path.exists():
+        raise FileNotFoundError(path)
+    with np.load(path, allow_pickle=False) as data:
+        _validate_feature_cache_metadata(
+            data,
+            path,
+            expected_sample_id=expected_sample_id,
+            expected_n_res=n_res,
+            expected_aatype=expected_aatype,
+            expected_node_mask=expected_node_mask,
+        )
+        if "oracle_motion_features" not in data:
+            raise KeyError(f"{path} missing oracle_motion_features")
+        matrix = np.asarray(data["oracle_motion_features"]).astype(np.float32)
+        if matrix.ndim != 2:
+            raise ValueError(f"{path} oracle_motion_features must be 2D, got shape={matrix.shape}")
+        if matrix.shape[0] != n_res:
+            raise ValueError(f"{path} oracle_motion_features n_res mismatch: {matrix.shape[0]} != {n_res}")
+        cached_names = _npz_feature_names(data, path)
+        name_to_idx = {name: idx for idx, name in enumerate(cached_names)}
+        missing = [name for name in feature_names if name not in name_to_idx]
+        if missing:
+            raise KeyError(f"{path} missing OracleMotion features: {missing}")
+        indices = [name_to_idx[name] for name in feature_names]
+        out = matrix[:, indices]
+    if not np.isfinite(out).all():
+        raise ValueError(f"{path} oracle_motion_features contains non-finite values")
+    return out.astype(np.float32)
+
+
+def _esm_features_from_data(data: Dict, path: Path, esm_num_layers: int = 1) -> np.ndarray:
+    """Extract single-layer or last-K ESM residue features from loaded esm.pt data."""
+    if esm_num_layers < 1:
+        raise ValueError(f"esm_num_layers must be >= 1, got {esm_num_layers}")
+    if "per_residue" not in data:
+        raise KeyError(f"{path} missing per_residue")
+
+    per_residue = data["per_residue"]
+    if torch.is_tensor(per_residue):
+        per_residue = per_residue.detach().cpu().numpy()
+    per_residue = np.asarray(per_residue, dtype=np.float32)
+    if per_residue.ndim != 2:
+        raise ValueError(f"{path} per_residue must be [N, D], got shape={per_residue.shape}")
+
+    if esm_num_layers == 1:
+        out = per_residue
+    else:
+        if "per_residue_layers" not in data:
+            raise KeyError(
+                f"{path} missing per_residue_layers required for esm_num_layers={esm_num_layers}"
+            )
+        layers = data["per_residue_layers"]
+        if torch.is_tensor(layers):
+            layers = layers.detach().cpu().numpy()
+        layers = np.asarray(layers, dtype=np.float32)
+        if layers.ndim != 3:
+            raise ValueError(
+                f"{path} per_residue_layers must be [N, K, D], got shape={layers.shape}"
+            )
+        if layers.shape[0] != per_residue.shape[0] or layers.shape[-1] != per_residue.shape[-1]:
+            raise ValueError(
+                f"{path} per_residue_layers shape {layers.shape} is inconsistent with "
+                f"per_residue shape {per_residue.shape}"
+            )
+        if layers.shape[1] < esm_num_layers:
+            raise ValueError(
+                f"{path} stores K={layers.shape[1]} ESM layers, fewer than requested "
+                f"esm_num_layers={esm_num_layers}"
+            )
+        out = layers[:, -esm_num_layers:, :]
+
+    if not np.isfinite(out).all():
+        raise ValueError(f"{path} ESM features contain non-finite values")
+    return out.astype(np.float32)
+
+
+def load_esm_features(path: Path, esm_num_layers: int = 1) -> np.ndarray:
+    """Load single-layer or last-K ESM residue features from an esm.pt file."""
+    data = torch.load(path, weights_only=False)
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} must contain a dict with per_residue features")
+    return _esm_features_from_data(data, path, esm_num_layers)
+
+
+def _stable_int_seed(*parts: str) -> int:
+    digest = hashlib.sha256("|".join(str(p) for p in parts).encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], byteorder="little", signed=False) % (2**32)
+
+
+def _shuffle_valid_residue_rows(features: np.ndarray, node_mask: np.ndarray, sample_id: str, mode: str) -> np.ndarray:
+    out = np.array(features, copy=True)
+    valid = np.flatnonzero(np.asarray(node_mask).astype(bool))
+    if valid.size <= 1:
+        return out
+    perm = np.array(valid, copy=True)
+    rng = np.random.default_rng(_stable_int_seed(sample_id, mode, "residue_shuffle"))
+    rng.shuffle(perm)
+    out[valid] = features[perm]
+    return out
+
+
 # -----------------------------
 # Dataset
 # -----------------------------
@@ -197,11 +554,22 @@ class ApoHoloBridgeDataset(Dataset):
                  index_file: Optional[str] = None,
                  max_lig_tokens: int = 128,
                  require_nma: bool = False,
-                 valid_samples_file: Optional[str] = None):
+                 valid_samples_file: Optional[str] = None,
+                 stage1v2_posterior_cache_dir: Optional[str] = None,
+                 stage1v2_posterior_feature_mode: str = "none",
+                 stage1v2_posterior_feature_names: Optional[str] = None,
+                 esm_num_layers: int = 1):
         self.data_dir = Path(data_dir)
         self.split = split
         self.max_lig_tokens = max_lig_tokens
         self.require_nma = require_nma
+        self.esm_num_layers = int(esm_num_layers)
+        if self.esm_num_layers < 1:
+            raise ValueError(f"esm_num_layers must be >= 1, got {esm_num_layers}")
+        self.stage1v2_posterior_cache_dir = stage1v2_posterior_cache_dir
+        self.stage1v2_posterior_feature_mode = str(stage1v2_posterior_feature_mode or "none")
+        self.stage1v2_posterior_feature_names = _parse_feature_names(stage1v2_posterior_feature_names)
+        self.stage1v2_posterior_cache_map = _load_manifest_paths(stage1v2_posterior_cache_dir, self.data_dir)
 
         self.samples = self._load_index(index_file)
         
@@ -209,12 +577,28 @@ class ApoHoloBridgeDataset(Dataset):
         if valid_samples_file:
             self.samples = self._filter_by_valid_samples(valid_samples_file)
         
+        # Filter out samples with missing required files
+        self.samples = self._filter_valid_samples()
+
+        if self.stage1v2_posterior_feature_mode in STAGE1V2_FILE_FEATURE_MODES:
+            self.samples = self._filter_stage1v2_posterior_samples()
+        self.stage1v2_sample_shuffle_sources: Dict[int, int] = {}
+        if self.stage1v2_posterior_feature_mode in SAMPLE_SHUFFLED_FEATURE_MODES:
+            self.stage1v2_sample_shuffle_sources = self._build_same_length_shuffle_sources()
+
         print(f"✓ Stage-2 {split} samples: {len(self.samples)}")
+        if self.stage1v2_posterior_feature_mode != "none":
+            print(
+                f"  Stage-1-v2 posterior features: mode={self.stage1v2_posterior_feature_mode} "
+                f"dim={len(self.stage1v2_posterior_feature_names)}"
+            )
+        if self.esm_num_layers > 1:
+            print(f"  ESM last-K layers required: K={self.esm_num_layers}")
 
     def _filter_by_valid_samples(self, valid_samples_file: str) -> List[Dict]:
         """Filter samples by a list of valid sample IDs."""
         valid_path = Path(valid_samples_file)
-        if not valid_path.is_absolute():
+        if not valid_path.is_absolute() and not valid_path.exists():
             valid_path = self.data_dir / valid_path
         
         if not valid_path.exists():
@@ -228,6 +612,142 @@ class ApoHoloBridgeDataset(Dataset):
         filtered = [s for s in self.samples if s.get('id', '') in valid_ids]
         print(f"  Filtered {before - len(filtered)} samples using {valid_path.name}")
         return filtered
+
+    def _filter_valid_samples(self) -> List[Dict]:
+        """Remove samples with missing required files."""
+        required_files = [
+            ('esm_path', 'esm.pt'),
+            ('torsion_apo', 'torsion_apo.npz'),
+            ('torsion_holo', 'torsion_holo.npz'),
+            ('ligand_coords', 'ligand_coords.npy'),
+            ('apo_pdb', 'apo.pdb'),
+            ('holo_pdb', 'holo.pdb'),
+        ]
+        valid = []
+        missing_counts = {name: 0 for name, _ in required_files}
+        for s in self.samples:
+            skip = False
+            for key, default in required_files:
+                p = self._resolve_path(s, key, default)
+                if p is None or not p.exists():
+                    missing_counts[key] += 1
+                    skip = True
+                    break
+            if not skip:
+                valid.append(s)
+        removed = len(self.samples) - len(valid)
+        if removed > 0:
+            for key, count in missing_counts.items():
+                if count > 0:
+                    print(f"  Removed {count} samples with missing {key}")
+            print(f"  Total removed: {removed}")
+        return valid
+
+    def _filter_stage1v2_posterior_samples(self) -> List[Dict]:
+        valid = []
+        missing = 0
+        for sample in self.samples:
+            sample_id = sample.get('id', '')
+            path = _resolve_stage1v2_path(
+                self.stage1v2_posterior_cache_dir,
+                self.stage1v2_posterior_cache_map,
+                self.data_dir,
+                sample_id,
+            )
+            if path.exists():
+                valid.append(sample)
+            else:
+                missing += 1
+        if missing > 0:
+            print(f"  Removed {missing} samples without Stage-1-v2 posterior cache/labels")
+        if not valid:
+            raise ValueError(
+                f"No Stage-1-v2 posterior files found for split={self.split}, "
+                f"mode={self.stage1v2_posterior_feature_mode}, dir={self.stage1v2_posterior_cache_dir}"
+            )
+        return valid
+
+    def _stage1v2_path_for_sample_id(self, sample_id: str) -> Path:
+        return _resolve_stage1v2_path(
+            self.stage1v2_posterior_cache_dir,
+            self.stage1v2_posterior_cache_map,
+            self.data_dir,
+            sample_id,
+        )
+
+    def _feature_cache_n_res(self, sample: Dict) -> int:
+        sample_id = sample.get('id', '')
+        path = self._stage1v2_path_for_sample_id(sample_id)
+        if not path.exists():
+            raise FileNotFoundError(path)
+        with np.load(path, allow_pickle=False) as data:
+            if "sample_id" in data:
+                cached_id = _scalar_string(data["sample_id"])
+                if cached_id != sample_id:
+                    raise ValueError(f"{path} sample_id={cached_id!r}, expected {sample_id!r}")
+            if "n_residues" not in data:
+                raise ValueError(f"{path} missing n_residues; cannot build strict sample-shuffled control")
+            return _scalar_int(data["n_residues"])
+
+    def _build_same_length_shuffle_sources(self) -> Dict[int, int]:
+        by_len: Dict[int, List[int]] = {}
+        for idx, sample in enumerate(self.samples):
+            n_res = self._feature_cache_n_res(sample)
+            by_len.setdefault(n_res, []).append(idx)
+
+        singleton = {
+            n_res: indices
+            for n_res, indices in by_len.items()
+            if len(indices) < 2
+        }
+        if singleton:
+            examples = [
+                self.samples[indices[0]].get('id', f'sample_{indices[0]}')
+                for _, indices in list(singleton.items())[:8]
+            ]
+            raise ValueError(
+                f"{self.stage1v2_posterior_feature_mode} requires same-length donor samples. "
+                f"{sum(len(v) for v in singleton.values())} singleton-length samples found; "
+                f"examples={examples}. Use a same-length subset or oracle_motion_residue_shuffled."
+            )
+
+        source_by_idx: Dict[int, int] = {}
+        for indices in by_len.values():
+            ordered = sorted(indices)
+            for pos, idx in enumerate(ordered):
+                source_by_idx[idx] = ordered[(pos + 1) % len(ordered)]
+        return source_by_idx
+
+    def _load_stage1v2_features_for_sample(
+        self,
+        *,
+        path: Path,
+        sample_id: str,
+        n_res: int,
+        aatype: Optional[np.ndarray],
+        node_mask: Optional[np.ndarray],
+        feature_mode: str,
+        strict_residue_identity: bool,
+    ) -> np.ndarray:
+        expected_aatype = aatype if strict_residue_identity else None
+        expected_node_mask = node_mask if strict_residue_identity else None
+        if feature_mode in ORACLE_MOTION_FEATURE_MODES:
+            return load_oracle_motion_features(
+                path,
+                self.stage1v2_posterior_feature_names,
+                n_res,
+                expected_sample_id=sample_id,
+                expected_aatype=expected_aatype,
+                expected_node_mask=expected_node_mask,
+            )
+        return load_stage1v2_posterior_features(
+            path,
+            self.stage1v2_posterior_feature_names,
+            n_res,
+            expected_sample_id=sample_id,
+            expected_aatype=expected_aatype,
+            expected_node_mask=expected_node_mask,
+        )
 
     def _load_index(self, index_file: Optional[str]) -> List[Dict]:
         if index_file is not None:
@@ -287,9 +807,11 @@ class ApoHoloBridgeDataset(Dataset):
         if esm_path is None or not esm_path.exists():
             raise FileNotFoundError(f"ESM not found for {sample_id}")
         esm_data = torch.load(esm_path, weights_only=False)
-        esm_features = esm_data['per_residue'].numpy()
+        if not isinstance(esm_data, dict):
+            raise ValueError(f"{esm_path} must contain a dict with per_residue features")
+        esm_features = _esm_features_from_data(esm_data, esm_path, self.esm_num_layers)
         sequence_str = esm_data.get('sequence_str', '')
-        n_res = len(esm_features)
+        n_res = int(esm_features.shape[0])
 
         # Apo/Holo backbone
         apo_pdb = self._resolve_path(sample, 'apo_pdb', 'apo.pdb')
@@ -362,6 +884,68 @@ class ApoHoloBridgeDataset(Dataset):
             w_res = compute_pocket_weights(Ca_apo, lig_tokens['coords'])
         w_res = w_res * node_mask.astype(np.float32)
 
+        stage1v2_posterior_features = None
+        if self.stage1v2_posterior_feature_mode == "zero":
+            stage1v2_posterior_features = np.zeros(
+                (n_res, len(self.stage1v2_posterior_feature_names)),
+                dtype=np.float32,
+            )
+        elif self.stage1v2_posterior_feature_mode in {"student", "oracle_holo_truth", "external_teacher_cached", "oracle_motion"}:
+            posterior_path = self._stage1v2_path_for_sample_id(sample_id)
+            stage1v2_posterior_features = self._load_stage1v2_features_for_sample(
+                path=posterior_path,
+                sample_id=sample_id,
+                n_res=n_res,
+                aatype=aatype,
+                node_mask=node_mask,
+                feature_mode=self.stage1v2_posterior_feature_mode,
+                strict_residue_identity=True,
+            )
+        elif self.stage1v2_posterior_feature_mode == "oracle_motion_residue_shuffled":
+            posterior_path = self._stage1v2_path_for_sample_id(sample_id)
+            stage1v2_posterior_features = self._load_stage1v2_features_for_sample(
+                path=posterior_path,
+                sample_id=sample_id,
+                n_res=n_res,
+                aatype=aatype,
+                node_mask=node_mask,
+                feature_mode=self.stage1v2_posterior_feature_mode,
+                strict_residue_identity=True,
+            )
+            stage1v2_posterior_features = _shuffle_valid_residue_rows(
+                stage1v2_posterior_features,
+                node_mask,
+                sample_id,
+                self.stage1v2_posterior_feature_mode,
+            )
+        elif self.stage1v2_posterior_feature_mode in SAMPLE_SHUFFLED_FEATURE_MODES:
+            if len(self.samples) < 2:
+                raise ValueError(f"{self.stage1v2_posterior_feature_mode} mode requires at least two samples")
+            source_idx = self.stage1v2_sample_shuffle_sources.get(idx)
+            if source_idx is None:
+                raise RuntimeError(f"No same-length shuffled source for sample idx={idx} id={sample_id}")
+            source_sample = self.samples[source_idx]
+            source_id = source_sample.get('id', f'sample_{source_idx}')
+            posterior_path = self._stage1v2_path_for_sample_id(source_id)
+            source_mode = (
+                "oracle_motion"
+                if self.stage1v2_posterior_feature_mode == "oracle_motion_sample_shuffled"
+                else "student"
+            )
+            stage1v2_posterior_features = self._load_stage1v2_features_for_sample(
+                path=posterior_path,
+                sample_id=source_id,
+                n_res=n_res,
+                aatype=None,
+                node_mask=None,
+                feature_mode=source_mode,
+                strict_residue_identity=False,
+            )
+        elif self.stage1v2_posterior_feature_mode != "none":
+            raise ValueError(f"Unknown stage1v2_posterior_feature_mode={self.stage1v2_posterior_feature_mode}")
+        if stage1v2_posterior_features is not None:
+            stage1v2_posterior_features = stage1v2_posterior_features * node_mask[:, None].astype(np.float32)
+
         bb_mask = torsion_apo['bb_mask'] & node_mask[:, None]
         chi_mask = torsion_apo['chi_mask'] & node_mask[:, None]
 
@@ -392,6 +976,7 @@ class ApoHoloBridgeDataset(Dataset):
             'lig_points': lig_tokens['coords'],
             'lig_types': lig_tokens['types'],
             'w_res': w_res,
+            'stage1v2_posterior_features': stage1v2_posterior_features,
             'nma_features': nma_features,
             'n_residues': n_res,
             'node_mask': node_mask,
@@ -408,7 +993,14 @@ def collate_stage2_batch(samples: List[Dict]) -> Stage2Batch:
     max_n_res = max(s['n_residues'] for s in samples)
     max_lig = max(len(s['lig_points']) for s in samples)
 
-    esm_batch = np.zeros((batch_size, max_n_res, 1280), dtype=np.float32)
+    esm_tail_shape = tuple(samples[0]['esm'].shape[1:])
+    for sample in samples:
+        if tuple(sample['esm'].shape[1:]) != esm_tail_shape:
+            raise ValueError(
+                f"Mixed ESM feature shapes in batch: {esm_tail_shape} and "
+                f"{tuple(sample['esm'].shape[1:])}"
+            )
+    esm_batch = np.zeros((batch_size, max_n_res, *esm_tail_shape), dtype=np.float32)
     torsion_apo = np.zeros((batch_size, max_n_res, 7), dtype=np.float32)
     torsion_holo = np.zeros((batch_size, max_n_res, 7), dtype=np.float32)
     bb_mask = np.zeros((batch_size, max_n_res, 3), dtype=bool)
@@ -427,6 +1019,15 @@ def collate_stage2_batch(samples: List[Dict]) -> Stage2Batch:
     lig_mask = np.zeros((batch_size, max_lig), dtype=bool)
 
     w_res = np.zeros((batch_size, max_n_res), dtype=np.float32)
+
+    stage1v2_dim = None
+    for s in samples:
+        if s.get('stage1v2_posterior_features') is not None:
+            stage1v2_dim = s['stage1v2_posterior_features'].shape[-1]
+            break
+    stage1v2_posterior_features = None
+    if stage1v2_dim is not None:
+        stage1v2_posterior_features = np.zeros((batch_size, max_n_res, stage1v2_dim), dtype=np.float32)
 
     nma_dim = None
     for s in samples:
@@ -470,6 +1071,10 @@ def collate_stage2_batch(samples: List[Dict]) -> Stage2Batch:
 
         w_res[i, :n_res] = sample['w_res']
 
+        if stage1v2_posterior_features is not None and sample.get('stage1v2_posterior_features') is not None:
+            feat = sample['stage1v2_posterior_features']
+            stage1v2_posterior_features[i, :n_res, :feat.shape[-1]] = feat
+
         if nma_features is not None and sample['nma_features'] is not None:
             nma = sample['nma_features']
             if nma.ndim == 1:
@@ -499,6 +1104,11 @@ def collate_stage2_batch(samples: List[Dict]) -> Stage2Batch:
         lig_types=torch.from_numpy(lig_types),
         lig_mask=torch.from_numpy(lig_mask),
         w_res=torch.from_numpy(w_res),
+        stage1v2_posterior_features=(
+            torch.from_numpy(stage1v2_posterior_features)
+            if stage1v2_posterior_features is not None
+            else None
+        ),
         nma_features=torch.from_numpy(nma_features) if nma_features is not None else None,
         aatype=torch.from_numpy(aatype),
         sequences=sequences,

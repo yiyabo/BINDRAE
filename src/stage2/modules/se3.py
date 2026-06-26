@@ -7,6 +7,10 @@ from typing import Tuple
 import torch
 
 
+_SE3_COEFF_SERIES_THRESH = 1e-2
+_SE3_V_INV_SERIES_THRESH = 1e-1
+
+
 def _skew(v: torch.Tensor) -> torch.Tensor:
     """Skew-symmetric matrix from vectors [..., 3]."""
     zero = torch.zeros_like(v[..., 0])
@@ -19,6 +23,60 @@ def _skew(v: torch.Tensor) -> torch.Tensor:
         ],
         dim=-2,
     )
+
+
+def _se3_v_coefficients(theta: torch.Tensor, eps: float = 1e-8) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Stable A/B/C coefficients for the SE(3) V matrix.
+
+    For float32, the closed-form expressions become numerically unstable well
+    before theta reaches 1e-4 because (1 - cos(theta)) and (1 - sin(theta)/theta)
+    suffer catastrophic cancellation. Use series expansions over a wider range.
+    """
+    theta2 = theta * theta
+    theta4 = theta2 * theta2
+    theta6 = theta4 * theta2
+
+    A_series = 1.0 - theta2 / 6.0 + theta4 / 120.0 - theta6 / 5040.0
+    B_series = 0.5 - theta2 / 24.0 + theta4 / 720.0 - theta6 / 40320.0
+    C_series = 1.0 / 6.0 - theta2 / 120.0 + theta4 / 5040.0 - theta6 / 362880.0
+
+    safe_theta = theta.clamp(min=eps)
+    safe_theta2 = theta2.clamp(min=eps)
+    A_exact = torch.sin(theta) / safe_theta
+    B_exact = (1.0 - torch.cos(theta)) / safe_theta2
+    C_exact = (1.0 - A_exact) / safe_theta2
+
+    use_series = theta < _SE3_COEFF_SERIES_THRESH
+    A = torch.where(use_series, A_series, A_exact)
+    B = torch.where(use_series, B_series, B_exact)
+    C = torch.where(use_series, C_series, C_exact)
+    return A, B, C
+
+
+def _se3_v_inv_factor(theta: torch.Tensor, A: torch.Tensor, B: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """
+    Stable scalar factor in V^{-1} = I - 0.5 K + factor * K^2.
+
+    The exact expression is numerically unusable in float32 for small angles, so
+    we switch to a series expansion long before the mathematical limit.
+    """
+    theta2 = theta * theta
+    theta4 = theta2 * theta2
+    theta6 = theta4 * theta2
+
+    factor_series = (
+        1.0 / 12.0
+        + theta2 / 720.0
+        + theta4 / 30240.0
+        + theta6 / 1209600.0
+    )
+
+    safe_theta2 = theta2.clamp(min=eps)
+    safe_B = B.clamp(min=eps)
+    factor_exact = (1.0 - A / (2.0 * safe_B)) / safe_theta2
+    use_series = theta < _SE3_V_INV_SERIES_THRESH
+    return torch.where(use_series, factor_series, factor_exact)
 
 
 def so3_exp(omega: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
@@ -42,7 +100,8 @@ def so3_exp(omega: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
 def so3_log(R: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     """Log map from SO(3) to so(3), returns axis-angle vector."""
     trace = R[..., 0, 0] + R[..., 1, 1] + R[..., 2, 2]
-    cos_theta = ((trace - 1.0) / 2.0).clamp(min=-1.0 + 1e-6, max=1.0 - 1e-6)
+    cos_theta_raw = ((trace - 1.0) / 2.0).clamp(min=-1.0, max=1.0)
+    cos_theta = cos_theta_raw.clamp(min=-1.0 + 1e-6, max=1.0 - 1e-6)
     theta = torch.acos(cos_theta)
 
     omega_hat = 0.5 * (R - R.transpose(-2, -1))
@@ -51,17 +110,66 @@ def so3_log(R: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
         dim=-1,
     )
 
+    near_pi = (cos_theta_raw < -0.9999)
+    small = (cos_theta_raw > 1.0 - 1e-6)
+
+    # Standard case: 0 < theta < pi
     sin_theta = torch.sin(theta).clamp(min=eps)
-    scale = theta / sin_theta
+    scale = torch.where(
+        near_pi.squeeze(-1),
+        torch.zeros_like(theta).squeeze(-1),
+        (theta / sin_theta).squeeze(-1)
+    )
     omega = omega * scale.unsqueeze(-1)
 
-    small = theta < 1e-4
+    # Near-pi case: use diagonal elements to extract axis
+    if near_pi.any():
+        mask = near_pi.squeeze(-1)
+        diag0 = R[..., 0, 0]
+        diag1 = R[..., 1, 1]
+        diag2 = R[..., 2, 2]
+
+        # Choose the largest diagonal for numerical stability
+        max_diag = torch.stack([diag0, diag1, diag2], dim=-1)
+        idx = max_diag.argmax(dim=-1)
+
+        def extract_axis(i):
+            denom = (2.0 * (R[..., i, i] + 1.0)).clamp(min=eps).sqrt()
+            axis_i = torch.zeros_like(omega)
+            if i == 0:
+                axis_i[..., 0] = (R[..., 0, 0] + 1.0) / denom
+                axis_i[..., 1] = R[..., 0, 1] / denom
+                axis_i[..., 2] = R[..., 0, 2] / denom
+            elif i == 1:
+                axis_i[..., 0] = R[..., 1, 0] / denom
+                axis_i[..., 1] = (R[..., 1, 1] + 1.0) / denom
+                axis_i[..., 2] = R[..., 1, 2] / denom
+            else:
+                axis_i[..., 0] = R[..., 2, 0] / denom
+                axis_i[..., 1] = R[..., 2, 1] / denom
+                axis_i[..., 2] = (R[..., 2, 2] + 1.0) / denom
+            return axis_i
+
+        axis0 = extract_axis(0)
+        axis1 = extract_axis(1)
+        axis2 = extract_axis(2)
+
+        axis = torch.where(
+            (idx == 0).unsqueeze(-1), axis0,
+            torch.where((idx == 1).unsqueeze(-1), axis1, axis2)
+        )
+        omega_pi = axis * torch.pi
+        omega = torch.where(mask.unsqueeze(-1), omega_pi, omega)
+
+    # Small angle case
     if small.any():
-        omega = torch.where(small.unsqueeze(-1), omega, omega)
-        omega = torch.where(small.unsqueeze(-1), torch.stack(
+        mask = small.squeeze(-1)
+        omega_small = torch.stack(
             [omega_hat[..., 2, 1], omega_hat[..., 0, 2], omega_hat[..., 1, 0]],
             dim=-1,
-        ), omega)
+        )
+        omega = torch.where(mask.unsqueeze(-1), omega_small, omega)
+
     return omega
 
 
@@ -75,13 +183,12 @@ def se3_exp(xi: torch.Tensor, eps: float = 1e-8) -> Tuple[torch.Tensor, torch.Te
     theta = torch.norm(omega, dim=-1, keepdim=True)
     R = so3_exp(omega, eps=eps)
 
-    K = _skew(omega / theta.clamp(min=eps))
+    # V matrix uses _skew(omega) (unnormalized), NOT _skew(omega/theta).
+    # Standard formula: V = I + B*[ω]× + C*[ω]×²
+    # where B = (1-cosθ)/θ², C = (1-sinθ/θ)/θ².
+    K = _skew(omega)
     eye = torch.eye(3, device=xi.device, dtype=xi.dtype).expand_as(K)
-    theta2 = theta * theta
-
-    A = torch.where(theta < 1e-4, 1.0 - theta2 / 6.0, torch.sin(theta) / theta)
-    B = torch.where(theta < 1e-4, 0.5 - theta2 / 24.0, (1.0 - torch.cos(theta)) / theta2.clamp(min=eps))
-    C = torch.where(theta < 1e-4, 1.0 / 6.0 - theta2 / 120.0, (1.0 - A) / theta2.clamp(min=eps))
+    _, B, C = _se3_v_coefficients(theta, eps=eps)
 
     V = eye + B[..., None] * K + C[..., None] * (K @ K)
     t = torch.matmul(V, v.unsqueeze(-1)).squeeze(-1)
@@ -95,24 +202,12 @@ def se3_log(R: torch.Tensor, t: torch.Tensor, eps: float = 1e-8) -> torch.Tensor
     """
     omega = so3_log(R, eps=eps)
     theta = torch.norm(omega, dim=-1, keepdim=True)  # [..., 1]
-    theta_squeezed = theta.squeeze(-1)  # [...]
-    K = _skew(omega / theta.clamp(min=eps))
+    # V_inv uses _skew(omega) (unnormalized), matching the V matrix convention.
+    K = _skew(omega)
     eye = torch.eye(3, device=R.device, dtype=R.dtype).expand_as(K)
-    theta2 = theta * theta
-
-    A = torch.where(theta < 1e-4, 1.0 - theta2 / 6.0, torch.sin(theta) / theta)
-    B = torch.where(theta < 1e-4, 0.5 - theta2 / 24.0, (1.0 - torch.cos(theta)) / theta2.clamp(min=eps))
-
-    # V_inv ≈ I - 0.5 K + (1/theta^2)*(1 - A/(2B)) K^2
-    B_safe = B.clamp(min=eps)
-    factor = (1.0 - A / (2.0 * B_safe)) / theta2.clamp(min=eps)
+    A, B, _ = _se3_v_coefficients(theta, eps=eps)
+    factor = _se3_v_inv_factor(theta, A, B, eps=eps)
     V_inv = eye - 0.5 * K + factor[..., None] * (K @ K)
-
-    # Handle small theta case
-    small = theta_squeezed < 1e-4  # [...]
-    if small.any():
-        V_inv_small = eye - 0.5 * K + (1.0 / 12.0) * (K @ K)
-        V_inv = torch.where(small[..., None, None], V_inv_small, V_inv)
 
     v = torch.matmul(V_inv, t.unsqueeze(-1)).squeeze(-1)
     return torch.cat([omega, v], dim=-1)
@@ -131,4 +226,3 @@ def rigid_inverse(R: torch.Tensor, t: torch.Tensor) -> Tuple[torch.Tensor, torch
     R_inv = R.transpose(-2, -1)
     t_inv = -torch.matmul(R_inv, t.unsqueeze(-1)).squeeze(-1)
     return R_inv, t_inv
-
