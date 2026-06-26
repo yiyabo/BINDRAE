@@ -19,6 +19,8 @@ proposal/
 __pycache__/
 *.egg-info/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # System files
 .DS_Store
@@ -48,6 +50,7 @@ wandb/
 *.bak
 *~
 tmp/
+.tmp_*
 *.sh.tmp
 ._*
 
@@ -70,6 +73,13 @@ vendor/
 
 # Agent tool configs (not project code)
 .aider*
+.kilo/
 .qwen/
 .sisyphus/
 .claude/
+.omo/
+.playwright-mcp/
+
+# Local operator notes / generated documentation bundles
+CLAUDE.md
+ALL_DOCUMENTATION_MERGED.md
