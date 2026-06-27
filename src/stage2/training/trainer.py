@@ -89,6 +89,26 @@ class Stage2Trainer:
         'end',
     )
 
+    _REPA_MOTION_CONTINUOUS_FEATURES = (
+        'delta_trans_local_x_norm',
+        'delta_trans_local_y_norm',
+        'delta_trans_local_z_norm',
+        'delta_rot_log_x_norm',
+        'delta_rot_log_y_norm',
+        'delta_rot_log_z_norm',
+        'delta_chi1_sin',
+        'delta_chi2_sin',
+        'delta_chi3_sin',
+        'delta_chi4_sin',
+        'delta_chi1_cos',
+        'delta_chi2_cos',
+        'delta_chi3_cos',
+        'delta_chi4_cos',
+        'trans_mag_norm',
+        'rot_angle_norm',
+        'max_abs_delta_chi_norm',
+    )
+
     @staticmethod
     def _resolve_stage1_model_config(ckpt: Dict) -> Stage1ModelConfig:
         saved_config = ckpt.get('config') if isinstance(ckpt, dict) else None
@@ -121,6 +141,22 @@ class Stage2Trainer:
         if not names:
             raise ValueError("stage1v2_posterior_feature_names cannot be empty")
         return names
+
+    def _resolve_repa_target_indices(self) -> Optional[Tuple[int, ...]]:
+        if self.config.repa_target_mode == 'full':
+            return None
+        if self.config.repa_target_mode != 'motion_continuous':
+            raise ValueError(f"Unsupported repa_target_mode={self.config.repa_target_mode}")
+        name_to_idx = {name: idx for idx, name in enumerate(self.stage1v2_feature_names)}
+        missing = [
+            name for name in self._REPA_MOTION_CONTINUOUS_FEATURES
+            if name not in name_to_idx
+        ]
+        if missing:
+            raise ValueError(
+                f"repa_target_mode=motion_continuous requires missing features: {missing}"
+            )
+        return tuple(name_to_idx[name] for name in self._REPA_MOTION_CONTINUOUS_FEATURES)
 
     def _stage1v2_feature_dir_for_split(self, split: str) -> Optional[str]:
         mode = self.config.stage1v2_posterior_feature_mode
@@ -206,6 +242,9 @@ class Stage2Trainer:
         allowed_repa_mask_modes = {'node', 'pocket', 'motion_active', 'motion_active_or_pocket'}
         if config.repa_mask_mode not in allowed_repa_mask_modes:
             raise ValueError(f"Unsupported repa_mask_mode={config.repa_mask_mode}")
+        allowed_repa_target_modes = {'full', 'motion_continuous'}
+        if config.repa_target_mode not in allowed_repa_target_modes:
+            raise ValueError(f"Unsupported repa_target_mode={config.repa_target_mode}")
         allowed_repa_target_shuffle_modes = {'none', 'residue'}
         if config.repa_target_shuffle_mode not in allowed_repa_target_shuffle_modes:
             raise ValueError(
@@ -249,6 +288,12 @@ class Stage2Trainer:
         self.stage1v2_feature_names = self._parse_stage1v2_feature_names(
             config.stage1v2_posterior_feature_names
         )
+        self.repa_target_indices = self._resolve_repa_target_indices()
+        self.repa_target_dim = (
+            len(self.stage1v2_feature_names)
+            if self.repa_target_indices is None
+            else len(self.repa_target_indices)
+        )
         if (
             config.repa_enabled or config.repa_weight > 0.0
         ) and config.stage1v2_posterior_feature_mode in {'none', 'zero'}:
@@ -278,7 +323,7 @@ class Stage2Trainer:
             interaction_prior_feature_scale=1.0,
             repa_enabled=config.repa_enabled,
             repa_dim=config.repa_dim,
-            repa_target_dim=self.stage1v2_feature_dim,
+            repa_target_dim=self.repa_target_dim,
         )
         self.model = TorsionFlowNet(model_config).to(self.device)
 
@@ -876,6 +921,8 @@ class Stage2Trainer:
             batch.stage1v2_posterior_features.detach().float()
             * float(self.config.stage1v2_posterior_feature_scale)
         )
+        if self.repa_target_indices is not None:
+            target = target[..., list(self.repa_target_indices)]
         if self.config.repa_target_shuffle_mode == 'none':
             return target
         if self.config.repa_target_shuffle_mode == 'residue':
@@ -1851,6 +1898,7 @@ class Stage2Trainer:
             'repa_dim',
             'repa_loss_type',
             'repa_mask_mode',
+            'repa_target_mode',
             'repa_target_shuffle_mode',
             # Optimizer state is restored, so these CLI values should not drift silently.
             'lr',

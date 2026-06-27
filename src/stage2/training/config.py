@@ -88,6 +88,7 @@ class TrainingConfig:
     repa_dim: int = 128
     repa_loss_type: str = "cosine"  # cosine | mse
     repa_mask_mode: str = "motion_active_or_pocket"  # node | pocket | motion_active | motion_active_or_pocket
+    repa_target_mode: str = "full"  # full | motion_continuous
     repa_target_shuffle_mode: str = "none"  # none | residue
 
     # NMA features
