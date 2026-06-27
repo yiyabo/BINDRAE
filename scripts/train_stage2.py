@@ -157,6 +157,9 @@ def parse_args():
     parser.add_argument('--repa_mask_mode', type=str, default='motion_active_or_pocket',
                         choices=['node', 'pocket', 'motion_active', 'motion_active_or_pocket'],
                         help='Residue mask used by REPA alignment')
+    parser.add_argument('--repa_target_mode', type=str, default='full',
+                        choices=['full', 'motion_continuous'],
+                        help='Feature subset used as the REPA alignment target')
     parser.add_argument('--repa_target_shuffle_mode', type=str, default='none',
                         choices=['none', 'residue'],
                         help='Shuffle only the REPA target while leaving Stage-2 conditioning features unchanged')
@@ -271,6 +274,7 @@ def main():
         repa_dim=args.repa_dim,
         repa_loss_type=args.repa_loss_type,
         repa_mask_mode=args.repa_mask_mode,
+        repa_target_mode=args.repa_target_mode,
         repa_target_shuffle_mode=args.repa_target_shuffle_mode,
         w_contact=args.w_contact,
         contact_loss_mode=args.contact_loss_mode,
@@ -343,6 +347,7 @@ def main():
     print(f"  - REPA dim: {config.repa_dim}")
     print(f"  - REPA loss type: {config.repa_loss_type}")
     print(f"  - REPA mask mode: {config.repa_mask_mode}")
+    print(f"  - REPA target mode: {config.repa_target_mode}")
     print(f"  - REPA target shuffle mode: {config.repa_target_shuffle_mode}")
     print(f"  - w_contact: {config.w_contact}")
     print(f"  - contact_loss_mode: {config.contact_loss_mode}")

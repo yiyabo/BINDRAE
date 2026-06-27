@@ -66,6 +66,7 @@ REPA_WEIGHT="${REPA_WEIGHT:-0.0}"
 REPA_DIM="${REPA_DIM:-128}"
 REPA_LOSS_TYPE="${REPA_LOSS_TYPE:-cosine}"
 REPA_MASK_MODE="${REPA_MASK_MODE:-motion_active_or_pocket}"
+REPA_TARGET_MODE="${REPA_TARGET_MODE:-full}"
 REPA_TARGET_SHUFFLE_MODE="${REPA_TARGET_SHUFFLE_MODE:-none}"
 RESUME_FROM="${RESUME_FROM:-}"
 AUTO_RESUME="${AUTO_RESUME:-1}"
@@ -135,6 +136,13 @@ case "$REPA_TARGET_SHUFFLE_MODE" in
   none|residue) ;;
   *)
     echo "ERROR: REPA_TARGET_SHUFFLE_MODE must be one of none, residue"
+    exit 1
+    ;;
+esac
+case "$REPA_TARGET_MODE" in
+  full|motion_continuous) ;;
+  *)
+    echo "ERROR: REPA_TARGET_MODE must be one of full, motion_continuous"
     exit 1
     ;;
 esac
@@ -452,6 +460,7 @@ if [[ "$REPA_ENABLED" == "1" ]]; then
     --repa_dim "$REPA_DIM"
     --repa_loss_type "$REPA_LOSS_TYPE"
     --repa_mask_mode "$REPA_MASK_MODE"
+    --repa_target_mode "$REPA_TARGET_MODE"
     --repa_target_shuffle_mode "$REPA_TARGET_SHUFFLE_MODE"
   )
 fi
@@ -487,6 +496,7 @@ echo "REPA enabled:    $REPA_ENABLED"
 echo "REPA weight:     $REPA_WEIGHT"
 echo "REPA dim/loss:   $REPA_DIM / $REPA_LOSS_TYPE"
 echo "REPA mask:       $REPA_MASK_MODE"
+echo "REPA target:     $REPA_TARGET_MODE"
 echo "REPA shuffle:    $REPA_TARGET_SHUFFLE_MODE"
 echo "Resume from:     ${RESUME_FROM:-OFF}"
 echo "Auto resume:     $AUTO_RESUME"
