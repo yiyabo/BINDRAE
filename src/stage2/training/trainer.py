@@ -54,6 +54,7 @@ class Stage2Trainer:
 
     _LOSS_KEYS = (
         'total',
+        'total_no_repa',
         'fm_chi',
         'fm_rigid',
         'bg',
@@ -1130,7 +1131,13 @@ class Stage2Trainer:
 
         return rigids_list, chi_list, t_list
 
-    def compute_losses(self, batch, t: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def compute_losses(
+        self,
+        batch,
+        t: torch.Tensor,
+        *,
+        force_geom: bool = False,
+    ) -> Dict[str, torch.Tensor]:
         # Reference bridge
         (chi_ref, rigids_ref, d_chi_ref,
          d_rot_ref, d_trans_ref, rigids_apo, rigids_holo) = self.sample_reference_bridge(batch, t)
@@ -1212,7 +1219,9 @@ class Stage2Trainer:
         ) / (bg_w.sum() + 1e-8)
 
         # Integrate path for geometry (only every N steps for performance)
-        compute_geom = (self.global_step % self.config.geom_loss_every_n_steps == 0)
+        compute_geom = force_geom or (
+            self.global_step % self.config.geom_loss_every_n_steps == 0
+        )
 
         L_smooth = chi_ref.new_tensor(0.0)
         L_clash = chi_ref.new_tensor(0.0)
@@ -1559,7 +1568,7 @@ class Stage2Trainer:
                      self.config.w_end_fape * L_end_fape +
                      L_end_rigid)
 
-        total = (
+        total_no_repa = (
             self.config.w_fm_chi * L_fm_chi.clamp(max=100.0) +
             self.config.w_fm_rigid * L_fm_rigid.clamp(max=100.0) +
             self.config.w_bg * L_bg.clamp(max=100.0) +
@@ -1568,14 +1577,15 @@ class Stage2Trainer:
             self.config.w_pep * L_pep.clamp(max=100.0) +
             self.config.w_contact * L_contact.clamp(max=100.0) +
             self.config.w_stage1v2_guidance * L_stage1v2_guidance.clamp(max=100.0) +
-            self.config.repa_weight * L_repa.clamp(max=100.0) +
             self.config.w_prior * L_prior.clamp(max=100.0) +
             self.config.w_interaction_prior * L_interaction_prior.clamp(max=100.0) +
             self.config.w_end * L_end.clamp(max=100.0)
         )
+        total = total_no_repa + self.config.repa_weight * L_repa.clamp(max=100.0)
 
         return {
             'total': total,
+            'total_no_repa': total_no_repa,
             'fm_chi': L_fm_chi,
             'fm_rigid': L_fm_rigid,
             'bg': L_bg,
@@ -1728,7 +1738,7 @@ class Stage2Trainer:
                     t = torch.rand(batch.esm.shape[0], device=self.device)
                 else:
                     t = torch.full((batch.esm.shape[0],), float(self.config.val_t), device=self.device)
-                losses = self.compute_losses(batch, t)
+                losses = self.compute_losses(batch, t, force_geom=True)
                 self._check_finite_losses(losses, "validation")
                 for k in val_losses:
                     val_losses[k] += losses[k].item()
@@ -1793,7 +1803,7 @@ class Stage2Trainer:
                     with metrics_path.open('a', encoding='utf-8') as f:
                         f.write(json.dumps(record) + '\n')
 
-                    current_metric = val_results['total']
+                    current_metric = val_results.get('total_no_repa', val_results['total'])
                     if current_metric < self.best_val_metric:
                         self.best_val_metric = current_metric
                         self.patience_counter = 0

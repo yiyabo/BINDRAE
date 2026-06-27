@@ -87,6 +87,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument(
+        "--esm_num_layers",
+        type=int,
+        default=1,
+        help="Require Stage-2 ESM features with this many last layers while exporting.",
+    )
     parser.add_argument("--max_batches", type=int, default=0)
     parser.add_argument("--max_samples", type=int, default=0)
     parser.add_argument("--device", default="cuda")
@@ -539,6 +545,7 @@ def iter_batches_skip_bad(args: argparse.Namespace):
         args.data_dir,
         split=args.split,
         valid_samples_file=args.valid_samples_file,
+        esm_num_layers=args.esm_num_layers,
     )
     batch_samples = []
     bad_records = []
@@ -605,6 +612,7 @@ def main() -> None:
                 shuffle=False,
                 num_workers=args.num_workers,
                 valid_samples_file=args.valid_samples_file,
+                esm_num_layers=args.esm_num_layers,
             )
         )
     fk_module = create_openfold_fk().to(device)

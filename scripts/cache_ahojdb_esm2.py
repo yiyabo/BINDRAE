@@ -3,6 +3,8 @@
 ESM-2 Cache for AHoJ-DB (Stage-2)
 - Input: data directory containing samples/<sample_id>/apo.pdb
 - Output: samples/<sample_id>/esm.pt
+  - per_residue: [N, D]
+  - per_residue_layers: [N, K, D] when --last-k-layers > 1
 """
 
 import os
@@ -60,9 +62,24 @@ class ESM2CacheAHoJ:
         }
     }
     
-    def __init__(self, data_dir: str, use_fallback: bool = False, batch_size: Optional[int] = None):
+    def __init__(
+        self,
+        data_dir: str,
+        use_fallback: bool = False,
+        batch_size: Optional[int] = None,
+        last_k_layers: int = 1,
+        sample_list: Optional[str] = None,
+        max_samples: int = 0,
+        force: bool = False,
+    ):
         self.data_dir = Path(data_dir)
         self.samples_dir = self.data_dir / "samples"
+        self.last_k_layers = int(last_k_layers)
+        if self.last_k_layers < 1:
+            raise ValueError(f"last_k_layers must be >= 1, got {last_k_layers}")
+        self.sample_ids = self._load_sample_ids(sample_list)
+        self.max_samples = int(max_samples)
+        self.force = bool(force)
         
         # Determine system
         self.system = platform.system()
@@ -76,6 +93,10 @@ class ESM2CacheAHoJ:
         print(f"Device: {self.device}")
         print(f"Model: {self.model_name}")
         print(f"Batch Size: {self.batch_size}")
+        print(f"Last-K layers: {self.last_k_layers}")
+        print(f"Sample list: {sample_list or 'ALL'}")
+        print(f"Max samples: {self.max_samples if self.max_samples > 0 else 'ALL'}")
+        print(f"Force: {self.force}")
         print(f"Data Dir: {self.data_dir}")
         
         # Load Model
@@ -113,6 +134,29 @@ class ESM2CacheAHoJ:
         except Exception as e:
             print(f"Model load failed: {e}")
             sys.exit(1)
+
+    def _load_sample_ids(self, sample_list: Optional[str]) -> Optional[set]:
+        if not sample_list:
+            return None
+        path = Path(sample_list)
+        if not path.is_absolute() and not path.exists():
+            path = self.data_dir / sample_list
+        with open(path, "r") as f:
+            ids = {line.strip() for line in f if line.strip()}
+        print(f"Loaded {len(ids)} sample ids from {path}")
+        return ids
+
+    def _esm_cache_satisfies_request(self, esm_path: Path) -> bool:
+        if self.force or not esm_path.exists():
+            return False
+        if self.last_k_layers <= 1:
+            return True
+        try:
+            data = torch.load(esm_path, map_location="cpu", weights_only=False)
+            layers = data.get("per_residue_layers") if isinstance(data, dict) else None
+            return layers is not None and int(layers.shape[1]) >= self.last_k_layers
+        except Exception:
+            return False
             
     def extract_sequence(self, pdb_path: Path) -> Optional[str]:
         if not pdb_path.exists():
@@ -136,21 +180,35 @@ class ESM2CacheAHoJ:
             _, _, batch_tokens = self.batch_converter(data)
             batch_tokens = batch_tokens.to(self.device)
             
+            final_layer = int(self.model.num_layers)
+            first_layer = max(1, final_layer - self.last_k_layers + 1)
+            repr_layers = list(range(first_layer, final_layer + 1))
             with torch.no_grad():
-                results = self.model(batch_tokens, repr_layers=[self.model.num_layers])
+                results = self.model(batch_tokens, repr_layers=repr_layers)
             
-            token_reprs = results['representations'][self.model.num_layers]
+            token_reprs = results['representations'][final_layer]
             
             # Remove start/end tokens
             per_residue = token_reprs[0, 1 : len(sequence) + 1]
             sequence_repr = token_reprs[0, 0] # CLS token
+            per_residue_layers = torch.stack(
+                [
+                    results['representations'][layer][0, 1 : len(sequence) + 1]
+                    for layer in repr_layers
+                ],
+                dim=1,
+            )
             
-            return {
+            encoding = {
                 'per_residue': per_residue.cpu(),
                 'sequence': sequence_repr.cpu(),
                 'sequence_str': sequence,
                 'n_residues': len(sequence)
             }
+            if self.last_k_layers > 1:
+                encoding['per_residue_layers'] = per_residue_layers.cpu()
+                encoding['esm_layer_indices'] = torch.tensor(repr_layers, dtype=torch.long)
+            return encoding
         except Exception as e:
             print(f"Encoding failed for {sample_id}: {e}")
             return None
@@ -169,8 +227,10 @@ class ESM2CacheAHoJ:
         tasks = []
         for d in tqdm(sample_dirs, desc="Scanning"):
             sample_id = d.name
+            if self.sample_ids is not None and sample_id not in self.sample_ids:
+                continue
             esm_path = d / "esm.pt"
-            if esm_path.exists():
+            if self._esm_cache_satisfies_request(esm_path):
                 continue
                 
             apo_pdb = d / "apo.pdb"
@@ -180,6 +240,8 @@ class ESM2CacheAHoJ:
             seq = self.extract_sequence(apo_pdb)
             if seq:
                 tasks.append((sample_id, seq, esm_path))
+                if self.max_samples > 0 and len(tasks) >= self.max_samples:
+                    break
                 
         return tasks
 
@@ -191,15 +253,18 @@ class ESM2CacheAHoJ:
             print("No samples to process.")
             return
 
-        # Sort by length to minimize padding (smart batching)
+        # Sort by length to minimize padding
         tasks.sort(key=lambda x: len(x[1]))
-        
-        # Batch processing
+
         batch_size = self.batch_size
         total_batches = (len(tasks) + batch_size - 1) // batch_size
-        
-        print(f"Processing in {total_batches} batches (Batch Size: {batch_size})...")
-        
+
+        print(f"Processing in {total_batches} batches (Start BS: {batch_size})...")
+
+        for i in tqdm(range(0, len(tasks), batch_size), desc="Inference"):
+            batch_tasks = tasks[i : i + batch_size]
+            self.process_batch_safe(batch_tasks)
+
     def process_batch_safe(self, batch_tasks: List[Tuple[str, str, Path]]):
         """Process a batch with OOM automatic recovery (recursive splitting)."""
         if not batch_tasks:
@@ -212,16 +277,26 @@ class ESM2CacheAHoJ:
             _, _, batch_tokens = self.batch_converter(batch_data)
             batch_tokens = batch_tokens.to(self.device)
             
+            final_layer = int(self.model.num_layers)
+            first_layer = max(1, final_layer - self.last_k_layers + 1)
+            repr_layers = list(range(first_layer, final_layer + 1))
             with torch.no_grad():
-                results = self.model(batch_tokens, repr_layers=[self.model.num_layers])
+                results = self.model(batch_tokens, repr_layers=repr_layers)
             
-            token_reprs = results['representations'][self.model.num_layers]
+            token_reprs = results['representations'][final_layer]
             
             # Save results
             for j, (sample_id, seq, out_path) in enumerate(batch_tasks):
                 seq_len = len(seq)
                 per_residue = token_reprs[j, 1 : seq_len + 1].cpu()
                 sequence_repr = token_reprs[j, 0].cpu()
+                per_residue_layers = torch.stack(
+                    [
+                        results['representations'][layer][j, 1 : seq_len + 1]
+                        for layer in repr_layers
+                    ],
+                    dim=1,
+                ).cpu()
                 
                 encoding = {
                     'per_residue': per_residue,
@@ -229,6 +304,9 @@ class ESM2CacheAHoJ:
                     'sequence_str': seq,
                     'n_residues': seq_len
                 }
+                if self.last_k_layers > 1:
+                    encoding['per_residue_layers'] = per_residue_layers
+                    encoding['esm_layer_indices'] = torch.tensor(repr_layers, dtype=torch.long)
                 torch.save(encoding, out_path)
                 
         except RuntimeError as e:
@@ -246,34 +324,30 @@ class ESM2CacheAHoJ:
             else:
                 print(f"❌ Batch inference failed: {e}")
 
-    def run(self):
-        tasks = self.prepare_samples()
-        print(f"Found {len(tasks)} samples to process.")
-        
-        if not tasks:
-            print("No samples to process.")
-            return
-
-        # Sort by length to minimize padding
-        tasks.sort(key=lambda x: len(x[1]))
-        
-        batch_size = self.batch_size
-        total_batches = (len(tasks) + batch_size - 1) // batch_size
-        
-        print(f"Processing in {total_batches} batches (Start BS: {batch_size})...")
-        
-        for i in tqdm(range(0, len(tasks), batch_size), desc="Inference"):
-            batch_tasks = tasks[i : i + batch_size]
-            self.process_batch_safe(batch_tasks)
-            
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", required=True)
     parser.add_argument("--fallback", action="store_true")
     parser.add_argument("--batch-size", type=int, default=None, help="Override default batch size")
+    parser.add_argument("--last-k-layers", type=int, default=1,
+                        help="Save last K per-residue ESM layers; 1 preserves legacy esm.pt schema")
+    parser.add_argument("--sample-list", type=str, default=None,
+                        help="Optional file with sample ids to process")
+    parser.add_argument("--max-samples", type=int, default=0,
+                        help="Limit number of samples to process after filtering; 0 means all")
+    parser.add_argument("--force", action="store_true",
+                        help="Recompute selected esm.pt files even if they already satisfy the request")
     args = parser.parse_args()
     
-    cacher = ESM2CacheAHoJ(args.data_dir, args.fallback, batch_size=args.batch_size)
+    cacher = ESM2CacheAHoJ(
+        args.data_dir,
+        args.fallback,
+        batch_size=args.batch_size,
+        last_k_layers=args.last_k_layers,
+        sample_list=args.sample_list,
+        max_samples=args.max_samples,
+        force=args.force,
+    )
     cacher.run()
 
 if __name__ == "__main__":

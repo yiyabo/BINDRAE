@@ -11,6 +11,7 @@ ESM-2 编码器缓存脚本
 输出：
 - features/<PDBID>_esm.pt
   - 'per_residue': (N_res, d_model) - 每残基表征
+  - 'per_residue_layers': (N_res, K, d_model) - 可选 last-K 每残基表征
   - 'sequence': (d_model,) - 全序列表征
   - 'sequence_str': str - 氨基酸序列
 """
@@ -69,10 +70,24 @@ class ESM2Cache:
         }
     }
     
-    def __init__(self, base_dir: str, use_fallback: bool = False):
+    def __init__(
+        self,
+        base_dir: str,
+        use_fallback: bool = False,
+        last_k_layers: int = 1,
+        sample_list: Optional[str] = None,
+        max_samples: int = 0,
+        force: bool = False,
+    ):
         self.base_dir = Path(base_dir)
         self.complexes_dir = self.base_dir / "data" / "casf2016" / "complexes"
         self.features_dir = self.base_dir / "data" / "casf2016" / "processed" / "features"
+        self.last_k_layers = int(last_k_layers)
+        if self.last_k_layers < 1:
+            raise ValueError(f"last_k_layers must be >= 1, got {last_k_layers}")
+        self.sample_ids = self._load_sample_ids(sample_list)
+        self.max_samples = int(max_samples)
+        self.force = bool(force)
         
         # 检测系统并选择模型
         self.system = platform.system()
@@ -86,6 +101,10 @@ class ESM2Cache:
         print(f"设备: {self.device}")
         print(f"模型: {self.model_name}")
         print(f"批大小: {self.batch_size}")
+        print(f"Last-K layers: {self.last_k_layers}")
+        print(f"Sample list: {sample_list or 'ALL'}")
+        print(f"Max samples: {self.max_samples if self.max_samples > 0 else 'ALL'}")
+        print(f"Force: {self.force}")
         print(f"\n输入目录: {self.complexes_dir}")
         print(f"输出目录: {self.features_dir}")
         
@@ -177,6 +196,29 @@ class ESM2Cache:
                 return self._load_model()
             else:
                 sys.exit(1)
+
+    def _load_sample_ids(self, sample_list: Optional[str]) -> Optional[set]:
+        if not sample_list:
+            return None
+        path = Path(sample_list)
+        if not path.is_absolute() and not path.exists():
+            path = self.base_dir / sample_list
+        with open(path, "r") as f:
+            ids = {line.strip() for line in f if line.strip()}
+        print(f"Loaded {len(ids)} sample ids from {path}")
+        return ids
+
+    def _esm_cache_satisfies_request(self, output_file: Path) -> bool:
+        if self.force or not output_file.exists():
+            return False
+        if self.last_k_layers <= 1:
+            return True
+        try:
+            data = torch.load(output_file, map_location="cpu", weights_only=False)
+            layers = data.get("per_residue_layers") if isinstance(data, dict) else None
+            return layers is not None and int(layers.shape[1]) >= self.last_k_layers
+        except Exception:
+            return False
     
     def extract_sequence(self, pdb_id: str) -> Optional[str]:
         """
@@ -241,22 +283,34 @@ class ESM2Cache:
             batch_tokens = batch_tokens.to(self.device)
             
             # 前向传播（无梯度）
+            final_layer = int(self.model.num_layers)
+            first_layer = max(1, final_layer - self.last_k_layers + 1)
+            repr_layers = list(range(first_layer, final_layer + 1))
             with torch.no_grad():
-                results = self.model(batch_tokens, repr_layers=[self.model.num_layers])
+                results = self.model(batch_tokens, repr_layers=repr_layers)
             
             # 提取表征
             # representations: (batch, seq_len, d_model)
-            per_residue = results['representations'][self.model.num_layers][0, 1:-1]  # 去掉 <cls> 和 <eos>
+            final_repr = results['representations'][final_layer]
+            per_residue = final_repr[0, 1:-1]  # 去掉 <cls> 和 <eos>
+            per_residue_layers = torch.stack(
+                [results['representations'][layer][0, 1:-1] for layer in repr_layers],
+                dim=1,
+            )
             
             # 全序列表征（使用 <cls> token）
-            sequence_repr = results['representations'][self.model.num_layers][0, 0]
+            sequence_repr = final_repr[0, 0]
             
-            return {
+            encoding = {
                 'per_residue': per_residue.cpu(),  # (N_res, d_model)
                 'sequence': sequence_repr.cpu(),    # (d_model,)
                 'sequence_str': sequence,           # str
                 'n_residues': len(sequence)
             }
+            if self.last_k_layers > 1:
+                encoding['per_residue_layers'] = per_residue_layers.cpu()
+                encoding['esm_layer_indices'] = torch.tensor(repr_layers, dtype=torch.long)
+            return encoding
             
         except Exception as e:
             print(f"  ⚠️  {pdb_id}: 编码失败 - {e}")
@@ -277,7 +331,7 @@ class ESM2Cache:
         output_file = self.features_dir / f"{pdb_id}_esm.pt"
         
         # 跳过已缓存
-        if output_file.exists():
+        if self._esm_cache_satisfies_request(output_file):
             self.stats['cached'] += 1
             return True
         
@@ -313,6 +367,10 @@ class ESM2Cache:
         """运行缓存"""
         # 获取所有蛋白
         pdb_ids = sorted([d.name for d in self.complexes_dir.iterdir() if d.is_dir()])
+        if self.sample_ids is not None:
+            pdb_ids = [pdb_id for pdb_id in pdb_ids if pdb_id in self.sample_ids]
+        if self.max_samples > 0:
+            pdb_ids = pdb_ids[: self.max_samples]
         
         print(f"\n发现 {len(pdb_ids)} 个蛋白\n")
         print("开始缓存...\n")
@@ -336,6 +394,9 @@ class ESM2Cache:
         print(f"\n输出文件:")
         print(f"  - <PDBID>_esm.pt")
         print(f"    - 'per_residue': (N_res, {self.embed_dim}) - 每残基表征")
+        if self.last_k_layers > 1:
+            print(f"    - 'per_residue_layers': (N_res, {self.last_k_layers}, {self.embed_dim}) - last-K 每残基表征")
+            print(f"    - 'esm_layer_indices': ({self.last_k_layers},) - ESM layer ids")
         print(f"    - 'sequence': ({self.embed_dim},) - 全序列表征")
         print(f"    - 'sequence_str': str - 氨基酸序列")
         print(f"    - 'n_residues': int - 残基数量")
@@ -353,11 +414,26 @@ def main():
                        help=f'项目根目录（默认: 脚本所在项目根目录）')
     parser.add_argument('--fallback', action='store_true',
                        help='使用备选模型（显存不足时）')
+    parser.add_argument('--last-k-layers', type=int, default=1,
+                       help='保存最后 K 层 per-residue ESM 表征；1 表示仅保存旧 per_residue')
+    parser.add_argument('--sample-list', type=str, default=None,
+                       help='可选样本/PDB ID 列表文件')
+    parser.add_argument('--max-samples', type=int, default=0,
+                       help='限制处理样本数；0 表示不限制')
+    parser.add_argument('--force', action='store_true',
+                       help='即使已有 cache 满足要求也重新计算')
     
     args = parser.parse_args()
     
     # 运行缓存
-    cache = ESM2Cache(args.base_dir, use_fallback=args.fallback)
+    cache = ESM2Cache(
+        args.base_dir,
+        use_fallback=args.fallback,
+        last_k_layers=args.last_k_layers,
+        sample_list=args.sample_list,
+        max_samples=args.max_samples,
+        force=args.force,
+    )
     cache.run()
 
 
