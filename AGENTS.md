@@ -15,7 +15,7 @@ When using SSH examples from `CLAUDE.md`, treat them as operational context and 
 ## Important directories
 - `src/stage1/`: holo prior / ligand-conditioned pocket rotamer-contact modeling. See its local guide before changing losses, candidate scoring, or FK outputs.
 - `src/stage2/`: conditional bridge flow using Stage-1 guidance, path integration, and path-level geometry losses. See its local guide before changing flow state or priors.
-- `scripts/`: training, diagnostics, preprocessing, and Slurm wrappers. See its local guide before launching jobs or adding CLI flags.
+- `scripts/`: active training, diagnostics, preprocessing, and Slurm wrappers. See its local guide before launching jobs or adding CLI flags. Archived scripts under `scripts/archive/` and `scripts/slurm/archive/` are reproducibility records, not templates for new experiments.
 - `docs/`: experiment rationale and design decisions. Start from `docs/CURRENT_PROJECT_STATUS_20260622.md`, then read the active Stage-1-v2 and Stage-2 records. Archived files are scientific context, not executable truth.
 - `data/`, `processed_data/`, `logs/`, `checkpoints/`, `tmp/`: generated or large artifacts. Do not casually rewrite, commit, or recursively scan them unless the task is explicitly about data or results.
 - `reference/` and `legacy/`: borrowed or historical code. Prefer wrapping or comparing against it instead of modifying it in-place.
@@ -40,6 +40,13 @@ Older notes may describe Stage-1 as a deterministic endpoint anchor. Newer diagn
 
 As of 2026-06-25, the strongest Stage-2 evidence is the frozen OracleMotion upper-bound baseline in `docs/ORACLE_MOTION_BASELINE_SNAPSHOT_20260625.md`. Treat it as the current stable starting point. Do not launch additional reliability step sweeps, sample ranking, or visualization jobs unless the user explicitly asks; the next default engineering track is `docs/RAEV2_REPA_STAGE2_ENHANCEMENT_PLAN_20260625.md` with ESM last-K fusion and REPA-style alignment.
 
+As of 2026-06-27, the active full-scale preparation matrix is OracleMotion
+conditioning with ESM last-K fusion and optional REPA-style hidden-state
+alignment. Compare REPA runs with `val_total_no_repa` plus endpoint/contact/path
+metrics; `val_repa` is only an auxiliary target-fitting diagnostic. Before
+60k/long training, run a matching Slurm precheck and ensure checkpoint resume
+support is available or the walltime is sufficient.
+
 ## Validation habits
 After Python edits, run targeted import or compile checks first, for example `python -m py_compile <changed files>`. For shell launchers, run `bash -n <script>`. For training changes, use smoke or diagnostic Slurm scripts before long runs, then inspect `logs/slurm/` and JSONL metrics under `logs/stage1/` or `logs/stage2/`.
 
@@ -49,6 +56,11 @@ Local syntax checks are acceptable in this checkout. Full dataset training, mult
 Use unique tags for new runs. Do not overwrite anchor checkpoints or logs. Selection metrics must match the scientific intent: ligand-lift metrics for ligand-causality experiments, path losses and endpoint/path quality for Stage-2, and smoke metrics only for pipeline health.
 
 When resuming or branching, keep separate `save_dir` and `log_dir` unless intentionally continuing the same run. Do not use the test split for model selection; screening should use validation lanes and short budgets. The old Stage-1 screening workflow is archived under `docs/archive/20260622_pre_stage1v2_pivot/` and should be treated as historical context.
+
+For multi-agent collaboration, do not use `git add .`. Keep commits split by
+topic: Stage-2 training/evaluation code, Stage-1-v2 posterior code, documentation
+and archive moves. If a file is already dirty and outside the current task,
+inspect it before editing and preserve unrelated changes.
 
 ## Remote cluster quick facts
 Remote project root: `/mnt/inaisfs/data/home/zhaozc_criait/XinxiangWang/BINDRAE`. Slurm logs: `logs/slurm/`. Stage logs: `logs/stage1/`, `logs/stage2/`. Datasets are under `processed_data/triplets/`; some SDF files may be corrupt and may require ligand preprocessing rather than trainer workarounds.

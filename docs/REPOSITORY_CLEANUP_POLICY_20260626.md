@@ -86,6 +86,18 @@ docs/archive/20260626_pre_fullscale_stage2/
 
 Keep a short `README.md` in each archive folder explaining why the files moved.
 
+2026-06-27 cleanup note: exploratory Python and Slurm entrypoints were moved
+non-destructively to:
+
+```text
+scripts/archive/20260627_pre_fullscale_stage2/
+scripts/slurm/archive/20260627_pre_fullscale_stage2/
+```
+
+The top-level script surface should now be treated as the supported entrypoint
+set for multi-agent work. Archived scripts are reproducibility records and may
+contain stale defaults.
+
 ## Safe Immediate Deletions
 
 These are generated local noise and can be removed whenever they appear:

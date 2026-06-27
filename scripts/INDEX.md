@@ -1,13 +1,14 @@
 # Scripts Index
 
 Top-level `scripts/` keeps active entrypoints and data-prep utilities. Older
-helpers and one-off diagnostics are archived under `scripts/archive/`.
+helpers and one-off diagnostics are archived under `scripts/archive/`. Do not
+start a new experiment from an archived script unless the current runbook says
+to revive that lane.
 
 ## Active Entry Points
 
 - `train_stage1.py` - main Stage-1 training CLI.
 - `train_stage2.py` - main Stage-2 training CLI; currently supports OracleMotion features, ESM last-K fusion, and optional REPA-style hidden-state alignment.
-- `train_interaction_prior.py` - current LC-PGBF v1 local interaction-prior trainer.
 - `train_stage1v2_posterior.py` - trains the Stage-1-v2 teacher-distilled posterior student.
 - `audit_stage1v2_posterior.py` - audits a trained Stage-1-v2 posterior checkpoint with threshold, ranking, calibration, and ligand-control metrics.
 - `export_stage1v2_posterior_cache.py` - exports per-sample Stage-1-v2 student posterior `.npz` caches for Stage-2 consumption.
@@ -31,28 +32,13 @@ Use the runbook before launching full-scale jobs:
 
 - `../docs/FULL_SCALE_TRAINING_AND_EVALUATION_RUNBOOK_20260626.md`
 
-Current primary launcher:
+Current primary training surface:
 
 - `slurm/train_stage2_oracle_motion_ablation_4gpu.sh` - despite the historical filename, this is the active OracleMotion / ESM last-K / REPA ablation launcher and defaults to 2xA100.
 
-## Transitional Experiment Entrypoints
-
-These are useful for reproducing recent pivots, but should be archived once the
-Stage-1-v2 posterior encoder is stable.
-
-- `train_change_prediction.py`
-- `train_change_prediction_fast.py`
-- `train_chi_head.py`
-- `train_chi_head_simple.py`
-- `train_ligand_chi_probe.py`
-- `train_pocket_relax_v2.py`
-- `diagnose_delta_z_predictor.py`
-- `diagnose_stage2_gradients.py`
-- `audit_apo_holo_ligand_geometry.py`
-- `audit_rotamer_oracle_signal.py`
-- `filter_stage1_strict_samples.py`
-- `precompute_latents.py`
-- `create_full_model_from_fast.py`
+For final-scale runs, prefer a short `PRECHECK_ONLY=1` Slurm run before the
+long training submission. Long jobs should use unique tags and should not
+overwrite OracleMotion baseline or REPA comparison outputs.
 
 ## Data Preparation
 
@@ -76,4 +62,6 @@ Stage-1-v2 posterior encoder is stable.
 
 - `archive/legacy_tools/` - older setup helpers and test wrappers.
 - `archive/diagnostics/` - one-off audits and lineage/debug scripts.
+- `archive/20260627_pre_fullscale_stage2/` - exploratory Stage-1 and early
+  Stage-2 entrypoints moved out of the main path before full-scale training.
 - `slurm/` - current cluster launchers; see `scripts/slurm/INDEX.md`.

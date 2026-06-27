@@ -26,6 +26,19 @@ Validation:
 - confirm `.omo/`, `.playwright-mcp/`, caches, logs, checkpoints, and datasets
   remain untracked or ignored.
 
+2026-06-27 update:
+
+- `AGENTS.md`, `scripts/AGENTS.md`, `scripts/INDEX.md`,
+  `scripts/slurm/INDEX.md`, `docs/REPOSITORY_CLEANUP_POLICY_20260626.md`, and
+  `docs/FULL_SCALE_TRAINING_AND_EVALUATION_RUNBOOK_20260626.md` now describe the
+  active OracleMotion/ESM/REPA full-scale path.
+- Exploratory Python and Slurm entrypoints were moved to
+  `scripts/archive/20260627_pre_fullscale_stage2/` and
+  `scripts/slurm/archive/20260627_pre_fullscale_stage2/`.
+- Stage-2 metric hygiene added `val_total_no_repa`; place that trainer change
+  with the Stage-2 OracleMotion/ESM/REPA commit, not with documentation-only
+  cleanup.
+
 ## Commit 2: Current Documentation And Archive Move
 
 Purpose: preserve the Stage-1-v2 pivot and Stage-2 OracleMotion baseline
@@ -81,6 +94,8 @@ Files:
 - `scripts/slurm/evaluate_stage2_transition_paths_1gpu.sh`
 - `scripts/slurm/evaluate_stage2_trajectory_reliability_1gpu.sh`
 - `scripts/slurm/generate_stage2_trajectories_1gpu.sh`
+- `src/stage2/training/trainer.py` metric hygiene, including validation
+  `force_geom=True` and `val_total_no_repa`
 - `ablation_subsets/`
 - `viewer/stage2_trajectory_viewer/`
 - `scripts/INDEX.md`

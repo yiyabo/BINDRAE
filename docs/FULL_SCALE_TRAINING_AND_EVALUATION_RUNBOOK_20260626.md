@@ -84,6 +84,10 @@ Use 4 A100 only when the cluster has contiguous free GPUs or when explicitly
 running a formal long training job. The current launcher filename may say
 `4gpu`, but its default request is intentionally 2 A100.
 
+For formal 60k-scale runs, 4-6 A100 is acceptable when resources are available.
+Keep Slurm `--gres` and `NPROC_PER_NODE` consistent, and run the identical cache
+configuration once with `PRECHECK_ONLY=1` before queueing the long job.
+
 Initial scale-up ladder:
 
 ```text
@@ -99,7 +103,10 @@ baseline or the same-budget REPA comparison directories.
 
 Use validation metrics for model selection and comparison:
 
-- `val_total`: broad training objective, useful for checkpoint selection.
+- `val_total_no_repa`: broad task objective excluding auxiliary REPA loss; use
+  this for checkpoint selection and no-REPA vs REPA comparisons.
+- `val_total`: actual training objective including auxiliary terms; useful for
+  checking optimization health within one run.
 - `val_end`, `val_end_rigid`, `val_end_chi`: endpoint quality.
 - `val_contact_score_gain`: whether generated paths move contact in the useful
   direction.
@@ -108,6 +115,10 @@ Use validation metrics for model selection and comparison:
 - `val_contact_score_sidechain_formed_recall`: formed contact recovery.
 - `val_repa`: only diagnostic for REPA target fitting; not sufficient evidence
   by itself.
+
+Older runs before 2026-06-27 may not have `val_total_no_repa`; for those, use
+`val_total` only within the same REPA setting and rely on endpoint/contact/path
+metrics for cross-setting comparisons.
 
 For physical reliability, run the trajectory reliability evaluator after
 selecting checkpoints, not during every training iteration.
