@@ -270,7 +270,7 @@ class EnhancedLigandEncoder(nn.Module):
         """
         # 使用欧氏距离
         diff = points.unsqueeze(2) - points.unsqueeze(1)  # [B, M, M, 3]
-        distances = torch.sqrt((diff ** 2).sum(dim=-1) + 1e-8)  # [B, M, M]
+        distances = torch.sqrt((diff ** 2).sum(dim=-1) + 1e-6)  # [B, M, M]
         return distances
     
     def forward(self,
@@ -409,8 +409,10 @@ class ProteinLigandCrossAttention(nn.Module):
             lig_mask_expanded = ligand_mask.unsqueeze(1).unsqueeze(2)
             attn = attn.masked_fill(~lig_mask_expanded, float('-inf'))
         
-        # Softmax
+        # Softmax + NaN 保护（全 -inf 行 softmax 产生 NaN）
+        attn = attn.clamp(min=-1e4, max=1e4)
         attn = F.softmax(attn, dim=-1)
+        attn = torch.nan_to_num(attn, nan=0.0)
         attn = self.dropout(attn)
         
         # 加权求和
@@ -434,10 +436,10 @@ class FiLMModulation(nn.Module):
     """
     Feature-wise Linear Modulation (FiLM)
     
-    公式: S_out = (1 + λ·γ) ⊙ S + λ·β
+    公式: S_out = ((1 - λ) + λ·γ) ⊙ S + λ·β
     
     其中：
-        - γ (gamma): 缩放参数
+        - γ (gamma): 缩放参数（以 1 为 identity）
         - β (beta): 偏移参数  
         - λ (gate_lambda): 门控系数（warmup从0到1）
     """
@@ -477,7 +479,7 @@ class FiLMModulation(nn.Module):
         FiLM特殊初始化
         
         关键：
-        - gamma最后层: 权重×0.1, 偏置=1
+        - gamma最后层: 权重很小, 偏置=1（保持 identity）
         - beta最后层: 权重×0.1, 偏置=0
         """
         # Gamma最后一层
@@ -506,11 +508,16 @@ class FiLMModulation(nn.Module):
             modulated: [B, N, c_s] 调制后的特征
         """
         # 预测gamma和beta
-        gamma = self.gamma_mlp(cross_features)  # [B, N, c_s]
+        raw_gamma = self.gamma_mlp(cross_features)  # [B, N, c_s]
         beta = self.beta_mlp(cross_features)    # [B, N, c_s]
-        
-        # FiLM调制: (1 + λ·γ) ⊙ S + λ·β
-        modulated = (1.0 + gate_lambda * gamma) * features + gate_lambda * beta
+
+        # Gamma is centered at 1.0 (identity) and softly bounded to avoid
+        # late-warmup multiplicative blow-ups.
+        gamma = 1.0 + torch.tanh(raw_gamma - 1.0)
+
+        # Interpolate from identity (λ=0) to full FiLM (λ=1).
+        scale = (1.0 - gate_lambda) + gate_lambda * gamma
+        modulated = scale * features + gate_lambda * beta
         
         return modulated
 
@@ -587,7 +594,7 @@ class LigandConditioner(nn.Module):
         if current_step >= self.config.warmup_steps:
             return 1.0
         else:
-            return float(current_step) / self.config.warmup_steps
+            return float(current_step) / max(self.config.warmup_steps, 1)
     
     def forward(self,
                 protein_features: torch.Tensor,
@@ -596,7 +603,8 @@ class LigandConditioner(nn.Module):
                 protein_mask: torch.Tensor,
                 ligand_mask: torch.Tensor,
                 gate_lambda: Optional[float] = None,
-                current_step: Optional[int] = None) -> torch.Tensor:
+                current_step: Optional[int] = None,
+                return_ligand_repr: bool = False):
         """
         配体条件化前向传播
         
@@ -608,9 +616,11 @@ class LigandConditioner(nn.Module):
             ligand_mask: [B, M] 配体掩码
             gate_lambda: 门控系数（可选，优先于current_step）
             current_step: 当前训练步数（用于自动计算lambda）
+            return_ligand_repr: 是否返回配体表示（用于对比学习）
             
         Returns:
             conditioned_features: [B, N, c_s] 配体条件化后的特征
+            ligand_repr: [B, d_lig] 配体表示（仅当return_ligand_repr=True时返回）
         """
         # 1. 配体Token嵌入（传递mask给增强编码器）
         lig_embed = self.ligand_embed(lig_points, lig_types, ligand_mask)  # [B, M, d_lig]
@@ -629,6 +639,15 @@ class LigandConditioner(nn.Module):
         
         # 4. FiLM调制
         conditioned = self.film(protein_features, cross_features, gate_lambda)
+        
+        if return_ligand_repr:
+            # Pool ligand representation over ligand atoms
+            if ligand_mask is not None:
+                lig_mask_f = ligand_mask.float().unsqueeze(-1)  # [B, M, 1]
+                lig_pooled = (lig_embed * lig_mask_f).sum(dim=1) / (lig_mask_f.sum(dim=1) + 1e-8)
+            else:
+                lig_pooled = lig_embed.mean(dim=1)  # [B, d_lig]
+            return conditioned, lig_pooled
         
         return conditioned
 

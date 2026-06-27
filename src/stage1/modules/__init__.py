@@ -1,16 +1,4 @@
-"""
-Stage-1 核心模块集合
-
-包含：
-- edge_embed: FlashIPA EdgeEmbedder 适配层
-- losses: 训练损失函数
-"""
-
-from .edge_embed import (
-    EdgeEmbedderAdapter,
-    ProjectEdgeConfig,
-    create_edge_embedder,
-)
+"""Stage-1 核心模块集合。"""
 
 from .losses import (
     fape_loss,
@@ -20,12 +8,24 @@ from .losses import (
 )
 
 __all__ = [
-    'EdgeEmbedderAdapter',
-    'ProjectEdgeConfig',
-    'create_edge_embedder',
     'fape_loss',
     'torsion_loss',
     'distance_loss',
     'clash_penalty',
 ]
 
+try:
+    from .edge_embed import (
+        EdgeEmbedderAdapter,
+        ProjectEdgeConfig,
+        create_edge_embedder,
+    )
+
+    __all__.extend([
+        'EdgeEmbedderAdapter',
+        'ProjectEdgeConfig',
+        'create_edge_embedder',
+    ])
+except ModuleNotFoundError as exc:
+    if exc.name != 'flash_ipa':
+        raise

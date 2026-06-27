@@ -139,7 +139,9 @@ def make_variant(batch: Stage1Batch, variant: str, rng: torch.Generator) -> Stag
         return out
     if variant == 'batch_shuffled_ligand':
         if out.lig_points.shape[0] > 1:
-            perm = torch.randperm(out.lig_points.shape[0], generator=rng, device=out.lig_points.device)
+            # Keep the diagnostic control strict for small batches.  A random
+            # permutation is identity about half the time when batch_size=2.
+            perm = torch.arange(out.lig_points.shape[0], device=out.lig_points.device).roll(shifts=1)
             out.lig_points = out.lig_points[perm]
             out.lig_types = out.lig_types[perm]
             out.lig_mask = out.lig_mask[perm]
@@ -309,6 +311,79 @@ def finalize_rotamer_stat(stat: Dict[str, float]) -> Dict[str, float]:
         'mean_confidence': stat['confidence_sum'] / total,
         'mean_entropy': stat['entropy_sum'] / total,
         'changed_from_correct_rate': stat['changed_from_correct_total'] / total,
+    }
+
+
+def init_typed_energy_gap_stat() -> Dict[str, Any]:
+    return {
+        'total': 0.0,
+        'gap_sum': 0.0,
+        'gap_sq_sum': 0.0,
+        'abs_gap_sum': 0.0,
+        'positive_total': 0.0,
+        'negative_total': 0.0,
+        'zero_total': 0.0,
+        'correct_holo_sum': 0.0,
+        'control_holo_sum': 0.0,
+        'gaps': [],
+    }
+
+
+def update_typed_energy_gap_stat(
+    stat: Dict[str, Any],
+    correct_energy: np.ndarray,
+    control_energy: np.ndarray,
+    holo_bins: np.ndarray,
+    mask: np.ndarray,
+) -> None:
+    mask = mask.astype(bool)
+    if not mask.any():
+        return
+    gather_idx = np.clip(holo_bins, 0, 2)[..., None]
+    correct_holo = np.take_along_axis(correct_energy, gather_idx, axis=-1)[..., 0]
+    control_holo = np.take_along_axis(control_energy, gather_idx, axis=-1)[..., 0]
+    gap = correct_holo[mask] - control_holo[mask]
+    if gap.size == 0:
+        return
+    correct_vals = correct_holo[mask]
+    control_vals = control_holo[mask]
+    stat['total'] += float(gap.size)
+    stat['gap_sum'] += float(gap.sum())
+    stat['gap_sq_sum'] += float(np.square(gap).sum())
+    stat['abs_gap_sum'] += float(np.abs(gap).sum())
+    stat['positive_total'] += float((gap > 0.0).sum())
+    stat['negative_total'] += float((gap < 0.0).sum())
+    stat['zero_total'] += float((gap == 0.0).sum())
+    stat['correct_holo_sum'] += float(correct_vals.sum())
+    stat['control_holo_sum'] += float(control_vals.sum())
+    _extend_stat_list(stat, 'gaps', gap)
+
+
+def finalize_typed_energy_gap_stat(stat: Dict[str, Any]) -> Dict[str, Any]:
+    n = int(stat['total'])
+    total = max(stat['total'], 1.0)
+    mean = stat['gap_sum'] / total
+    var = max(stat['gap_sq_sum'] / total - mean * mean, 0.0)
+    gaps = np.asarray(stat.get('gaps', []), dtype=np.float64)
+    if gaps.size > 0:
+        q05, q25, median, q75, q95 = np.quantile(gaps, [0.05, 0.25, 0.50, 0.75, 0.95])
+    else:
+        q05 = q25 = median = q75 = q95 = float('nan')
+    return {
+        'n': n,
+        'mean_gap': mean,
+        'median_gap': float(median),
+        'std_gap': math.sqrt(var),
+        'q05_gap': float(q05),
+        'q25_gap': float(q25),
+        'q75_gap': float(q75),
+        'q95_gap': float(q95),
+        'mean_abs_gap': stat['abs_gap_sum'] / total,
+        'frac_positive': stat['positive_total'] / total,
+        'frac_negative': stat['negative_total'] / total,
+        'frac_zero': stat['zero_total'] / total,
+        'mean_correct_holo_energy': stat['correct_holo_sum'] / total,
+        'mean_control_holo_energy': stat['control_holo_sum'] / total,
     }
 
 
@@ -686,6 +761,7 @@ def run_diagnostics(trainer: Stage1Trainer, args: argparse.Namespace, current_st
     stats = {variant: {} for variant in ['apo_carryover', *variants]}
     posterior_stats = {variant: {} for variant in variants}
     candidate_rotamer_stats = {variant: {} for variant in variants}
+    typed_energy_gap_stats = {variant: {} for variant in variants if variant != 'correct_ligand'}
     decomp_stats = {variant: {} for variant in ['base_only', *variants]} if getattr(args, 'decomposition', False) else {}
     rng = torch.Generator(device=device)
     rng.manual_seed(args.seed)
@@ -708,6 +784,7 @@ def run_diagnostics(trainer: Stage1Trainer, args: argparse.Namespace, current_st
                 stats['apo_carryover'].setdefault(name, init_stat())
                 update_stat(stats['apo_carryover'][name], apo, holo, apo, masks[name], args.threshold_deg)
             correct_pred = None
+            correct_typed_energy_np = None
             # For decomposition: precompute holo/apo bins
             if getattr(args, 'decomposition', False):
                 holo_bins_np = _rotamer_labels_np(holo)
@@ -724,6 +801,9 @@ def run_diagnostics(trainer: Stage1Trainer, args: argparse.Namespace, current_st
                 pred = angles_from_outputs(outputs)[..., 0].detach().cpu().numpy()
                 if variant == 'correct_ligand':
                     correct_pred = pred
+                    typed_energy_t = outputs.get('geometry_chi1_typed_energy')
+                    if typed_energy_t is not None:
+                        correct_typed_energy_np = typed_energy_t.detach().cpu().numpy()
                     if getattr(args, 'decomposition', False):
                         correct_outputs_cache = outputs
                         bl = outputs.get('geometry_chi1_base_logits')
@@ -762,6 +842,19 @@ def run_diagnostics(trainer: Stage1Trainer, args: argparse.Namespace, current_st
                     )
                 if variant == 'correct_ligand' and candidate_pred is not None:
                     correct_candidate_pred = candidate_pred
+                if variant != 'correct_ligand' and correct_typed_energy_np is not None:
+                    typed_energy_t = outputs.get('geometry_chi1_typed_energy')
+                    if typed_energy_t is not None:
+                        typed_energy_np = typed_energy_t.detach().cpu().numpy()
+                        for name in masks:
+                            typed_energy_gap_stats[variant].setdefault(name, init_typed_energy_gap_stat())
+                            update_typed_energy_gap_stat(
+                                typed_energy_gap_stats[variant][name],
+                                correct_typed_energy_np,
+                                typed_energy_np,
+                                holo_bins_np,
+                                masks[name],
+                            )
                 if args.posterior_diagnostics:
                     for name, mask_pair in posterior_masks.items():
                         posterior_stats[variant].setdefault(name, init_posterior_stat())
@@ -832,6 +925,10 @@ def run_diagnostics(trainer: Stage1Trainer, args: argparse.Namespace, current_st
     results['candidate_rotamer_metrics'] = {
         variant: {name: finalize_rotamer_stat(stat) for name, stat in subset_stats.items()}
         for variant, subset_stats in candidate_rotamer_stats.items()
+    }
+    results['typed_energy_gap_metrics'] = {
+        variant: {name: finalize_typed_energy_gap_stat(stat) for name, stat in subset_stats.items()}
+        for variant, subset_stats in typed_energy_gap_stats.items()
     }
     if decomp_stats:
         results['decomposition_metrics'] = {
@@ -1124,7 +1221,7 @@ def print_summary(results: Dict[str, Any]) -> None:
     candidate_metrics = results.get('candidate_rotamer_metrics')
     if candidate_metrics:
         print("\ncandidate/rotamer ligand sensitivity")
-        for subset in ('all_chi1', 'pocket', 'ligand_facing_apo_ca', 'apo_wrong', 'switch', 'non_contact'):
+        for subset in ('all_chi1', 'pocket', 'ligand_facing_apo_ca', 'apo_wrong', 'switch', 'contact_switch', 'pocket_switch', 'non_contact'):
             print(f"\n{subset}")
             for variant, subset_stats in candidate_metrics.items():
                 if subset not in subset_stats:
@@ -1136,6 +1233,23 @@ def print_summary(results: Dict[str, Any]) -> None:
                     f"  {variant:22s} n={stat['n']:6d} rot_acc={stat['rotamer_acc']:.4f} "
                     f"rescue={stat['rescue_rate']:.4f} harmful={stat['harmful_flip_rate']:.4f} "
                     f"net={stat['net_rescue']:+.4f} changed={stat['changed_from_correct_rate']:.4f}"
+                )
+    typed_energy_metrics = results.get('typed_energy_gap_metrics')
+    if typed_energy_metrics:
+        print("\ntyped-energy correct-vs-control holo-bin gap")
+        for subset in ('switch', 'contact', 'contact_switch', 'pocket_switch', 'non_contact'):
+            print(f"\n{subset}")
+            for variant, subset_stats in typed_energy_metrics.items():
+                if subset not in subset_stats:
+                    continue
+                stat = subset_stats[subset]
+                if stat['n'] == 0:
+                    continue
+                print(
+                    f"  {variant:22s} n={stat['n']:6d} mean={stat['mean_gap']:+.6f} "
+                    f"median={stat['median_gap']:+.6f} pos={stat['frac_positive']:.3f} "
+                    f"q25={stat['q25_gap']:+.6f} q75={stat['q75_gap']:+.6f} "
+                    f"abs={stat['mean_abs_gap']:.6f}"
                 )
     decomp_metrics = results.get('decomposition_metrics')
     if decomp_metrics:

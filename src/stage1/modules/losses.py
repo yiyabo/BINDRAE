@@ -800,6 +800,11 @@ def typed_candidate_energy_loss(
     residues.  Auxiliary terms keep the typed branch quiet on apo-correct and
     non-contact residues so it cannot become an unconditional rotamer prior.
     """
+    # Keep the loss connected to the typed branch even for batches without
+    # usable switch/contact supervision. Otherwise DDP can classify the whole
+    # batch loss as detached and skip unrelated trainable updates.
+    grad_anchor = (correct_energy.sum() + decoy_energy.sum()) * 0.0
+
     apo_labels, apo_valid = chi1_rotamer_labels(apo_chi1, chi1_mask)
     holo_labels, holo_valid = chi1_rotamer_labels(holo_chi1, chi1_mask)
     valid = apo_valid & holo_valid
@@ -813,7 +818,7 @@ def typed_candidate_energy_loss(
         lift_loss = F.relu(float(margin) - (correct_holo - decoy_holo))
         lift = (lift_loss * switch_valid.float()).sum() / (switch_valid.float().sum() + eps)
     else:
-        lift = correct_energy.new_tensor(0.0)
+        lift = grad_anchor
 
     keep_valid = valid & (apo_labels == holo_labels)
     if contact_mask is not None:
@@ -825,7 +830,7 @@ def typed_candidate_energy_loss(
         noharm_loss = F.relu(max_other - apo_energy)
         noharm = (noharm_loss * keep_valid.float()).sum() / (keep_valid.float().sum() + eps)
     else:
-        noharm = correct_energy.new_tensor(0.0)
+        noharm = grad_anchor
 
     if non_contact_mask is not None and noncontact_zero_weight > 0.0:
         zero_valid = valid & non_contact_mask.bool()
@@ -833,9 +838,9 @@ def typed_candidate_energy_loss(
             zero_loss = (correct_energy ** 2).sum(dim=-1)
             zero = (zero_loss * zero_valid.float()).sum() / (zero_valid.float().sum() + eps)
         else:
-            zero = correct_energy.new_tensor(0.0)
+            zero = grad_anchor
     else:
-        zero = correct_energy.new_tensor(0.0)
+        zero = grad_anchor
 
     return lift + float(noharm_weight) * noharm + float(noncontact_zero_weight) * zero
 
@@ -884,6 +889,201 @@ def candidate_decoy_rerank_loss(
     if w_res is not None:
         weights = weights * w_res.float()
     return (loss_per * weights).sum() / (weights.sum() + eps)
+
+
+def candidate_decoy_contrastive_loss(
+    correct_logits: torch.Tensor,
+    decoy_logits: torch.Tensor,
+    apo_chi1: torch.Tensor,
+    holo_chi1: torch.Tensor,
+    chi1_mask: torch.Tensor,
+    contact_mask: Optional[torch.Tensor] = None,
+    decoy_margin: float = 0.1,
+    repulsion_margin: float = 0.1,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Strong contrastive loss that actively pushes decoy predictions away from holo.
+
+    On switch residues:
+    1. correct_holo > decoy_holo + margin (correct ligand prefers holo rotamer)
+    2. decoy_max_other > decoy_holo + repulsion (decoy avoids holo rotamer)
+    """
+    apo_labels, apo_valid = chi1_rotamer_labels(apo_chi1, chi1_mask)
+    holo_labels, holo_valid = chi1_rotamer_labels(holo_chi1, chi1_mask)
+    valid = apo_valid & holo_valid & (apo_labels != holo_labels)
+    if contact_mask is not None:
+        valid = valid & contact_mask.bool()
+    grad_anchor = (correct_logits.sum() + decoy_logits.sum()) * 0.0
+    if valid.sum() == 0:
+        return grad_anchor
+
+    correct_logp = F.log_softmax(correct_logits, dim=-1)
+    decoy_logp = F.log_softmax(decoy_logits, dim=-1)
+    correct_holo = correct_logp.gather(-1, holo_labels.unsqueeze(-1)).squeeze(-1)
+    decoy_holo = decoy_logp.gather(-1, holo_labels.unsqueeze(-1)).squeeze(-1)
+
+    margin_loss = F.relu(float(decoy_margin) - (correct_holo - decoy_holo))
+
+    mask_for_max = torch.zeros_like(decoy_logp).scatter_(-1, holo_labels.unsqueeze(-1), -1e9)
+    decoy_max_other = (decoy_logp + mask_for_max).max(dim=-1).values
+    repulsion_loss = F.relu(float(repulsion_margin) - (decoy_max_other - decoy_holo))
+
+    loss_per = margin_loss + repulsion_loss
+    return (loss_per * valid.float()).sum() / (valid.float().sum() + eps)
+
+
+def ligand_internal_guidance_loss(
+    logits_with_ligand: torch.Tensor,
+    logits_without_ligand: torch.Tensor,
+    apo_chi1: torch.Tensor,
+    holo_chi1: torch.Tensor,
+    chi1_mask: torch.Tensor,
+    node_mask: Optional[torch.Tensor] = None,
+    switch_margin: float = 0.1,
+    nonswitch_weight: float = 0.1,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Ligand internal guidance loss inspired by RAEv2.
+
+    guidance = logits_with_ligand - logits_without_ligand
+
+    On switch residues (apo != holo): guidance magnitude should be large.
+    On non-switch residues: guidance magnitude should be small.
+
+    Analogous to RAEv2 internal guidance: x_guided = x_full + w*(x_full - x_repa).
+    """
+    valid = chi1_mask.bool()
+    if node_mask is not None:
+        valid = valid & node_mask.bool()
+    grad_anchor = (logits_with_ligand.sum() + logits_without_ligand.sum()) * 0.0
+    if valid.sum() == 0:
+        return grad_anchor
+
+    guidance = logits_with_ligand - logits_without_ligand
+    guidance_mag = guidance.norm(dim=-1)
+
+    apo_labels, apo_valid = chi1_rotamer_labels(apo_chi1, chi1_mask)
+    holo_labels, holo_valid = chi1_rotamer_labels(holo_chi1, chi1_mask)
+    label_valid = apo_valid & holo_valid & valid
+
+    switch_mask = label_valid & (apo_labels != holo_labels)
+    nonswitch_mask = label_valid & (apo_labels == holo_labels)
+
+    switch_loss = torch.tensor(0.0, device=logits_with_ligand.device)
+    if switch_mask.any():
+        switch_mag = guidance_mag[switch_mask]
+        switch_loss = F.relu(float(switch_margin) - switch_mag).mean()
+
+    nonswitch_loss = torch.tensor(0.0, device=logits_with_ligand.device)
+    if nonswitch_mask.any() and nonswitch_weight > 0.0:
+        nonswitch_mag = guidance_mag[nonswitch_mask]
+        nonswitch_loss = nonswitch_mag.mean()
+
+    return switch_loss + float(nonswitch_weight) * nonswitch_loss + grad_anchor
+
+
+def ligand_discriminator_loss(
+    correct_score: torch.Tensor,
+    decoy_score: torch.Tensor,
+    apo_chi1: torch.Tensor,
+    holo_chi1: torch.Tensor,
+    chi1_mask: torch.Tensor,
+    node_mask: Optional[torch.Tensor] = None,
+    margin: float = 0.1,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Contrastive loss for independent ligand discriminator.
+
+    On all residues (not just switch): correct ligand binding score should
+    exceed decoy binding score by margin. This trains the discriminator to
+    distinguish correct from decoy ligands independent of rotamer prediction.
+    """
+    valid = chi1_mask.bool()
+    if node_mask is not None:
+        valid = valid & node_mask.bool()
+    grad_anchor = (correct_score.sum() + decoy_score.sum()) * 0.0
+    if valid.sum() == 0:
+        return grad_anchor
+
+    loss_per = F.relu(float(margin) - (correct_score - decoy_score))
+    return (loss_per * valid.float()).sum() / (valid.float().sum() + eps)
+
+
+def protein_ligand_contrastive_loss(
+    protein_repr_correct: torch.Tensor,
+    protein_repr_decoy: torch.Tensor,
+    ligand_repr_correct: torch.Tensor,
+    ligand_repr_decoy: torch.Tensor,
+    node_mask: Optional[torch.Tensor] = None,
+    temperature: float = 0.1,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Protein-ligand contrastive representation loss (DrugCLIP/ConPLex-inspired).
+
+    Learns to distinguish (protein, correct_ligand) from (protein, decoy_ligand)
+    at the representation level, independent of chi1 classification.
+
+    Uses InfoNCE-style contrastive loss:
+    - Positive pairs: (protein_repr_correct, ligand_repr_correct)
+    - Negative pairs: (protein_repr_correct, ligand_repr_decoy)
+
+    The loss encourages the protein representation to be more similar to the
+    correct ligand representation than to decoy ligand representations.
+
+    Args:
+        protein_repr_correct: [B, N, D_prot] protein representation with correct ligand
+        protein_repr_decoy: [B, N, D_prot] protein representation with decoy ligand
+        ligand_repr_correct: [B, D_lig] correct ligand representation (pooled)
+        ligand_repr_decoy: [B, D_lig] decoy ligand representation (pooled)
+        node_mask: [B, N] valid residue mask
+        temperature: temperature for contrastive loss
+        eps: numerical stability
+
+    Returns:
+        loss: scalar tensor
+    """
+    B, N, D_prot = protein_repr_correct.shape
+    D_lig = ligand_repr_correct.shape[-1]
+
+    # Pool protein representations over residues (mean pooling with mask)
+    if node_mask is not None:
+        mask_f = node_mask.float().unsqueeze(-1)
+        protein_pooled_correct = (protein_repr_correct * mask_f).sum(dim=1) / (mask_f.sum(dim=1) + eps)
+        protein_pooled_decoy = (protein_repr_decoy * mask_f).sum(dim=1) / (mask_f.sum(dim=1) + eps)
+    else:
+        protein_pooled_correct = protein_repr_correct.mean(dim=1)
+        protein_pooled_decoy = protein_repr_decoy.mean(dim=1)
+
+    # Do not instantiate projection layers inside a loss function: those
+    # parameters would be random on every call and would never be optimized.
+    # Use the shared leading subspace as a deterministic projection.  If a
+    # learned projection is needed, it should live on the model as a real module.
+    projection_dim = min(D_prot, D_lig)
+    if projection_dim <= 0:
+        return protein_repr_correct.new_tensor(0.0)
+    protein_pooled_correct = protein_pooled_correct[..., :projection_dim]
+    protein_pooled_decoy = protein_pooled_decoy[..., :projection_dim]
+    ligand_repr_correct = ligand_repr_correct[..., :projection_dim]
+    ligand_repr_decoy = ligand_repr_decoy[..., :projection_dim]
+
+    # Normalize representations
+    protein_pooled_correct = F.normalize(protein_pooled_correct, dim=-1)
+    protein_pooled_decoy = F.normalize(protein_pooled_decoy, dim=-1)
+    ligand_repr_correct = F.normalize(ligand_repr_correct, dim=-1)
+    ligand_repr_decoy = F.normalize(ligand_repr_decoy, dim=-1)
+
+    # Compute similarities: positive pair vs two stable negatives.
+    sim_pos = (protein_pooled_correct * ligand_repr_correct).sum(dim=-1) / temperature
+    sim_neg_ligand = (protein_pooled_correct * ligand_repr_decoy).sum(dim=-1) / temperature
+    sim_neg_protein = (protein_pooled_decoy * ligand_repr_correct).sum(dim=-1) / temperature
+
+    # InfoNCE loss: -log(exp(sim_pos) / sum(exp(sim_*)))
+    logits = torch.stack([sim_pos, sim_neg_ligand, sim_neg_protein], dim=-1)
+    targets = torch.zeros(B, dtype=torch.long, device=logits.device)
+
+    loss = F.cross_entropy(logits, targets, reduction='mean')
+
+    return loss
 
 
 def ligand_residual_chi1_loss(
@@ -1078,3 +1278,45 @@ def clash_penalty(coords: torch.Tensor,
         return coords.new_tensor(0.0)
 
     return loss.to(orig_dtype)
+
+
+def latent_change_prediction_loss(
+    delta_z_pred: torch.Tensor,
+    delta_z_true: torch.Tensor,
+    node_mask: torch.Tensor,
+    reduction: str = 'mean',
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """
+    Latent change prediction loss.
+    
+    Computes MSE between predicted and true delta_z in latent space.
+    
+    Args:
+        delta_z_pred: [B, N, D] predicted change in latent space
+        delta_z_true: [B, N, D] true change (z_holo - z_apo)
+        node_mask: [B, N] valid residue mask
+        reduction: 'mean' or 'sum'
+        eps: small value for numerical stability
+    
+    Returns:
+        Scalar loss value
+    """
+    diff = delta_z_pred - delta_z_true
+    loss_per_residue = (diff ** 2).sum(dim=-1)
+    
+    mask_sum = node_mask.float().sum()
+    if mask_sum < eps:
+        return delta_z_pred.new_tensor(0.0)
+    
+    if reduction == 'mean':
+        loss = (loss_per_residue * node_mask.float()).sum() / (mask_sum + eps)
+    elif reduction == 'sum':
+        loss = (loss_per_residue * node_mask.float()).sum()
+    else:
+        raise ValueError(f"Unsupported reduction: {reduction}")
+    
+    if torch.isnan(loss) or torch.isinf(loss):
+        return delta_z_pred.new_tensor(0.0)
+    
+    return loss

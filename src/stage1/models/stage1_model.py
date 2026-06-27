@@ -95,6 +95,8 @@ class Stage1ModelConfig:
     geometry_scorer_typed_init_scale: float = 0.1
     use_contact_posterior: bool = False
     contact_hidden: int = 128
+    use_ligand_discriminator: bool = False
+    ligand_discriminator_hidden: int = 128
     
     # Pocket Routing Adapter (early/mid-trunk ligand→pocket intervention)
     use_pocket_routing_adapter: bool = False
@@ -377,6 +379,10 @@ class Stage1Model(nn.Module):
                 typed_pair_dim=getattr(config, 'geometry_scorer_typed_pair_dim', 64),
                 typed_cutoff=getattr(config, 'geometry_scorer_typed_cutoff', 6.0),
                 typed_init_scale=getattr(config, 'geometry_scorer_typed_init_scale', 0.1),
+                use_sgeo_contact_gate=getattr(config, 'geometry_scorer_use_sgeo_contact_gate', False),
+                contact_gate_d0=getattr(config, 'geometry_scorer_contact_gate_d0', 6.0),
+                use_slig=getattr(config, 'geometry_scorer_use_slig', False),
+                slig_proj_dim=getattr(config, 'geometry_scorer_slig_proj_dim', 32),
             )
 
         # 5c. Optional pocket routing adapter (early/mid-trunk)
@@ -386,6 +392,15 @@ class Stage1Model(nn.Module):
                 c_s=config.c_s,
                 hidden=config.pocket_routing_hidden,
                 n_layers=config.pocket_routing_layers,
+                dropout=config.dropout,
+            )
+
+        self.ligand_discriminator = None
+        if getattr(config, 'use_ligand_discriminator', False):
+            from .torsion_head import LigandDiscriminator
+            self.ligand_discriminator = LigandDiscriminator(
+                c_s=config.c_s,
+                c_hidden=getattr(config, 'ligand_discriminator_hidden', 128),
                 dropout=config.dropout,
             )
         if config.use_pocket_chi1_expert:
@@ -467,13 +482,14 @@ class Stage1Model(nn.Module):
         )
         
         # 3. LigandConditioner（在IPA前注入，符合理论）
-        s_with_ligand = self.ligand_conditioner(
+        s_with_ligand, ligand_repr = self.ligand_conditioner(
             s,
             batch.lig_points,
             batch.lig_types,
             batch.node_mask,
             batch.lig_mask,
-            current_step=current_step
+            current_step=current_step,
+            return_ligand_repr=True
         )
         
         # 3b. Pocket Routing Adapter (pocket-gated residual before IPA)
@@ -537,6 +553,7 @@ class Stage1Model(nn.Module):
                 self.fk_module, rigids_updated, aatype_for_geom,
                 batch.torsion_apo, batch.lig_points, batch.lig_types, batch.lig_mask, batch.node_mask,
                 s_geo=s_geo if self.config.geometry_scorer_use_sgeo else None,
+                s_lig=s_with_ligand if getattr(self.config, 'geometry_scorer_use_slig', False) else None,
                 return_decomposition=True,
                 **scorer_kwargs,
             )
@@ -573,7 +590,11 @@ class Stage1Model(nn.Module):
         torsions_sincos = reorder_torsions_to_openfold(torsions_sincos)
 
         atom14_result = self.fk_module(torsions_sincos, rigids_updated, aatype)
-        
+
+        ligand_discriminator_score = None
+        if self.ligand_discriminator is not None:
+            ligand_discriminator_score = self.ligand_discriminator(s_with_ligand)
+
         return {
             'pred_chi': pred_chi,
             'chi1_rotamer_logits': chi1_rotamer_logits,
@@ -589,10 +610,13 @@ class Stage1Model(nn.Module):
             'geometry_chi1_gate': geometry_chi1_gate,
             'geometry_chi1_typed_energy': geometry_chi1_typed_energy,
             'pocket_chi1_delta': pocket_chi1_delta,
-            's_final': s_geo,  # IPA输出（已含配体信息）
+            's_final': s_geo,
+            's_with_ligand': s_with_ligand,
+            'ligand_repr': ligand_repr,
             'rigids_final': rigids_updated,
             'atom14_pos': atom14_result['atom14_pos'],      # [B, N, 14, 3]
             'atom14_mask': atom14_result['atom14_mask'],    # [B, N, 14]
+            'ligand_discriminator_score': ligand_discriminator_score,
         }
 
     def _build_rigids_from_backbone(self,

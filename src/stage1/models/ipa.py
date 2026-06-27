@@ -207,12 +207,12 @@ def clip_frame_update(axis_angle: torch.Tensor,
     
     # 裁剪旋转
     angle = torch.norm(axis_angle, dim=-1, keepdim=True)
-    scale = torch.clamp(angle / max_angle_rad, max=1.0)
+    scale = torch.clamp(max_angle_rad / torch.clamp(angle, min=1e-8), max=1.0)
     axis_angle_clipped = axis_angle * scale
     
     # 裁剪平移
     trans_norm = torch.norm(translation, dim=-1, keepdim=True)
-    trans_scale = torch.clamp(trans_norm / max_trans, max=1.0)
+    trans_scale = torch.clamp(max_trans / torch.clamp(trans_norm, min=1e-8), max=1.0)
     translation_clipped = translation * trans_scale
     
     return axis_angle_clipped, translation_clipped
@@ -510,4 +510,3 @@ def create_flashipa_module(c_s: int = 384,
         **kwargs
     )
     return FlashIPAModule(config)
-

@@ -322,7 +322,9 @@ class GeometryCandidateScorer(nn.Module):
                  gate_clamp: float = 6.0, gate_init_bias: float = 0.0,
                  use_typed_energy: bool = False, lig_type_dim: int = 20,
                  typed_pair_dim: int = 64, typed_cutoff: float = 6.0,
-                 typed_init_scale: float = 0.1):
+                 typed_init_scale: float = 0.1,
+                 use_sgeo_contact_gate: bool = False, contact_gate_d0: float = 6.0,
+                 use_slig: bool = False, slig_proj_dim: int = 32):
         super().__init__()
         self.use_sgeo = use_sgeo
         self.num_rbf = num_rbf
@@ -340,6 +342,10 @@ class GeometryCandidateScorer(nn.Module):
         self.lig_type_dim = int(lig_type_dim)
         self.typed_pair_dim = int(typed_pair_dim)
         self.typed_cutoff = float(typed_cutoff)
+        self.use_sgeo_contact_gate = bool(use_sgeo_contact_gate)
+        self.contact_gate_d0 = float(contact_gate_d0)
+        self.use_slig = bool(use_slig)
+        self._slig_proj_dim = int(slig_proj_dim)
 
         # --- Base prior: aatype(21) + phi/psi_sc(4) + apo_chi1_sc(2) + cand_chi1_sc(2) = 29 ---
         self.base_dim = 21 + 4 + 2 + 2
@@ -364,6 +370,13 @@ class GeometryCandidateScorer(nn.Module):
                 nn.GELU(),
             )
             self.residual_dim += sgeo_proj_dim
+        if use_slig:
+            self.slig_proj = nn.Sequential(
+                nn.LayerNorm(c_s),
+                nn.Linear(c_s, slig_proj_dim),
+                nn.GELU(),
+            )
+            self.residual_dim += slig_proj_dim
 
         self.residual_mlp = nn.Sequential(
             nn.Linear(self.residual_dim, c_hidden),
@@ -462,7 +475,11 @@ class GeometryCandidateScorer(nn.Module):
 
         valid_f = local_valid.to(pair_score.dtype)
         pair_count = valid_f.sum(dim=(-1, -2))
-        denom = pair_count.clamp(min=1.0)
+        # Average pooling washed out the correct-vs-scrambled signal because
+        # most candidates see nearly the same local ligand-type multiset.
+        # sqrt-count normalization keeps the score size stable while preserving
+        # more of the distance-weighted local chemistry contrast.
+        denom = pair_count.clamp(min=1.0).sqrt()
         typed_energy = (pair_score * valid_f).sum(dim=(-1, -2)) / denom
         typed_energy = self.typed_energy_scale.to(typed_energy.dtype) * typed_energy
         typed_energy = typed_energy * (pair_count > 0).to(typed_energy.dtype)
@@ -564,6 +581,7 @@ class GeometryCandidateScorer(nn.Module):
         lig_mask: torch.Tensor,
         node_mask: torch.Tensor,
         s_geo: Optional[torch.Tensor] = None,
+        s_lig: Optional[torch.Tensor] = None,
         return_decomposition: bool = False,
         base_detach: bool = False,
         gate_override: Optional[float] = None,
@@ -604,7 +622,18 @@ class GeometryCandidateScorer(nn.Module):
             residual_feats_list = [rbf_pooled, clash.unsqueeze(-1), min_dist.unsqueeze(-1)]
             if self.use_sgeo and s_geo is not None:
                 sgeo_compressed = self.sgeo_proj(s_geo)  # [B, N, sgeo_proj_dim]
-                residual_feats_list.append(sgeo_compressed.unsqueeze(2).expand(B, N, 3, -1))
+                if self.use_sgeo_contact_gate:
+                    contact_w = torch.sigmoid(
+                        (self.contact_gate_d0 - min_dist) / 1.0
+                    )  # [B, N, K]
+                    sgeo_expanded = sgeo_compressed.unsqueeze(2).expand(B, N, 3, -1)
+                    sgeo_gated = sgeo_expanded * contact_w.unsqueeze(-1)
+                    residual_feats_list.append(sgeo_gated)
+                else:
+                    residual_feats_list.append(sgeo_compressed.unsqueeze(2).expand(B, N, 3, -1))
+            if self.use_slig and s_lig is not None:
+                slig_compressed = self.slig_proj(s_lig)  # [B, N, slig_proj_dim]
+                residual_feats_list.append(slig_compressed.unsqueeze(2).expand(B, N, 3, -1))
             residual_input = torch.cat(residual_feats_list, dim=-1)  # [B, N, 3, residual_dim]
             residual_logits = self.residual_mlp(residual_input).squeeze(-1)  # [B, N, 3]
             if self.use_typed_energy and lig_types is not None:
@@ -654,6 +683,43 @@ class GeometryCandidateScorer(nn.Module):
             # Always expose the (un-detached) base_logits and the actual gate*residual contribution.
             return logits, base_logits, residual_logits * beta_scale, gate, typed_energy * beta_scale
         return logits
+
+
+class LigandDiscriminator(nn.Module):
+    """Independent ligand discrimination head for two-stage training.
+
+    Stage 1: train rotamer prediction with chi1 loss (base prior checkpoint).
+    Stage 2: freeze rotamer head, train this discriminator with contrastive loss.
+
+    The discriminator produces a per-residue binding score from the ligand
+    conditioner output. It's completely independent of rotamer prediction,
+    so chi1 loss cannot interfere with ligand discrimination learning.
+    """
+
+    def __init__(self, c_s: int = 384, c_hidden: int = 128, dropout: float = 0.1):
+        super().__init__()
+        self.score_mlp = nn.Sequential(
+            nn.LayerNorm(c_s),
+            nn.Linear(c_s, c_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(c_hidden, c_hidden // 2),
+            nn.GELU(),
+            nn.Linear(c_hidden // 2, 1),
+        )
+        nn.init.zeros_(self.score_mlp[-1].weight)
+        nn.init.zeros_(self.score_mlp[-1].bias)
+
+    def forward(self, s_lig: torch.Tensor) -> torch.Tensor:
+        """Per-residue binding score from ligand conditioner output.
+
+        Args:
+            s_lig: [B, N, c_s] ligand conditioner output
+
+        Returns:
+            score: [B, N] per-residue binding score
+        """
+        return self.score_mlp(s_lig).squeeze(-1)
 
 
 def create_torsion_head(c_s: int = 384,

@@ -144,6 +144,38 @@ def parse_args():
                        help='M3 mode: add s_geo projection to geometry scorer input')
     parser.add_argument('--geometry_scorer_sgeo_dim', type=int, default=32,
                        help='s_geo projection dim for M3 mode')
+    parser.add_argument('--geometry_scorer_use_sgeo_contact_gate', action='store_true',
+                       help='Gate s_geo injection by per-residue contact distance')
+    parser.add_argument('--geometry_scorer_contact_gate_d0', type=float, default=6.0,
+                       help='Contact gate distance threshold in Angstrom')
+    parser.add_argument('--geometry_scorer_use_slig', action='store_true',
+                       help='Inject ligand conditioner output directly into residual path')
+    parser.add_argument('--geometry_scorer_slig_proj_dim', type=int, default=32,
+                       help='s_lig projection dim for direct injection')
+    parser.add_argument('--use_ligand_discriminator', action='store_true',
+                       help='enable independent ligand discriminator for two-stage training')
+    parser.add_argument('--ligand_discriminator_hidden', type=int, default=128,
+                       help='hidden dim for ligand discriminator')
+    parser.add_argument('--lambda_ligand_discriminator', type=float, default=0.0,
+                       help='contrastive loss weight for ligand discriminator')
+    parser.add_argument('--ligand_discriminator_decoy_kind', type=str, default='scrambled',
+                       choices=['scrambled', 'shuffled', 'nolig', 'translated'],
+                       help='decoy type for ligand discriminator')
+    parser.add_argument('--ligand_discriminator_margin', type=float, default=0.1,
+                       help='margin for ligand discriminator contrastive loss')
+    parser.add_argument('--lambda_ligand_guidance', type=float, default=0.0,
+                       help='ligand internal guidance loss weight (RAEv2-inspired)')
+    parser.add_argument('--ligand_guidance_switch_margin', type=float, default=0.1,
+                       help='margin for guidance magnitude on switch residues')
+    parser.add_argument('--ligand_guidance_nonswitch_weight', type=float, default=0.1,
+                       help='weight for guidance magnitude penalty on non-switch residues')
+    parser.add_argument('--lambda_protein_ligand_contrastive', type=float, default=0.0,
+                       help='protein-ligand contrastive representation loss weight (DrugCLIP-inspired)')
+    parser.add_argument('--protein_ligand_contrastive_decoy_kind', type=str, default='shuffled',
+                       choices=['scrambled', 'shuffled', 'nolig', 'translated'],
+                       help='decoy type for protein-ligand contrastive loss')
+    parser.add_argument('--protein_ligand_contrastive_temperature', type=float, default=0.1,
+                       help='temperature for protein-ligand contrastive loss')
     parser.add_argument('--geometry_scorer_use_typed_energy', action='store_true',
                        help='enable typed residue-atom/ligand-token interaction energy in geometry scorer')
     parser.add_argument('--geometry_scorer_typed_pair_dim', type=int, default=64,
@@ -157,6 +189,8 @@ def parse_args():
     parser.add_argument('--typed_candidate_decoy_kind', type=str, default='scrambled',
                        choices=['scrambled', 'shuffled', 'nolig', 'translated'],
                        help='decoy type for typed candidate energy loss')
+    parser.add_argument('--typed_candidate_energy_controls', type=str, default='',
+                       help='optional comma-separated controls for typed candidate energy loss')
     parser.add_argument('--typed_candidate_contact_only', action='store_true', default=True,
                        help='restrict typed candidate energy loss to CA-ligand contact switch residues')
     parser.add_argument('--typed_candidate_no_contact_only', dest='typed_candidate_contact_only', action='store_false')
@@ -166,6 +200,23 @@ def parse_args():
                        help='auxiliary no-harm weight for typed candidate energy')
     parser.add_argument('--typed_candidate_noncontact_zero_weight', type=float, default=0.05,
                        help='auxiliary non-contact zero-energy weight for typed candidate energy')
+    parser.add_argument('--lambda_typed_strict_rotamer', type=float, default=0.0,
+                       help='strict correct-vs-control rotamer rerank loss weight for typed candidate runs')
+    parser.add_argument('--typed_strict_rotamer_controls', type=str, default='scrambled,shuffled',
+                       help='comma-separated strict controls for typed strict rotamer loss')
+    parser.add_argument('--typed_strict_rotamer_margin', type=float, default=0.05,
+                       help='margin for correct ligand holo-bin log-prob over strict controls')
+    parser.add_argument('--typed_strict_rotamer_rank_margin', type=float, default=0.0,
+                       help='optional margin for holo bin over other bins under correct ligand')
+    parser.add_argument('--lambda_decoy_contrastive', type=float, default=0.0,
+                       help='strong contrastive loss weight (margin + repulsion)')
+    parser.add_argument('--decoy_contrastive_margin', type=float, default=0.1,
+                       help='correct-vs-decoy margin for contrastive loss')
+    parser.add_argument('--decoy_contrastive_repulsion', type=float, default=0.1,
+                       help='decoy repulsion margin (push decoy away from holo)')
+    parser.add_argument('--decoy_contrastive_decoy_kind', type=str, default='scrambled',
+                       choices=['scrambled', 'shuffled', 'nolig', 'translated'],
+                       help='decoy type for contrastive loss')
     parser.add_argument('--lambda_switch_bce', type=float, default=0.0,
                        help='switch prediction BCE loss weight')
     parser.add_argument('--lambda_rescue_noharm', type=float, default=0.0,
@@ -283,11 +334,20 @@ def parse_args():
                             'typed_energy_gap_contact',
                             'typed_energy_gap_contact_switch',
                             'typed_energy_gap_pocket_switch',
+                            'typed_strict_switch_energy_gap_min',
                             'candidate_decoy_lift_switch_rotamer_acc',
                             'candidate_decoy_lift_apo_wrong_rotamer_acc',
                             'candidate_decoy_lift_contact_rotamer_acc',
                             'candidate_decoy_lift_contact_switch_rotamer_acc',
                             'candidate_decoy_lift_pocket_switch_rotamer_acc',
+                            'typed_strict_contact_switch_score',
+                            'typed_strict_pocket_switch_score',
+                            'typed_strict_switch_score',
+                            'ligand_discriminator_lift_switch',
+                            'ligand_discriminator_lift_contact_switch',
+                            'ligand_guidance_switch_loss',
+                            'ligand_guidance_nonswitch_loss',
+                            'protein_ligand_contrastive',
                         ],
                        help='选模/早停指标：默认 total 保持历史行为兼容')
 
@@ -401,16 +461,40 @@ def main():
         geometry_scorer_lr_scale=args.geometry_scorer_lr_scale,
         geometry_scorer_use_sgeo=args.geometry_scorer_use_sgeo,
         geometry_scorer_sgeo_dim=args.geometry_scorer_sgeo_dim,
+        geometry_scorer_use_sgeo_contact_gate=args.geometry_scorer_use_sgeo_contact_gate,
+        geometry_scorer_contact_gate_d0=args.geometry_scorer_contact_gate_d0,
+        geometry_scorer_use_slig=args.geometry_scorer_use_slig,
+        geometry_scorer_slig_proj_dim=args.geometry_scorer_slig_proj_dim,
+        use_ligand_discriminator=args.use_ligand_discriminator,
+        ligand_discriminator_hidden=args.ligand_discriminator_hidden,
+        lambda_ligand_discriminator=args.lambda_ligand_discriminator,
+        ligand_discriminator_decoy_kind=args.ligand_discriminator_decoy_kind,
+        ligand_discriminator_margin=args.ligand_discriminator_margin,
+        lambda_ligand_guidance=args.lambda_ligand_guidance,
+        ligand_guidance_switch_margin=args.ligand_guidance_switch_margin,
+        ligand_guidance_nonswitch_weight=args.ligand_guidance_nonswitch_weight,
+        lambda_protein_ligand_contrastive=args.lambda_protein_ligand_contrastive,
+        protein_ligand_contrastive_decoy_kind=args.protein_ligand_contrastive_decoy_kind,
+        protein_ligand_contrastive_temperature=args.protein_ligand_contrastive_temperature,
         geometry_scorer_use_typed_energy=args.geometry_scorer_use_typed_energy,
         geometry_scorer_typed_pair_dim=args.geometry_scorer_typed_pair_dim,
         geometry_scorer_typed_cutoff=args.geometry_scorer_typed_cutoff,
         geometry_scorer_typed_init_scale=args.geometry_scorer_typed_init_scale,
         lambda_typed_candidate_energy=args.lambda_typed_candidate_energy,
         typed_candidate_decoy_kind=args.typed_candidate_decoy_kind,
+        typed_candidate_energy_controls=args.typed_candidate_energy_controls,
         typed_candidate_contact_only=args.typed_candidate_contact_only,
         typed_candidate_margin=args.typed_candidate_margin,
         typed_candidate_noharm_weight=args.typed_candidate_noharm_weight,
         typed_candidate_noncontact_zero_weight=args.typed_candidate_noncontact_zero_weight,
+        lambda_typed_strict_rotamer=args.lambda_typed_strict_rotamer,
+        typed_strict_rotamer_controls=args.typed_strict_rotamer_controls,
+        typed_strict_rotamer_margin=args.typed_strict_rotamer_margin,
+        typed_strict_rotamer_rank_margin=args.typed_strict_rotamer_rank_margin,
+        lambda_decoy_contrastive=args.lambda_decoy_contrastive,
+        decoy_contrastive_margin=args.decoy_contrastive_margin,
+        decoy_contrastive_repulsion=args.decoy_contrastive_repulsion,
+        decoy_contrastive_decoy_kind=args.decoy_contrastive_decoy_kind,
         lambda_switch_bce=args.lambda_switch_bce,
         lambda_rescue_noharm=args.lambda_rescue_noharm,
         lambda_ligand_residual=args.lambda_ligand_residual,
@@ -511,7 +595,8 @@ def main():
         print(f"  - 损失权重: w_fape={config.w_fape}, w_chi={config.w_chi}, w_clash={config.w_clash}, lambda_pchi1={config.lambda_pchi1}, lambda_chi1_rotamer={config.lambda_chi1_rotamer}, lambda_contact={config.lambda_contact}, lambda_candidate_chi1={config.lambda_candidate_chi1}, lambda_ligand_contrastive={config.lambda_ligand_contrastive}, lambda_candidate_rerank={config.lambda_candidate_rerank}, lambda_typed_candidate_energy={config.lambda_typed_candidate_energy}")
         print(f"  - ligand contrastive margin: {config.ligand_contrastive_margin}")
         print(f"  - candidate rerank: margin={config.candidate_rerank_margin}, rank_margin={config.candidate_rerank_rank_margin}, contact_only={config.candidate_rerank_contact_only}, decoy={config.candidate_rerank_decoy_kind}")
-        print(f"  - typed candidate energy: enabled={config.geometry_scorer_use_typed_energy}, decoy={config.typed_candidate_decoy_kind}, margin={config.typed_candidate_margin}, contact_only={config.typed_candidate_contact_only}")
+        print(f"  - typed candidate energy: enabled={config.geometry_scorer_use_typed_energy}, decoy={config.typed_candidate_decoy_kind}, controls={config.typed_candidate_energy_controls}, margin={config.typed_candidate_margin}, contact_only={config.typed_candidate_contact_only}")
+        print(f"  - typed strict rotamer: lambda={config.lambda_typed_strict_rotamer}, controls={config.typed_strict_rotamer_controls}, margin={config.typed_strict_rotamer_margin}, rank_margin={config.typed_strict_rotamer_rank_margin}")
         print(f"  - pchi1 mask: {config.pchi1_mask_mode}")
         print(f"  - pchi1 start step: {config.pchi1_start_step}")
         print(f"  - pchi1 ramp steps: {config.pchi1_ramp_steps}")

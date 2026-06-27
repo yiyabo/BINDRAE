@@ -360,3 +360,234 @@ def build_atom14_constants():
         'restype_atom14_mask': restype_atom14_mask,
     }
 
+
+# ========================================================================
+# Chi angle atom definitions (standard AlphaFold2/OpenFold convention)
+# Each chi angle is defined by 4 atoms; the torsion rotates around
+# the bond between atoms[1] and atoms[2].
+# ========================================================================
+
+chi_angles_atoms = {
+    "ALA": [],
+    "ARG": [["N","CA","CB","CG"], ["CA","CB","CG","CD"],
+            ["CB","CG","CD","NE"], ["CG","CD","NE","CZ"]],
+    "ASN": [["N","CA","CB","CG"], ["CA","CB","CG","OD1"]],
+    "ASP": [["N","CA","CB","CG"], ["CA","CB","CG","OD1"]],
+    "CYS": [["N","CA","CB","SG"]],
+    "GLN": [["N","CA","CB","CG"], ["CA","CB","CG","CD"],
+            ["CB","CG","CD","OE1"]],
+    "GLU": [["N","CA","CB","CG"], ["CA","CB","CG","CD"],
+            ["CB","CG","CD","OE1"]],
+    "GLY": [],
+    "HIS": [["N","CA","CB","CG"], ["CA","CB","CG","ND1"]],
+    "ILE": [["N","CA","CB","CG1"], ["CA","CB","CG1","CD1"]],
+    "LEU": [["N","CA","CB","CG"], ["CA","CB","CG","CD1"]],
+    "LYS": [["N","CA","CB","CG"], ["CA","CB","CG","CD"],
+            ["CB","CG","CD","CE"], ["CG","CD","CE","NZ"]],
+    "MET": [["N","CA","CB","CG"], ["CA","CB","CG","SD"],
+            ["CB","CG","SD","CE"]],
+    "PHE": [["N","CA","CB","CG"], ["CA","CB","CG","CD1"]],
+    "PRO": [["N","CA","CB","CG"], ["CA","CB","CG","CD"]],
+    "SER": [["N","CA","CB","OG"]],
+    "THR": [["N","CA","CB","OG1"]],
+    "TRP": [["N","CA","CB","CG"], ["CA","CB","CG","CD1"]],
+    "TYR": [["N","CA","CB","CG"], ["CA","CB","CG","CD1"]],
+    "VAL": [["N","CA","CB","CG1"]],
+}
+
+
+def _make_rigid_transformation_4x4(ex, ey, translation):
+    """
+    Build a [4,4] homogeneous transformation matrix from:
+      ex:          unit x-axis direction  (shape [3])
+      ey:          vector in the xy-plane (shape [3], will be orthogonalized)
+      translation: origin position        (shape [3])
+
+    Returns:
+      np.ndarray of shape [4,4], dtype float64 (caller casts to float32).
+    """
+    # Orthogonalize ey against ex and normalize
+    ex = ex / (np.linalg.norm(ex) + 1e-20)
+    ey = ey - np.dot(ey, ex) * ex
+    ey = ey / (np.linalg.norm(ey) + 1e-20)
+    ez = np.cross(ex, ey)
+
+    result = np.eye(4)
+    # Rotation columns = basis vectors (each column is a basis vector in
+    # the parent frame).  Row-major: result[row, col].
+    # Column 0 = ex, Column 1 = ey, Column 2 = ez  =>  R @ [1,0,0] = ex
+    result[0, 0] = ex[0];  result[0, 1] = ey[0];  result[0, 2] = ez[0]
+    result[1, 0] = ex[1];  result[1, 1] = ey[1];  result[1, 2] = ez[1]
+    result[2, 0] = ex[2];  result[2, 1] = ey[2];  result[2, 2] = ez[2]
+    result[0, 3] = translation[0]
+    result[1, 3] = translation[1]
+    result[2, 3] = translation[2]
+    return result
+
+
+def _invert_4x4(T):
+    """Invert a [4,4] homogeneous rigid transformation (R|t ; 0 1)."""
+    R = T[:3, :3]
+    t = T[:3, 3]
+    inv = np.eye(4)
+    inv[:3, :3] = R.T
+    inv[:3, 3] = -R.T @ t
+    return inv
+
+
+def make_default_frames():
+    """
+    Build ``restype_rigid_group_default_frame`` -- a [21, 8, 4, 4] float32
+    array of homogeneous transformation matrices.
+
+    For each of the 20 standard amino acids and 8 rigid groups (backbone,
+    pre-omega, phi, psi, chi1 .. chi4) this gives the default (zero-torsion)
+    frame of each group expressed *relative to its parent group*.
+
+    Parent chain:  0->backbone  1->0  2->0  3->0  4->0  5->4  6->5  7->6
+
+    The algorithm builds backbone-frame atom positions iteratively:
+      1. Group-0 atoms are already in backbone frame.
+      2. For each chi group g (4 .. 7), the default frame is computed from
+         the three defining atoms (atoms[0], atoms[1], atoms[2] of the
+         corresponding chi angle).  The frame has:
+           - origin at atoms[2]
+           - x-axis along atoms[1] -> atoms[2]  (the torsion bond axis)
+           - y-axis in the atoms[0]-atoms[1]-atoms[2] plane
+         After building group g's frame, the positions of atoms belonging
+         to group g are transformed from their local coords into the
+         backbone frame, making them available for group g+1.
+      3. Frames for groups 5-7 are re-expressed relative to the parent
+         group via: frame_rel = inv(parent_frame) @ child_frame.
+    """
+    FRAME_PARENT = [0, 0, 0, 0, 0, 4, 5, 6]
+
+    result = np.zeros([21, 8, 4, 4], dtype=np.float64)
+    # Initialize all to identity
+    for i in range(21):
+        for g in range(8):
+            result[i, g] = np.eye(4)
+
+    for restype_letter in restypes:
+        resname = restype_1to3[restype_letter]
+        aa_idx = restype_order[restype_letter]
+
+        # -- Collect group-0 (backbone) atom positions in backbone frame --
+        # These are the "seed" positions we know directly.
+        atom_pos_local = {}   # atom_name -> (group_idx, np.array position in that group's frame)
+        atom_pos_bb = {}      # atom_name -> np.array position in backbone frame
+
+        for atom_name, grp, pos in rigid_group_atom_positions[resname]:
+            p = np.array(pos, dtype=np.float64)
+            atom_pos_local[atom_name] = (grp, p)
+            if grp == 0:
+                atom_pos_bb[atom_name] = p
+
+        # Convenience: get backbone atom positions (with safe defaults)
+        def _get_bb(name, default=None):
+            if name in atom_pos_bb:
+                return atom_pos_bb[name]
+            if default is not None:
+                return default
+            return np.zeros(3, dtype=np.float64)
+
+        pos_N  = _get_bb("N",  np.array([-0.525, 1.363, 0.0]))
+        pos_CA = _get_bb("CA", np.array([ 0.000, 0.000, 0.0]))
+        pos_C  = _get_bb("C",  np.array([ 1.526, 0.000, 0.0]))
+
+        # ---- Group 0 (backbone): identity ----
+        # Already set to identity above.
+
+        # ---- Group 1 (pre-omega): identity ----
+        # Already identity.
+
+        # ---- Group 2 (phi): rotation around N-CA bond, origin at N ----
+        ex = pos_CA - pos_N
+        ey = pos_C - pos_N
+        result[aa_idx, 2] = _make_rigid_transformation_4x4(ex, ey, pos_N)
+
+        # ---- Group 3 (psi): rotation around CA-C bond, origin at C ----
+        ex = pos_C - pos_CA
+        ey = pos_N - pos_CA
+        result[aa_idx, 3] = _make_rigid_transformation_4x4(ex, ey, pos_C)
+
+        # ---- Groups 4-7 (chi1 .. chi4) ----
+        chi_atoms = chi_angles_atoms.get(resname, [])
+        chi_mask_this = chi_angles_mask[aa_idx]
+
+        # We will accumulate absolute (backbone-frame) default frames for
+        # each chi group, so we can compute relative frames for child groups.
+        abs_frames = {}   # group_idx -> 4x4 matrix in backbone frame
+
+        for chi_idx in range(4):
+            group_idx = chi_idx + 4  # groups 4,5,6,7
+
+            if chi_idx >= len(chi_atoms) or chi_mask_this[chi_idx] < 0.5:
+                # No chi angle for this group -- leave as identity
+                abs_frames[group_idx] = np.eye(4)
+                continue
+
+            a0_name, a1_name, a2_name, _a3_name = chi_atoms[chi_idx]
+
+            # We need a0, a1, a2 positions in backbone frame.
+            # For chi1: all three (N, CA, CB) are group-0 atoms => already known.
+            # For chi2+: the first atom of the chi definition that's in a higher
+            #   group will have been transformed to backbone frame in a
+            #   previous iteration.
+            #
+            # Strategy: for each atom, check if we already have it in atom_pos_bb.
+            # If not, it's in a group we already processed -- we must have
+            # added it via the frame composition below.
+
+            # Resolve positions -- atoms not yet in atom_pos_bb are a problem
+            # we handle by transforming them from their local frame using
+            # the already-computed absolute default frame.
+            for aname in [a0_name, a1_name, a2_name]:
+                if aname not in atom_pos_bb:
+                    grp_of_atom, local_p = atom_pos_local[aname]
+                    if grp_of_atom in abs_frames:
+                        T = abs_frames[grp_of_atom]
+                        p_homo = np.array([local_p[0], local_p[1], local_p[2], 1.0])
+                        p_bb = (T @ p_homo)[:3]
+                        atom_pos_bb[aname] = p_bb
+
+            p0 = atom_pos_bb.get(a0_name, np.zeros(3))
+            p1 = atom_pos_bb.get(a1_name, np.zeros(3))
+            p2 = atom_pos_bb.get(a2_name, np.zeros(3))
+
+            # Build the absolute (backbone-frame) default frame for this group:
+            #   origin at p2 (the "child" pivot atom)
+            #   x-axis along p1 -> p2  (the torsion rotation axis)
+            #   y  in the p0-p1-p2 plane
+            ex = p2 - p1
+            ey = p0 - p1
+            T_abs = _make_rigid_transformation_4x4(ex, ey, p2)
+            abs_frames[group_idx] = T_abs
+
+            # Now transform all atoms in this group to backbone frame
+            # so they're available for subsequent chi definitions.
+            for atom_name, grp, pos in rigid_group_atom_positions[resname]:
+                if grp == group_idx and atom_name not in atom_pos_bb:
+                    p_local = np.array(pos, dtype=np.float64)
+                    p_homo = np.array([p_local[0], p_local[1], p_local[2], 1.0])
+                    p_bb = (T_abs @ p_homo)[:3]
+                    atom_pos_bb[atom_name] = p_bb
+
+            # Store the frame: for groups 4 this is relative to backbone
+            # (which is identity, so abs == rel).  For groups 5-7 we need
+            # to re-express relative to the parent group's default frame.
+            parent_grp = FRAME_PARENT[group_idx]
+            if parent_grp == 0:
+                result[aa_idx, group_idx] = T_abs.astype(np.float64)
+            else:
+                T_parent = abs_frames.get(parent_grp, np.eye(4))
+                T_rel = _invert_4x4(T_parent) @ T_abs
+                result[aa_idx, group_idx] = T_rel.astype(np.float64)
+
+    # Index 20 = UNK => all identity (already set).
+    return result.astype(np.float32)
+
+
+# Module-level constant: computed once at import time.
+restype_rigid_group_default_frame = make_default_frames()
+

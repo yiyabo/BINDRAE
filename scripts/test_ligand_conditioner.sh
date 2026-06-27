@@ -17,7 +17,7 @@ echo ""
 echo -e "${GREEN}[1/1]${NC} 功能验证..."
 python << 'EOF'
 import torch
-from src.stage1.models.ligand_condition import create_ligand_conditioner
+from src.stage1.models.ligand_condition import create_ligand_conditioner, LIGAND_TYPE_DIM
 
 print("\n测试配置:")
 print(f"  - 批大小: 2")
@@ -30,7 +30,7 @@ c_s = 384
 
 protein_features = torch.randn(B, N, c_s)
 lig_points = torch.randn(B, M, 3)
-lig_types = torch.randn(B, M, 12)
+lig_types = torch.randn(B, M, LIGAND_TYPE_DIM)
 protein_mask = torch.ones(B, N, dtype=torch.bool)
 ligand_mask = torch.ones(B, M, dtype=torch.bool)
 ligand_mask[:, -10:] = False  # 最后10个token无效
@@ -80,7 +80,7 @@ print("\n梯度测试...")
 # 创建需要梯度的输入（叶子节点）
 protein_grad = torch.randn(B, N, c_s, requires_grad=True)
 lig_points_grad = torch.randn(B, M, 3, requires_grad=True)
-lig_types_grad = torch.randn(B, M, 12, requires_grad=True)
+lig_types_grad = torch.randn(B, M, LIGAND_TYPE_DIM, requires_grad=True)
 
 if torch.cuda.is_available():
     protein_grad = protein_grad.cuda()
@@ -113,4 +113,3 @@ echo ""
 echo "============================================================================"
 echo -e "${GREEN}✅ 测试通过！${NC}"
 echo "============================================================================"
-

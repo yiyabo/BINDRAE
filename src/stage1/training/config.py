@@ -74,12 +74,36 @@ class TrainingConfig:
     geometry_scorer_typed_pair_dim: int = 64
     geometry_scorer_typed_cutoff: float = 6.0
     geometry_scorer_typed_init_scale: float = 0.1
+    geometry_scorer_use_sgeo_contact_gate: bool = False
+    geometry_scorer_contact_gate_d0: float = 6.0
+    geometry_scorer_use_slig: bool = False
+    geometry_scorer_slig_proj_dim: int = 32
+    use_ligand_discriminator: bool = False
+    ligand_discriminator_hidden: int = 128
+    lambda_ligand_discriminator: float = 0.0
+    ligand_discriminator_decoy_kind: str = 'scrambled'
+    ligand_discriminator_margin: float = 0.1
+    lambda_ligand_guidance: float = 0.0
+    ligand_guidance_switch_margin: float = 0.1
+    ligand_guidance_nonswitch_weight: float = 0.1
+    lambda_protein_ligand_contrastive: float = 0.0
+    protein_ligand_contrastive_decoy_kind: str = 'shuffled'
+    protein_ligand_contrastive_temperature: float = 0.1
     lambda_typed_candidate_energy: float = 0.0
     typed_candidate_decoy_kind: str = 'scrambled'  # 'scrambled' | 'shuffled' | 'nolig' | 'translated'
+    typed_candidate_energy_controls: str = ''  # optional comma-separated strict energy controls
     typed_candidate_contact_only: bool = True
     typed_candidate_margin: float = 0.05
     typed_candidate_noharm_weight: float = 0.1
     typed_candidate_noncontact_zero_weight: float = 0.05
+    lambda_typed_strict_rotamer: float = 0.0
+    typed_strict_rotamer_controls: str = 'scrambled,shuffled'
+    typed_strict_rotamer_margin: float = 0.05
+    typed_strict_rotamer_rank_margin: float = 0.0
+    lambda_decoy_contrastive: float = 0.0
+    decoy_contrastive_margin: float = 0.1
+    decoy_contrastive_repulsion: float = 0.1
+    decoy_contrastive_decoy_kind: str = 'scrambled'
 
     # Phase-1 residual retraining (GPT-5.5 Pro plan)
     geometry_scorer_bounded_residual: bool = False

@@ -10,6 +10,7 @@ This script scans all samples in the data directory and checks:
 Outputs:
 - valid_samples.txt: list of sample IDs that passed all checks
 - invalid_samples.txt: list of sample IDs that failed with reasons
+- sample_metadata.json: per-sample metadata for training-time bucketing
 
 Usage:
     python scripts/validate_triplets_data.py --data_dir data/apo_holo_triplets
@@ -22,7 +23,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
 
@@ -104,31 +105,105 @@ def check_numpy_file(path: Path) -> Tuple[bool, str]:
         return False, f"Load error: {str(e)[:50]}"
 
 
-def check_esm_file(path: Path) -> Tuple[bool, str]:
-    """Check ESM file for validity."""
+def check_esm_file(path: Path, require_esm_layers: int = 0) -> Tuple[bool, str, Optional[int]]:
+    """Check ESM file for validity and return residue count."""
     try:
         import torch
         data = torch.load(path, weights_only=False)
         if 'per_residue' not in data:
-            return False, "Missing 'per_residue' key"
+            return False, "Missing 'per_residue' key", None
         emb = data['per_residue']
+        if emb.ndim != 2:
+            return False, f"per_residue must be 2D, got {tuple(emb.shape)}", None
         if torch.isnan(emb).any():
-            return False, "NaN in embeddings"
+            return False, "NaN in embeddings", None
         if torch.isinf(emb).any():
-            return False, "Inf in embeddings"
+            return False, "Inf in embeddings", None
         if emb.shape[0] == 0:
-            return False, "Empty embeddings"
-        return True, ""
+            return False, "Empty embeddings", None
+        layers = data.get('per_residue_layers')
+        if require_esm_layers > 0 and layers is None:
+            return False, f"Missing per_residue_layers required K>={require_esm_layers}", None
+        if layers is not None:
+            if layers.ndim != 3:
+                return False, f"per_residue_layers must be 3D, got {tuple(layers.shape)}", None
+            if layers.shape[0] != emb.shape[0] or layers.shape[-1] != emb.shape[-1]:
+                return False, (
+                    f"per_residue_layers shape {tuple(layers.shape)} inconsistent "
+                    f"with per_residue {tuple(emb.shape)}"
+                ), None
+            if require_esm_layers > 0 and layers.shape[1] < require_esm_layers:
+                return False, (
+                    f"per_residue_layers K={layers.shape[1]} < required {require_esm_layers}"
+                ), None
+            if torch.isnan(layers).any():
+                return False, "NaN in per_residue_layers", None
+            if torch.isinf(layers).any():
+                return False, "Inf in per_residue_layers", None
+        return True, "", int(emb.shape[0])
     except Exception as e:
-        return False, f"Load error: {str(e)[:50]}"
+        return False, f"Load error: {str(e)[:50]}", None
 
 
-def validate_sample(sample_dir: Path) -> Tuple[str, bool, str]:
+def _resolve_optional_path(path_str: Optional[str], base_dir: Path) -> Optional[Path]:
+    if path_str is None:
+        return None
+    path = Path(path_str)
+    if path.is_absolute() or path.exists():
+        return path
+    return base_dir / path_str
+
+
+def load_sample_ids(path: Path) -> List[str]:
+    """Load sample IDs from txt/json while preserving order."""
+    if path.suffix == '.json':
+        with open(path, 'r') as f:
+            data = json.load(f)
+
+        if isinstance(data, dict):
+            if 'pdb_ids' in data:
+                raw_ids = data['pdb_ids']
+            elif 'ids' in data:
+                raw_ids = data['ids']
+            else:
+                raise ValueError(
+                    f"Unsupported JSON format in {path}; expected list or dict with 'pdb_ids'/'ids'"
+                )
+        elif isinstance(data, list):
+            raw_ids = data
+        else:
+            raise ValueError(f"Unsupported JSON format in {path}")
+    else:
+        with open(path, 'r') as f:
+            raw_ids = [line.strip() for line in f if line.strip()]
+
+    sample_ids = []
+    seen = set()
+    for item in raw_ids:
+        if isinstance(item, str):
+            sample_id = item.strip()
+        elif isinstance(item, dict) and 'id' in item:
+            sample_id = str(item['id']).strip()
+        else:
+            raise ValueError(
+                f"Unsupported sample ID entry in {path}: expected string or dict with 'id'"
+            )
+
+        if sample_id and sample_id not in seen:
+            sample_ids.append(sample_id)
+            seen.add(sample_id)
+
+    return sample_ids
+
+
+def validate_sample(sample_dir: Path,
+                    metadata_only: bool = False,
+                    require_esm_layers: int = 0) -> Tuple[str, bool, str, Optional[Dict[str, int]]]:
     """
     Validate a single sample directory.
     
     Returns:
-        (sample_id, is_valid, error_message)
+        (sample_id, is_valid, error_message, metadata)
     """
     sample_id = sample_dir.name
     
@@ -136,35 +211,47 @@ def validate_sample(sample_dir: Path) -> Tuple[str, bool, str]:
     for fname in REQUIRED_FILES:
         fpath = sample_dir / fname
         if not fpath.exists():
-            return sample_id, False, f"Missing {fname}"
+            return sample_id, False, f"Missing {fname}", None
     
+    # Check ESM file
+    esm_valid, esm_error, n_residues = check_esm_file(
+        sample_dir / 'esm.pt',
+        require_esm_layers=require_esm_layers,
+    )
+    if not esm_valid:
+        return sample_id, False, f"esm.pt: {esm_error}", None
+
+    # Check ligand coords
+    lig_valid, lig_error = check_numpy_file(sample_dir / 'ligand_coords.npy')
+    if not lig_valid:
+        return sample_id, False, f"ligand_coords.npy: {lig_error}", None
+
+    ligand_coords = np.load(sample_dir / 'ligand_coords.npy')
+    metadata = {
+        'n_residues': int(n_residues if n_residues is not None else 0),
+        'ligand_atoms': int(len(ligand_coords)),
+    }
+
+    if metadata_only:
+        return sample_id, True, "", metadata
+
     # Check apo.pdb has complete backbone
     apo_valid, apo_error = check_pdb_has_full_backbone(sample_dir / 'apo.pdb')
     if not apo_valid:
-        return sample_id, False, f"apo.pdb: {apo_error}"
+        return sample_id, False, f"apo.pdb: {apo_error}", None
     
     # Check holo.pdb has complete backbone
     holo_valid, holo_error = check_pdb_has_full_backbone(sample_dir / 'holo.pdb')
     if not holo_valid:
-        return sample_id, False, f"holo.pdb: {holo_error}"
-    
-    # Check ESM file
-    esm_valid, esm_error = check_esm_file(sample_dir / 'esm.pt')
-    if not esm_valid:
-        return sample_id, False, f"esm.pt: {esm_error}"
+        return sample_id, False, f"holo.pdb: {holo_error}", None
     
     # Check torsion files
     for torsion_file in ['torsion_apo.npz', 'torsion_holo.npz']:
         valid, error = check_numpy_file(sample_dir / torsion_file)
         if not valid:
-            return sample_id, False, f"{torsion_file}: {error}"
-    
-    # Check ligand coords
-    lig_valid, lig_error = check_numpy_file(sample_dir / 'ligand_coords.npy')
-    if not lig_valid:
-        return sample_id, False, f"ligand_coords.npy: {lig_error}"
-    
-    return sample_id, True, ""
+            return sample_id, False, f"{torsion_file}: {error}", None
+
+    return sample_id, True, "", metadata
 
 
 def main():
@@ -177,6 +264,12 @@ def main():
                         help='Number of parallel workers')
     parser.add_argument('--limit', type=int, default=None,
                         help='Limit number of samples to check (for testing)')
+    parser.add_argument('--sample_ids_file', type=str, default=None,
+                        help='Optional txt/json file listing sample IDs to validate')
+    parser.add_argument('--metadata_only', action='store_true',
+                        help='Only extract metadata for a prevalidated sample list')
+    parser.add_argument('--require_esm_layers', type=int, default=0,
+                        help='Require esm.pt to contain per_residue_layers with at least this K')
     args = parser.parse_args()
     
     data_dir = Path(args.data_dir)
@@ -188,29 +281,54 @@ def main():
     
     output_dir = Path(args.output_dir) if args.output_dir else data_dir
     output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Get all sample directories
-    sample_dirs = sorted([d for d in samples_dir.iterdir() if d.is_dir()])
+
+    if args.metadata_only and args.sample_ids_file is None:
+        parser.error('--metadata_only requires --sample_ids_file')
+
+    sample_ids_path = _resolve_optional_path(args.sample_ids_file, data_dir)
+
+    if sample_ids_path is not None:
+        sample_ids = load_sample_ids(sample_ids_path)
+        sample_dirs = [samples_dir / sample_id for sample_id in sample_ids]
+        sample_source = sample_ids_path
+    else:
+        # Get all sample directories
+        sample_dirs = sorted([d for d in samples_dir.iterdir() if d.is_dir()])
+        sample_source = samples_dir
     
     if args.limit:
         sample_dirs = sample_dirs[:args.limit]
     
-    print(f"Validating {len(sample_dirs)} samples from {samples_dir}")
+    print(f"Validating {len(sample_dirs)} samples from {sample_source}")
     print(f"Using {args.workers} workers")
+    if args.metadata_only:
+        print("Mode: metadata_only (extract metadata for prevalidated sample IDs)")
+        print(
+            "[WARN] metadata_only does not perform the full apo/holo/torsion validation "
+            "used for training manifests; use the default mode before launching training."
+        )
+    if args.require_esm_layers > 0:
+        print(f"Requiring ESM last-K layer cache: K>={args.require_esm_layers}")
     
     valid_samples = []
     invalid_samples = []
+    sample_metadata = {}
     
     # Process in parallel
     with ProcessPoolExecutor(max_workers=args.workers) as executor:
-        futures = {executor.submit(validate_sample, d): d for d in sample_dirs}
+        futures = {
+            executor.submit(validate_sample, d, args.metadata_only, args.require_esm_layers): d
+            for d in sample_dirs
+        }
         
         with tqdm(total=len(sample_dirs), desc="Validating") as pbar:
             for future in as_completed(futures):
-                sample_id, is_valid, error = future.result()
+                sample_id, is_valid, error, metadata = future.result()
                 
                 if is_valid:
                     valid_samples.append(sample_id)
+                    if metadata is not None:
+                        sample_metadata[sample_id] = metadata
                 else:
                     invalid_samples.append((sample_id, error))
                 
@@ -235,6 +353,10 @@ def main():
     with open(invalid_path, 'w') as f:
         for sample_id, error in invalid_samples:
             f.write(f"{sample_id}\t{error}\n")
+
+    metadata_path = output_dir / 'sample_metadata.json'
+    with open(metadata_path, 'w') as f:
+        json.dump(sample_metadata, f, indent=2, sort_keys=True)
     
     # Summary
     total = len(sample_dirs)
@@ -250,6 +372,7 @@ def main():
     print(f"{'='*60}")
     print(f"Valid list:   {valid_path}")
     print(f"Invalid list: {invalid_path}")
+    print(f"Metadata:     {metadata_path}")
     
     # Error distribution
     if invalid_samples:
@@ -266,11 +389,15 @@ def main():
         for error_type, count in sorted(error_counts.items(), key=lambda x: -x[1]):
             print(f"  {error_type}: {count}")
     
-    # Create split files if splits directory exists
+    # Create split files if splits directory exists.
+    # Skip this in metadata_only mode so we do not imply the sample list has passed
+    # the full training-time validation path.
     splits_dir = data_dir / 'splits'
-    if splits_dir.exists():
+    if splits_dir.exists() and not args.metadata_only:
         valid_set = set(valid_samples)
         for split_file in splits_dir.glob('*.json'):
+            if split_file.stem.endswith('_valid'):
+                continue
             split_name = split_file.stem
             with open(split_file, 'r') as f:
                 split_data = json.load(f)
@@ -292,10 +419,17 @@ def main():
             output_split.parent.mkdir(parents=True, exist_ok=True)
             with open(output_split, 'w') as f:
                 json.dump(filtered_ids, f, indent=2)
+
+            output_split_txt = output_dir / f'{split_name}_valid.txt'
+            with open(output_split_txt, 'w') as f:
+                for sample_id in filtered_ids:
+                    f.write(f"{sample_id}\n")
             
-            print(f"\n{split_name}: {n_filt}/{n_orig} samples valid -> {output_split}")
+            print(
+                f"\n{split_name}: {n_filt}/{n_orig} samples valid "
+                f"-> {output_split_txt} (+ {output_split})"
+            )
 
 
 if __name__ == '__main__':
     main()
-

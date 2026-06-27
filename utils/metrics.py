@@ -13,8 +13,15 @@ Date: 2025-10-28
 
 import numpy as np
 import torch
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 from scipy.spatial.transform import Rotation as ScipyRotation
+
+
+def _to_numpy(value) -> np.ndarray:
+    """Best-effort conversion to numpy without relying on static torch type narrowing."""
+    if hasattr(value, 'detach'):
+        value = value.detach().cpu().numpy()
+    return np.asarray(value)
 
 
 # ============================================================================
@@ -34,6 +41,13 @@ def kabsch_align(P: np.ndarray, Q: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         t: [3] 平移向量
         使得 P_aligned = P @ R.T + t 最接近 Q
     """
+    P = _to_numpy(P).astype(np.float64, copy=False)
+    Q = _to_numpy(Q).astype(np.float64, copy=False)
+    if P.shape != Q.shape or P.ndim != 2 or P.shape[1] != 3 or P.shape[0] < 3:
+        raise ValueError(f"Kabsch expects matching [N, 3] arrays with N>=3, got {P.shape} and {Q.shape}")
+    if not (np.isfinite(P).all() and np.isfinite(Q).all()):
+        raise ValueError("Kabsch input contains NaN or Inf coordinates")
+
     # 中心化
     P_center = P.mean(axis=0)
     Q_center = Q.mean(axis=0)
@@ -101,12 +115,9 @@ def compute_pocket_irmsd(pred_coords: np.ndarray,
         irmsd: float（Å）
     """
     # 确保是numpy
-    if isinstance(pred_coords, torch.Tensor):
-        pred_coords = pred_coords.detach().cpu().numpy()
-    if isinstance(true_coords, torch.Tensor):
-        true_coords = true_coords.detach().cpu().numpy()
-    if isinstance(pocket_mask, torch.Tensor):
-        pocket_mask = pocket_mask.detach().cpu().numpy()
+    pred_coords = _to_numpy(pred_coords)
+    true_coords = _to_numpy(true_coords)
+    pocket_mask = _to_numpy(pocket_mask)
     
     # 转换为bool
     pocket_mask = pocket_mask.astype(bool)
@@ -126,10 +137,19 @@ def compute_pocket_irmsd(pred_coords: np.ndarray,
     # 提取口袋坐标
     pred_pocket = pred_coords[pocket_mask]
     true_pocket = true_coords[pocket_mask]
+    if pred_pocket.shape[0] < 3 or true_pocket.shape[0] < 3:
+        return float('nan')
+    if not (np.isfinite(pred_pocket).all() and np.isfinite(true_pocket).all()):
+        return float('nan')
     
     # Kabsch对齐
-    R, t = kabsch_align(pred_pocket, true_pocket)
+    try:
+        R, t = kabsch_align(pred_pocket, true_pocket)
+    except (np.linalg.LinAlgError, ValueError):
+        return float('nan')
     pred_aligned = pred_pocket @ R.T + t
+    if not np.isfinite(pred_aligned).all():
+        return float('nan')
     
     # 计算RMSD
     irmsd = compute_rmsd(pred_aligned, true_pocket)
@@ -174,12 +194,9 @@ def compute_chi1_accuracy(pred_angles: np.ndarray,
         accuracy: float 命中率（0-1）
     """
     # 确保是numpy
-    if isinstance(pred_angles, torch.Tensor):
-        pred_angles = pred_angles.detach().cpu().numpy()
-    if isinstance(true_angles, torch.Tensor):
-        true_angles = true_angles.detach().cpu().numpy()
-    if isinstance(angle_mask, torch.Tensor):
-        angle_mask = angle_mask.detach().cpu().numpy()
+    pred_angles = _to_numpy(pred_angles)
+    true_angles = _to_numpy(true_angles)
+    angle_mask = _to_numpy(angle_mask)
     
     # 转换为bool
     angle_mask = angle_mask.astype(bool)
@@ -205,6 +222,190 @@ def compute_chi1_accuracy(pred_angles: np.ndarray,
     return float(accuracy)
 
 
+def compute_angle_errors_deg(pred_angles: np.ndarray,
+                             true_angles: np.ndarray,
+                             angle_mask: np.ndarray) -> np.ndarray:
+    """
+    计算有效角度的绝对误差（度）。
+
+    Args:
+        pred_angles: [N] 预测角度（弧度）
+        true_angles: [N] 真实角度（弧度）
+        angle_mask: [N] 有效掩码
+
+    Returns:
+        errors_deg: [K] 有效角度的绝对误差（度）
+    """
+    pred_angles = _to_numpy(pred_angles)
+    true_angles = _to_numpy(true_angles)
+    angle_mask = _to_numpy(angle_mask)
+
+    angle_mask = angle_mask.astype(bool)
+    if not angle_mask.any():
+        return np.array([], dtype=np.float32)
+
+    pred_valid = pred_angles[angle_mask]
+    true_valid = true_angles[angle_mask]
+    diff = wrap_angle_diff(pred_valid, true_valid)
+    errors_deg = np.abs(diff) * 180.0 / np.pi
+    return errors_deg.astype(np.float32)
+
+
+def compute_angle_error_summary(pred_angles: np.ndarray,
+                                true_angles: np.ndarray,
+                                angle_mask: np.ndarray) -> Dict[str, float]:
+    """
+    汇总角度误差统计（度）。
+
+    Returns:
+        {"mae_deg": ..., "median_deg": ...}
+    """
+    errors_deg = compute_angle_errors_deg(pred_angles, true_angles, angle_mask)
+    if errors_deg.size == 0:
+        return {
+            'mae_deg': float('nan'),
+            'median_deg': float('nan'),
+        }
+
+    return {
+        'mae_deg': float(errors_deg.mean()),
+        'median_deg': float(np.median(errors_deg)),
+    }
+
+
+def compute_chi12_accuracy(pred_angles: np.ndarray,
+                           true_angles: np.ndarray,
+                           angle_mask: np.ndarray,
+                           threshold_deg: float = 20.0) -> float:
+    """
+    计算 χ1+χ2 联合命中率。
+
+    Args:
+        pred_angles: [N, 2] 预测 χ1/χ2（弧度）
+        true_angles: [N, 2] 真实 χ1/χ2（弧度）
+        angle_mask: [N, 2] χ1/χ2 有效掩码
+        threshold_deg: 命中阈值（度）
+    """
+    pred_angles = _to_numpy(pred_angles)
+    true_angles = _to_numpy(true_angles)
+    angle_mask = _to_numpy(angle_mask)
+
+    valid_mask = angle_mask.astype(bool)
+    if valid_mask.ndim != 2 or valid_mask.shape[-1] != 2:
+        raise ValueError(f"compute_chi12_accuracy expects [N,2] arrays, got mask shape={valid_mask.shape}")
+
+    residue_mask = valid_mask[:, 0] & valid_mask[:, 1]
+    if not residue_mask.any():
+        return float('nan')
+
+    pred_valid = pred_angles[residue_mask]
+    true_valid = true_angles[residue_mask]
+    diff = wrap_angle_diff(pred_valid, true_valid)
+    diff_deg = np.abs(diff) * 180.0 / np.pi
+    hits = (diff_deg[:, 0] < threshold_deg) & (diff_deg[:, 1] < threshold_deg)
+    return float(hits.mean())
+
+
+def compute_residue_contact_mask(residue_coords: np.ndarray,
+                                 residue_atom_mask: np.ndarray,
+                                 lig_coords: np.ndarray,
+                                 contact_threshold: float = 4.5,
+                                 eps: float = 1e-8) -> np.ndarray:
+    """
+    基于残基原子与配体原子的最近距离，计算 residue-level contact mask。
+
+    Args:
+        residue_coords: [N, A, 3]
+        residue_atom_mask: [N, A]
+        lig_coords: [M, 3]
+        contact_threshold: 距离阈值（Å）
+
+    Returns:
+        contact_mask: [N] bool
+    """
+    residue_coords = _to_numpy(residue_coords)
+    residue_atom_mask = _to_numpy(residue_atom_mask)
+    lig_coords = _to_numpy(lig_coords)
+
+    residue_atom_mask = residue_atom_mask.astype(bool)
+    if residue_coords.ndim != 3:
+        raise ValueError(f"residue_coords must be [N,A,3], got shape={residue_coords.shape}")
+    if lig_coords.size == 0:
+        return np.zeros(residue_coords.shape[0], dtype=bool)
+
+    n_res = residue_coords.shape[0]
+    contact_mask = np.zeros(n_res, dtype=bool)
+    for i in range(n_res):
+        valid_atoms = residue_atom_mask[i]
+        if not valid_atoms.any():
+            continue
+        atoms_i = residue_coords[i][valid_atoms]
+        diff = atoms_i[:, None, :] - lig_coords[None, :, :]
+        dists = np.sqrt(np.sum(diff ** 2, axis=-1) + eps)
+        contact_mask[i] = bool(np.min(dists) < contact_threshold)
+    return contact_mask
+
+
+def compute_contact_recovery(pred_contact_mask: np.ndarray,
+                             true_contact_mask: np.ndarray) -> Dict[str, float]:
+    """
+    计算 residue-level contact recovery 指标。
+    """
+    pred_contact_mask = _to_numpy(pred_contact_mask)
+    true_contact_mask = _to_numpy(true_contact_mask)
+
+    pred = pred_contact_mask.astype(bool)
+    true = true_contact_mask.astype(bool)
+    if pred.shape != true.shape:
+        raise ValueError(f"contact masks shape mismatch: pred={pred.shape}, true={true.shape}")
+
+    tp = np.logical_and(pred, true).sum()
+    fp = np.logical_and(pred, ~true).sum()
+    fn = np.logical_and(~pred, true).sum()
+    union = np.logical_or(pred, true).sum()
+
+    precision = float(tp / max(tp + fp, 1))
+    recall = float(tp / max(tp + fn, 1))
+    f1 = float(2 * precision * recall / max(precision + recall, 1e-8))
+    iou = float(tp / max(union, 1))
+
+    return {
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+        'iou': iou,
+    }
+
+
+def compute_pocket_clash_percentage(coords: np.ndarray,
+                                    atom_mask: np.ndarray,
+                                    residue_mask: np.ndarray,
+                                    clash_threshold: float = 2.0,
+                                    eps: float = 1e-8) -> float:
+    """
+    仅在 pocket residue 子集上计算 clash 百分比。
+
+    Args:
+        coords: [N, A, 3]
+        atom_mask: [N, A]
+        residue_mask: [N]
+    """
+    coords = _to_numpy(coords)
+    atom_mask = _to_numpy(atom_mask)
+    residue_mask = _to_numpy(residue_mask)
+
+    residue_mask = residue_mask.astype(bool)
+    if not residue_mask.any():
+        return float('nan')
+
+    coords_sel = coords[residue_mask]
+    atom_mask_sel = atom_mask[residue_mask].astype(bool)
+    valid_coords = coords_sel[atom_mask_sel]
+    if valid_coords.shape[0] < 2:
+        return float('nan')
+    return compute_clash_percentage(valid_coords, clash_threshold=clash_threshold, eps=eps)
+
+
 # ============================================================================
 # Clash检测
 # ============================================================================
@@ -226,8 +427,7 @@ def compute_clash_percentage(coords: np.ndarray,
         clash_pct: float 碰撞百分比（0-1）
     """
     # 确保是numpy
-    if isinstance(coords, torch.Tensor):
-        coords = coords.detach().cpu().numpy()
+    coords = _to_numpy(coords)
     
     N = len(coords)
     
@@ -290,19 +490,17 @@ def compute_fape(pred_coords: np.ndarray,
         fape: float（Å）
     """
     # 确保是numpy
-    if isinstance(pred_coords, torch.Tensor):
-        pred_coords = pred_coords.detach().cpu().numpy()
-    if isinstance(true_coords, torch.Tensor):
-        true_coords = true_coords.detach().cpu().numpy()
+    pred_coords = _to_numpy(pred_coords)
+    true_coords = _to_numpy(true_coords)
     
     pred_R, pred_t = pred_frames
     true_R, true_t = true_frames
     
     if isinstance(pred_R, torch.Tensor):
-        pred_R = pred_R.detach().cpu().numpy()
-        pred_t = pred_t.detach().cpu().numpy()
-        true_R = true_R.detach().cpu().numpy()
-        true_t = true_t.detach().cpu().numpy()
+        pred_R = _to_numpy(pred_R)
+        pred_t = _to_numpy(pred_t)
+        true_R = _to_numpy(true_R)
+        true_t = _to_numpy(true_t)
     
     # 展平为[N_atoms, 3]
     if pred_coords.ndim == 3:
@@ -357,4 +555,3 @@ def compute_fape(pred_coords: np.ndarray,
     fape = np.average(errors, weights=weights)
     
     return float(fape)
-

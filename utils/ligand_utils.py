@@ -27,6 +27,10 @@ import numpy as np
 from pathlib import Path
 from typing import Tuple, List, Dict, Optional
 import warnings
+from contextlib import contextmanager
+from functools import lru_cache
+import signal
+import threading
 warnings.filterwarnings('ignore')
 
 try:
@@ -80,6 +84,35 @@ PROBE_DISTANCE = 1.5     # 探针距离原子的距离 (Å)
 
 # 重要性采样配置
 MAX_LIGAND_TOKENS = 128  # 配体token上限
+RDKit_FEATURE_TIMEOUT_SECONDS = 3.0
+
+
+class _RDKitFeatureTimeout(TimeoutError):
+    """Raised when RDKit feature detection takes too long."""
+
+
+def _raise_rdkit_feature_timeout(signum, frame):
+    raise _RDKitFeatureTimeout("RDKit feature detection timed out")
+
+
+@contextmanager
+def _rdkit_feature_timeout(seconds: float):
+    if (
+        seconds <= 0
+        or not hasattr(signal, 'SIGALRM')
+        or threading.current_thread() is not threading.main_thread()
+    ):
+        yield
+        return
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    signal.signal(signal.SIGALRM, _raise_rdkit_feature_timeout)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, previous_handler)
 
 
 # ============================================================================
@@ -95,6 +128,7 @@ class LigandTokenBuilder:
             max_tokens: 最大token数 (重原子+探针)
         """
         self.max_tokens = max_tokens
+        self._feature_fallback_warned = False
         
         # RDKit Feature Factory (用于检测HBD/HBA)
         if RDKIT_AVAILABLE:
@@ -102,6 +136,41 @@ class LigandTokenBuilder:
             self.feature_factory = ChemicalFeatures.BuildFeatureFactory(fdefName)
         else:
             self.feature_factory = None
+
+    def _warn_feature_fallback(self, message: str):
+        if not self._feature_fallback_warned:
+            warnings.warn(message)
+            self._feature_fallback_warned = True
+
+    def _heuristic_hbond_features(self, mol: 'Chem.Mol', n_atoms: int) -> Tuple[List[int], List[int]]:
+        hbd: List[int] = []
+        hba: List[int] = []
+
+        for i in range(n_atoms):
+            atom = mol.GetAtomWithIdx(i)
+            atomic_num = atom.GetAtomicNum()
+            formal_charge = atom.GetFormalCharge()
+            degree = atom.GetDegree()
+            total_valence = atom.GetTotalValence()
+            total_h = atom.GetTotalNumHs(includeNeighbors=True)
+
+            if atomic_num in (7, 8, 16) and total_h > 0 and formal_charge >= 0:
+                hbd.append(i)
+
+            if atomic_num == 7:
+                if formal_charge <= 0 and total_valence < 4:
+                    hba.append(i)
+            elif atomic_num == 8:
+                if formal_charge <= 0 and total_valence <= 2:
+                    hba.append(i)
+            elif atomic_num == 15:
+                if formal_charge <= 0 and degree <= 4:
+                    hba.append(i)
+            elif atomic_num == 16:
+                if formal_charge <= 0 and degree <= 4:
+                    hba.append(i)
+
+        return sorted(set(hbd)), sorted(set(hba))
     
     def build_tokens(self, ligand_coords: np.ndarray, 
                     ligand_mol: Optional['Chem.Mol'] = None) -> Dict[str, np.ndarray]:
@@ -234,14 +303,23 @@ class LigandTokenBuilder:
         # 检测 HBD/HBA (使用 RDKit Feature Factory)
         if self.feature_factory is not None:
             try:
-                features = self.feature_factory.GetFeaturesForMol(mol)
+                with _rdkit_feature_timeout(RDKit_FEATURE_TIMEOUT_SECONDS):
+                    features = self.feature_factory.GetFeaturesForMol(mol)
                 for feat in features:
                     if feat.GetFamily() == 'Donor':
                         info['hbd'].extend(feat.GetAtomIds())
                     elif feat.GetFamily() == 'Acceptor':
                         info['hba'].extend(feat.GetAtomIds())
+            except _RDKitFeatureTimeout:
+                self._warn_feature_fallback(
+                    "RDKit feature detection timed out; using heuristic ligand H-bond features."
+                )
+                info['hbd'], info['hba'] = self._heuristic_hbond_features(mol, n_atoms)
             except Exception:
-                pass  # 忽略特征检测失败
+                info['hbd'], info['hba'] = self._heuristic_hbond_features(mol, n_atoms)
+
+        info['hbd'] = sorted(set(info['hbd']))
+        info['hba'] = sorted(set(info['hba']))
         
         return info
     
@@ -548,39 +626,44 @@ def build_ligand_tokens_from_file(ligand_coords_file: Path,
         if mol is None:
             raise ValueError(
                 f"❌ 无法加载配体分子: {ligand_sdf_file}\n"
-                f"这表明SDF文件损坏或格式错误。\n"
-                f"请重新运行数据预处理: python scripts/prepare_ligands.py"
+                f"SDF 文件损坏或格式不合法，不能继续使用伪造的 ligand 特征训练。\n"
+                f"请重新运行: python scripts/prepare_ligands.py"
             )
-        
-        # ✅ 严格验证原子数一致性（科研代码不允许不一致）
-        if mol.GetNumAtoms() != len(coords):
-            raise ValueError(
-                f"🚨 数据不一致错误！\n"
-                f"配体: {ligand_sdf_file.stem}\n"
-                f"SDF分子: {mol.GetNumAtoms()} 个原子\n"
-                f"坐标文件: {len(coords)} 个原子\n"
-                f"差异: {abs(mol.GetNumAtoms() - len(coords))} 个原子\n\n"
-                f"这是严重的数据预处理问题，不能继续训练！\n"
-                f"解决方案:\n"
-                f"1. 验证数据: python scripts/verify_ligand_consistency.py\n"
-                f"2. 重新预处理: python scripts/prepare_ligands.py\n"
-                f"3. 确保预处理时验证通过"
-            )
-        
-        # 初始化分子信息（必需，失败则报错）
-        try:
-            mol.UpdatePropertyCache(strict=False)
-            Chem.GetSymmSSSR(mol)  # 初始化环信息
-        except Exception as e:
-            raise ValueError(
-                f"❌ 配体分子初始化失败: {ligand_sdf_file.stem}\n"
-                f"错误: {e}\n"
-                f"这表明分子结构有问题，请检查SDF文件。"
-            )
+        else:
+            # ✅ 严格验证原子数一致性（科研代码不允许不一致）
+            if mol.GetNumAtoms() != len(coords):
+                raise ValueError(
+                    f"🚨 数据不一致错误！\n"
+                    f"配体: {ligand_sdf_file.stem}\n"
+                    f"SDF分子: {mol.GetNumAtoms()} 个原子\n"
+                    f"坐标文件: {len(coords)} 个原子\n"
+                    f"差异: {abs(mol.GetNumAtoms() - len(coords))} 个原子\n\n"
+                    f"这是严重的数据预处理问题，不能继续训练！\n"
+                    f"解决方案:\n"
+                    f"1. 验证数据: python scripts/verify_ligand_consistency.py\n"
+                    f"2. 重新预处理: python scripts/prepare_ligands.py\n"
+                    f"3. 确保预处理时验证通过"
+                )
+            
+            # 初始化分子信息（必需，失败则报错）
+            try:
+                mol.UpdatePropertyCache(strict=False)
+                Chem.GetSymmSSSR(mol)  # 初始化环信息
+            except Exception as e:
+                raise ValueError(
+                    f"❌ 配体分子初始化失败: {ligand_sdf_file.stem}\n"
+                    f"错误: {e}\n"
+                    f"这表明分子结构有问题，请检查SDF文件。"
+                )
     
     # 构建 tokens
-    builder = LigandTokenBuilder(max_tokens=max_tokens)
+    builder = _get_ligand_token_builder(int(max_tokens))
     return builder.build_tokens(coords, mol)
+
+
+@lru_cache(maxsize=4)
+def _get_ligand_token_builder(max_tokens: int) -> LigandTokenBuilder:
+    return LigandTokenBuilder(max_tokens=max_tokens)
 
 
 def encode_ligand_batch(ligand_tokens_list: List[Dict[str, np.ndarray]],

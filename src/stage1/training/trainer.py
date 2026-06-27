@@ -43,6 +43,7 @@ from ..datasets import (
 from ..datasets.dataset_stage1 import compute_pocket_weights
 from ..modules.losses import (
     binary_contact_loss,
+    candidate_decoy_contrastive_loss,
     candidate_decoy_rerank_loss,
     chi1_rotamer_loss,
     clash_penalty,
@@ -56,12 +57,17 @@ from ..modules.losses import (
     g_switch_rank_loss,
     g_zero_noncontact_loss,
     ligand_contrastive_chi1_loss,
+    ligand_discriminator_loss,
+    ligand_internal_guidance_loss,
     ligand_residual_chi1_loss,
+    protein_ligand_contrastive_loss,
     rescue_noharm_loss,
     switch_bce_loss,
     typed_candidate_energy_loss,
     torsion_sincos_loss,
 )
+
+from ..models.torsion_head import CHI1_BIN_CENTERS
 from utils.metrics import (
     compute_angle_errors_deg,
     compute_chi12_accuracy,
@@ -122,11 +128,20 @@ class Stage1Trainer:
         'typed_energy_gap_contact': 'max',
         'typed_energy_gap_contact_switch': 'max',
         'typed_energy_gap_pocket_switch': 'max',
+        'typed_strict_switch_energy_gap_min': 'max',
         'candidate_decoy_lift_switch_rotamer_acc': 'max',
         'candidate_decoy_lift_apo_wrong_rotamer_acc': 'max',
         'candidate_decoy_lift_contact_rotamer_acc': 'max',
         'candidate_decoy_lift_contact_switch_rotamer_acc': 'max',
         'candidate_decoy_lift_pocket_switch_rotamer_acc': 'max',
+        'typed_strict_contact_switch_score': 'max',
+        'typed_strict_pocket_switch_score': 'max',
+        'typed_strict_switch_score': 'max',
+        'ligand_discriminator_lift_switch': 'max',
+        'ligand_discriminator_lift_contact_switch': 'max',
+        'ligand_guidance_switch_loss': 'max',
+        'ligand_guidance_nonswitch_loss': 'min',
+        'protein_ligand_contrastive': 'min',
         'contact_posterior_f1': 'max',
         'pocket_irmsd': 'min',
         'clash_pct': 'min',
@@ -303,8 +318,7 @@ class Stage1Trainer:
         if B < 2:
             # B=1: use same ligand as decoy (contrastive loss will be ~0 but keeps DDP in sync)
             return replace(batch, lig_points=batch.lig_points, lig_types=batch.lig_types, lig_mask=batch.lig_mask)
-        shift = 1 + (B // 2)
-        perm = torch.arange(B, device=batch.lig_points.device).roll(shifts=shift)
+        perm = torch.arange(B, device=batch.lig_points.device).roll(shifts=1)
         return replace(
             batch,
             lig_points=batch.lig_points.index_select(0, perm),
@@ -343,8 +357,8 @@ class Stage1Trainer:
             lig_points=batch.lig_points + offset_vec,
         )
 
-    def _make_typed_candidate_decoy_batch(self, batch):
-        kind = getattr(self.config, 'typed_candidate_decoy_kind', 'scrambled')
+    def _make_typed_candidate_decoy_batch(self, batch, kind: Optional[str] = None):
+        kind = kind or getattr(self.config, 'typed_candidate_decoy_kind', 'scrambled')
         if kind == 'nolig':
             return self._make_nolig_batch(batch)
         if kind == 'shuffled':
@@ -354,6 +368,24 @@ class Stage1Trainer:
                 batch, offset=float(getattr(self.config, 'g_decoy_translation_offset', 100.0)),
             )
         return self._make_scrambled_ligand_types(batch)
+
+    def _typed_strict_rotamer_control_kinds(self) -> Tuple[str, ...]:
+        raw = str(getattr(self.config, 'typed_strict_rotamer_controls', 'scrambled,shuffled'))
+        controls = tuple(k.strip() for k in raw.split(',') if k.strip())
+        allowed = {'scrambled', 'shuffled', 'nolig', 'translated'}
+        bad = [k for k in controls if k not in allowed]
+        if bad:
+            raise ValueError(f"Unsupported typed_strict_rotamer_controls: {bad}. Allowed: {sorted(allowed)}")
+        return controls
+
+    def _typed_candidate_energy_control_kinds(self) -> Tuple[str, ...]:
+        raw = str(getattr(self.config, 'typed_candidate_energy_controls', ''))
+        controls = tuple(k.strip() for k in raw.split(',') if k.strip())
+        allowed = {'scrambled', 'shuffled', 'nolig', 'translated'}
+        bad = [k for k in controls if k not in allowed]
+        if bad:
+            raise ValueError(f"Unsupported typed_candidate_energy_controls: {bad}. Allowed: {sorted(allowed)}")
+        return controls
 
 
     @staticmethod
@@ -442,6 +474,9 @@ class Stage1Trainer:
         model_config.use_geometry_candidate_scorer = (
             config.lambda_geometry_chi1 > 0.0
             or config.lambda_base_prior > 0.0
+            or config.lambda_switch_bce > 0.0
+            or config.lambda_rescue_noharm > 0.0
+            or config.lambda_ligand_residual > 0.0
             or config.lambda_g_lift_switch > 0.0
             or config.lambda_g_noharm > 0.0
             or config.lambda_g_zero_noncontact > 0.0
@@ -451,6 +486,9 @@ class Stage1Trainer:
             or getattr(config, 'lambda_g_antiharm', 0.0) > 0.0
             or getattr(config, 'lambda_g_decoy', 0.0) > 0.0
             or getattr(config, 'lambda_typed_candidate_energy', 0.0) > 0.0
+            or getattr(config, 'lambda_typed_strict_rotamer', 0.0) > 0.0
+            or getattr(config, 'lambda_decoy_contrastive', 0.0) > 0.0
+            or getattr(config, 'lambda_ligand_guidance', 0.0) > 0.0
         )
         model_config.geometry_scorer_hidden = getattr(config, 'geometry_scorer_hidden', 64)
         model_config.geometry_scorer_num_rbf = getattr(config, 'geometry_scorer_num_rbf', 16)
@@ -468,6 +506,11 @@ class Stage1Trainer:
         model_config.geometry_scorer_typed_init_scale = getattr(config, 'geometry_scorer_typed_init_scale', 0.1)
         model_config.use_contact_posterior = config.lambda_contact > 0.0
         model_config.contact_hidden = config.contact_hidden
+        model_config.use_ligand_discriminator = (
+            getattr(config, 'use_ligand_discriminator', False)
+            or getattr(config, 'lambda_ligand_discriminator', 0.0) > 0.0
+        )
+        model_config.ligand_discriminator_hidden = getattr(config, 'ligand_discriminator_hidden', 128)
         model_config.use_pocket_routing_adapter = config.use_pocket_routing_adapter
         model_config.pocket_routing_hidden = config.pocket_routing_hidden
         model_config.pocket_routing_layers = config.pocket_routing_layers
@@ -949,7 +992,7 @@ class Stage1Trainer:
 
     def _freeze_stage1_backbone_for_posteriors(self):
         """Freeze the deterministic Stage-1 trunk and train selected posterior modules."""
-        trainable_prefixes = ['chi1_rotamer_head.', 'contact_head.', 'candidate_chi1_scorer.', 'geometry_candidate_scorer.']
+        trainable_prefixes = ['chi1_rotamer_head.', 'contact_head.', 'candidate_chi1_scorer.', 'geometry_candidate_scorer.', 'ligand_discriminator.']
         if getattr(self.config, 'unfreeze_ligand_conditioner_for_posteriors', False):
             trainable_prefixes.append('ligand_conditioner.')
 
@@ -1178,7 +1221,7 @@ class Stage1Trainer:
         target_mask = torch.where(use_raw[:, None, None], raw_mask, fk_mask)
         return target_atom14, target_mask
 
-    def compute_loss(self, outputs: Dict, batch, step: int) -> Dict[str, torch.Tensor]:
+    def compute_loss(self, outputs: Dict, batch, step: int, scorer_kwargs_train: Optional[Dict] = None) -> Dict[str, torch.Tensor]:
         pred_chi_sincos = outputs['pred_chi']  # [B,N,4,2]
         pocket_chi1_delta = outputs.get('pocket_chi1_delta', None)
 
@@ -1370,10 +1413,13 @@ class Stage1Trainer:
         loss_g_antiharm = loss_chi.new_zeros(())
         loss_g_decoy = loss_chi.new_zeros(())
         loss_typed_candidate_energy = loss_chi.new_zeros(())
+        loss_typed_strict_rotamer = loss_chi.new_zeros(())
+        loss_decoy_contrastive = loss_chi.new_zeros(())
+        loss_ligand_discriminator = loss_chi.new_zeros(())
+        chi_holo_t = batch.chi_holo[:, :, 0]
+        chi_mask_t = batch.chi_mask[:, :, 0] & batch.node_mask.bool()
+        apo_chi1_t = batch.torsion_apo[:, :, 3]
         if (geometry_chi1_logits is not None and geometry_chi1_base_logits is not None):
-            chi_holo_t = batch.chi_holo[:, :, 0]
-            chi_mask_t = batch.chi_mask[:, :, 0] & batch.node_mask.bool()
-            apo_chi1_t = batch.torsion_apo[:, :, 3]
             if self.config.lambda_g_lift_switch > 0.0:
                 loss_g_lift = g_lift_switch_loss(
                     geometry_chi1_logits, geometry_chi1_base_logits,
@@ -1449,8 +1495,7 @@ class Stage1Trainer:
                         )
             if self.config.lambda_typed_candidate_energy > 0.0:
                 typed_energy = outputs.get('geometry_chi1_typed_energy', None)
-                typed_decoy_energy = outputs.get('geometry_chi1_typed_decoy_energy', None)
-                if typed_energy is not None and typed_decoy_energy is not None:
+                if typed_energy is not None:
                     typed_contact_mask = None
                     if bool(getattr(self.config, 'typed_candidate_contact_only', True)):
                         typed_contact_mask = self._compute_ca_ligand_contact_mask(
@@ -1459,18 +1504,125 @@ class Stage1Trainer:
                     typed_noncontact = self._compute_ca_ligand_non_contact_mask(
                         batch, threshold=float(getattr(self.config, 'g_noncontact_threshold', 8.0)),
                     )
-                    loss_typed_candidate_energy = typed_candidate_energy_loss(
-                        typed_energy,
-                        typed_decoy_energy,
+                    energy_control_kinds = self._typed_candidate_energy_control_kinds()
+                    if not energy_control_kinds:
+                        energy_control_kinds = (getattr(self.config, 'typed_candidate_decoy_kind', 'scrambled'),)
+                    typed_energy_losses = []
+                    for energy_kind in energy_control_kinds:
+                        typed_decoy_energy = outputs.get(f'geometry_chi1_typed_control_energy_{energy_kind}', None)
+                        if typed_decoy_energy is None and energy_kind == getattr(self.config, 'typed_candidate_decoy_kind', 'scrambled'):
+                            typed_decoy_energy = outputs.get('geometry_chi1_typed_decoy_energy', None)
+                        if typed_decoy_energy is None:
+                            continue
+                        typed_energy_losses.append(typed_candidate_energy_loss(
+                            typed_energy,
+                            typed_decoy_energy,
+                            apo_chi1_t,
+                            chi_holo_t,
+                            chi_mask_t,
+                            contact_mask=typed_contact_mask,
+                            non_contact_mask=typed_noncontact,
+                            margin=float(getattr(self.config, 'typed_candidate_margin', 0.05)),
+                            noharm_weight=float(getattr(self.config, 'typed_candidate_noharm_weight', 0.1)),
+                            noncontact_zero_weight=float(getattr(self.config, 'typed_candidate_noncontact_zero_weight', 0.05)),
+                        ))
+                    if typed_energy_losses:
+                        loss_typed_candidate_energy = torch.stack(typed_energy_losses).mean()
+            if self.config.lambda_typed_strict_rotamer > 0.0:
+                strict_contact_mask = None
+                if bool(getattr(self.config, 'typed_candidate_contact_only', True)):
+                    strict_contact_mask = self._compute_ca_ligand_contact_mask(
+                        batch, threshold=float(getattr(self.config, 'g_noncontact_threshold', 8.0)),
+                    )
+                strict_losses = []
+                for strict_kind in self._typed_strict_rotamer_control_kinds():
+                    strict_logits = outputs.get(f'geometry_chi1_control_logits_{strict_kind}', None)
+                    if strict_logits is None:
+                        continue
+                    strict_losses.append(candidate_decoy_rerank_loss(
+                        geometry_chi1_logits,
+                        strict_logits,
                         apo_chi1_t,
                         chi_holo_t,
                         chi_mask_t,
-                        contact_mask=typed_contact_mask,
-                        non_contact_mask=typed_noncontact,
-                        margin=float(getattr(self.config, 'typed_candidate_margin', 0.05)),
-                        noharm_weight=float(getattr(self.config, 'typed_candidate_noharm_weight', 0.1)),
-                        noncontact_zero_weight=float(getattr(self.config, 'typed_candidate_noncontact_zero_weight', 0.05)),
+                        contact_mask=strict_contact_mask,
+                        decoy_margin=float(getattr(self.config, 'typed_strict_rotamer_margin', 0.05)),
+                        rank_margin=float(getattr(self.config, 'typed_strict_rotamer_rank_margin', 0.0)),
+                    ))
+                if strict_losses:
+                    loss_typed_strict_rotamer = torch.stack(strict_losses).mean()
+            if self.config.lambda_decoy_contrastive > 0.0:
+                contrastive_contact_mask = None
+                contrastive_kind = getattr(self.config, 'decoy_contrastive_decoy_kind', 'scrambled')
+                contrastive_logits = outputs.get(f'geometry_chi1_control_logits_{contrastive_kind}', None)
+                if contrastive_logits is None and contrastive_kind == getattr(self.config, 'typed_candidate_decoy_kind', 'scrambled'):
+                    contrastive_logits = outputs.get('geometry_chi1_decoy_logits', None)
+                if contrastive_logits is not None:
+                    loss_decoy_contrastive = candidate_decoy_contrastive_loss(
+                        geometry_chi1_logits,
+                        contrastive_logits,
+                        apo_chi1_t,
+                        chi_holo_t,
+                        chi_mask_t,
+                        contact_mask=contrastive_contact_mask,
+                        decoy_margin=float(getattr(self.config, 'decoy_contrastive_margin', 0.1)),
+                        repulsion_margin=float(getattr(self.config, 'decoy_contrastive_repulsion', 0.1)),
                     )
+
+        correct_disc_score = outputs.get('ligand_discriminator_score', None)
+        if self.config.lambda_ligand_discriminator > 0.0 and correct_disc_score is not None:
+            disc_kind = getattr(self.config, 'ligand_discriminator_decoy_kind', 'scrambled')
+            decoy_disc_score = outputs.get(f'ligand_discriminator_decoy_score_{disc_kind}', None)
+            if decoy_disc_score is None:
+                decoy_disc_score = outputs.get('ligand_discriminator_decoy_score', None)
+            if decoy_disc_score is not None:
+                loss_ligand_discriminator = ligand_discriminator_loss(
+                    correct_disc_score,
+                    decoy_disc_score,
+                    apo_chi1_t,
+                    chi_holo_t,
+                    chi_mask_t,
+                    node_mask=batch.node_mask,
+                    margin=float(getattr(self.config, 'ligand_discriminator_margin', 0.1)),
+                )
+
+        loss_ligand_guidance = loss_chi.new_zeros(())
+        if getattr(self.config, 'lambda_ligand_guidance', 0.0) > 0.0:
+            guidance_logits = outputs.get('geometry_chi1_logits', None)
+            guidance_nolig_logits = outputs.get('geometry_chi1_nolig_logits', None)
+            if guidance_logits is not None and guidance_nolig_logits is not None:
+                loss_ligand_guidance = ligand_internal_guidance_loss(
+                    guidance_logits,
+                    guidance_nolig_logits,
+                    apo_chi1_t,
+                    chi_holo_t,
+                    chi_mask_t,
+                    node_mask=batch.node_mask,
+                    switch_margin=float(getattr(self.config, 'ligand_guidance_switch_margin', 0.1)),
+                    nonswitch_weight=float(getattr(self.config, 'ligand_guidance_nonswitch_weight', 0.1)),
+                )
+
+        loss_protein_ligand_contrastive = loss_chi.new_zeros(())
+        if getattr(self.config, 'lambda_protein_ligand_contrastive', 0.0) > 0.0:
+            protein_repr_correct = outputs.get('s_with_ligand', None)
+            ligand_repr_correct = outputs.get('ligand_repr', None)
+            if protein_repr_correct is not None and ligand_repr_correct is not None:
+                decoy_kind = getattr(self.config, 'protein_ligand_contrastive_decoy_kind', 'shuffled')
+                decoy_batch = self._make_typed_candidate_decoy_batch(batch, decoy_kind)
+                if decoy_batch is not None:
+                    decoy_outputs = self.model(decoy_batch, self.global_step, geometry_scorer_kwargs=scorer_kwargs_train)
+                    protein_repr_decoy = decoy_outputs.get('s_with_ligand', None)
+                    ligand_repr_decoy = decoy_outputs.get('ligand_repr', None)
+
+                    if protein_repr_decoy is not None and ligand_repr_decoy is not None:
+                        loss_protein_ligand_contrastive = protein_ligand_contrastive_loss(
+                            protein_repr_correct,
+                            protein_repr_decoy,
+                            ligand_repr_correct,
+                            ligand_repr_decoy,
+                            node_mask=batch.node_mask,
+                            temperature=float(getattr(self.config, 'protein_ligand_contrastive_temperature', 0.1)),
+                        )
 
         # FAPE on atom14 (if available)
         pred_atom14 = outputs['atom14_pos']
@@ -1532,7 +1684,12 @@ class Stage1Trainer:
             self.config.lambda_g_switch_rank * loss_g_switch_rank +
             self.config.lambda_g_antiharm * loss_g_antiharm +
             self.config.lambda_g_decoy * loss_g_decoy +
-            self.config.lambda_typed_candidate_energy * loss_typed_candidate_energy
+            self.config.lambda_typed_candidate_energy * loss_typed_candidate_energy +
+            self.config.lambda_typed_strict_rotamer * loss_typed_strict_rotamer +
+            self.config.lambda_decoy_contrastive * loss_decoy_contrastive +
+            self.config.lambda_ligand_discriminator * loss_ligand_discriminator +
+            self.config.lambda_ligand_guidance * loss_ligand_guidance +
+            self.config.lambda_protein_ligand_contrastive * loss_protein_ligand_contrastive
         )
 
         if pocket_chi1_delta is not None:
@@ -1563,6 +1720,11 @@ class Stage1Trainer:
             'g_antiharm': loss_g_antiharm,
             'g_decoy': loss_g_decoy,
             'typed_candidate_energy': loss_typed_candidate_energy,
+            'typed_strict_rotamer': loss_typed_strict_rotamer,
+            'decoy_contrastive': loss_decoy_contrastive,
+            'ligand_discriminator': loss_ligand_discriminator,
+            'ligand_guidance': loss_ligand_guidance,
+            'protein_ligand_contrastive': loss_protein_ligand_contrastive,
             'expert_delta': loss_expert_delta,
             'clash': loss_clash,
             'fape': loss_fape,
@@ -1668,6 +1830,11 @@ class Stage1Trainer:
                 'g_switch_dir': float('nan'), 'g_switch_amp': float('nan'), 'g_switch_rank': float('nan'),
                 'g_antiharm': float('nan'), 'g_decoy': float('nan'),
                 'typed_candidate_energy': float('nan'),
+                'typed_strict_rotamer': float('nan'),
+                'decoy_contrastive': float('nan'),
+                'ligand_discriminator': float('nan'),
+                'ligand_guidance': float('nan'),
+                'protein_ligand_contrastive': float('nan'),
                 'expert_delta': float('nan'), 'fape': float('nan'), 'clash': float('nan')
             }
 
@@ -1678,10 +1845,6 @@ class Stage1Trainer:
         forward_error = False
         outputs = {}
         scorer_kwargs_train = self._geometry_scorer_kwargs(self.global_step, training=True)
-        # The "no-ligand" pass for contrastive losses must always include the residual
-        # path with full beta and no detach: it is a pure inference of "what would
-        # happen without ligand?" used as a contrastive denominator.
-        scorer_kwargs_nolig = self._geometry_scorer_kwargs(self.global_step, training=False)
 
         def _v2_decoy_batch(b):
             """Build the v2 G-decoy batch according to config.g_decoy_kind."""
@@ -1707,6 +1870,7 @@ class Stage1Trainer:
 
         def _do_forward_with_aux():
             outs = self.model(batch, self.global_step, geometry_scorer_kwargs=scorer_kwargs_train)
+            cached_typed_control_outputs = {}
             if (
                 getattr(self.config, 'lambda_ligand_contrastive', 0.0) > 0.0
                 or getattr(self.config, 'lambda_candidate_rerank', 0.0) > 0.0
@@ -1718,31 +1882,63 @@ class Stage1Trainer:
                 if decoy_batch is not None:
                     decoy_outputs = self.model(decoy_batch, self.global_step, geometry_scorer_kwargs=scorer_kwargs_train)
                     outs['candidate_chi1_decoy_logits'] = decoy_outputs.get('candidate_chi1_logits', None)
-            if getattr(self.config, 'lambda_ligand_residual', 0.0) > 0.0 or getattr(self.config, 'use_nolig_contrastive', False):
+            if getattr(self.config, 'lambda_ligand_residual', 0.0) > 0.0 or getattr(self.config, 'use_nolig_contrastive', False) or getattr(self.config, 'lambda_ligand_guidance', 0.0) > 0.0:
                 nolig_batch = self._make_nolig_batch(batch)
-                nolig_outputs = self.model(nolig_batch, self.global_step, geometry_scorer_kwargs=scorer_kwargs_nolig)
+                nolig_outputs = self.model(nolig_batch, self.global_step, geometry_scorer_kwargs=scorer_kwargs_train)
                 outs['geometry_chi1_nolig_logits'] = nolig_outputs.get('geometry_chi1_logits', None)
             # v2 G-decoy contrastive forward
             if getattr(self.config, 'lambda_g_decoy', 0.0) > 0.0:
                 v2_decoy = _v2_decoy_batch(batch)
                 v2_decoy_outputs = self.model(v2_decoy, self.global_step, geometry_scorer_kwargs=scorer_kwargs_train)
                 outs['geometry_chi1_decoy_logits'] = v2_decoy_outputs.get('geometry_chi1_logits', None)
+            typed_control_kinds: List[str] = []
+            primary_typed_kind = getattr(self.config, 'typed_candidate_decoy_kind', 'scrambled')
             if getattr(self.config, 'lambda_typed_candidate_energy', 0.0) > 0.0:
-                typed_decoy = self._make_typed_candidate_decoy_batch(batch)
-                typed_decoy_outputs = self.model(typed_decoy, self.global_step, geometry_scorer_kwargs=scorer_kwargs_train)
-                outs['geometry_chi1_typed_decoy_energy'] = typed_decoy_outputs.get('geometry_chi1_typed_energy', None)
-                outs['geometry_chi1_decoy_logits'] = typed_decoy_outputs.get('geometry_chi1_logits', None)
+                typed_control_kinds.append(primary_typed_kind)
+                typed_control_kinds.extend(self._typed_candidate_energy_control_kinds())
+            if getattr(self.config, 'lambda_typed_strict_rotamer', 0.0) > 0.0:
+                typed_control_kinds.extend(self._typed_strict_rotamer_control_kinds())
+            for typed_kind in dict.fromkeys(typed_control_kinds):
+                typed_outputs = cached_typed_control_outputs.get(typed_kind)
+                if typed_outputs is None:
+                    typed_batch = self._make_typed_candidate_decoy_batch(batch, typed_kind)
+                    typed_outputs = self.model(typed_batch, self.global_step, geometry_scorer_kwargs=scorer_kwargs_train)
+                    cached_typed_control_outputs[typed_kind] = typed_outputs
+                outs[f'geometry_chi1_typed_control_energy_{typed_kind}'] = typed_outputs.get('geometry_chi1_typed_energy', None)
+                if (
+                    getattr(self.config, 'lambda_typed_strict_rotamer', 0.0) > 0.0
+                    and typed_kind in self._typed_strict_rotamer_control_kinds()
+                ):
+                    outs[f'geometry_chi1_control_logits_{typed_kind}'] = typed_outputs.get('geometry_chi1_logits', None)
+                if typed_kind == primary_typed_kind:
+                    outs['geometry_chi1_typed_decoy_energy'] = typed_outputs.get('geometry_chi1_typed_energy', None)
+                    outs['geometry_chi1_decoy_logits'] = typed_outputs.get('geometry_chi1_logits', None)
+            if getattr(self.config, 'lambda_decoy_contrastive', 0.0) > 0.0:
+                contrastive_kind = getattr(self.config, 'decoy_contrastive_decoy_kind', 'scrambled')
+                if f'geometry_chi1_control_logits_{contrastive_kind}' not in outs and outs.get('geometry_chi1_decoy_logits') is None:
+                    contrastive_batch = self._make_typed_candidate_decoy_batch(batch, contrastive_kind)
+                    if contrastive_batch is not None:
+                        contrastive_outputs = self.model(contrastive_batch, self.global_step, geometry_scorer_kwargs=scorer_kwargs_train)
+                        outs[f'geometry_chi1_control_logits_{contrastive_kind}'] = contrastive_outputs.get('geometry_chi1_logits', None)
+            if getattr(self.config, 'lambda_ligand_discriminator', 0.0) > 0.0:
+                base_model = self.model.module if hasattr(self.model, 'module') else self.model
+                if getattr(base_model, 'ligand_discriminator', None) is not None:
+                    disc_kind = getattr(self.config, 'ligand_discriminator_decoy_kind', 'scrambled')
+                    disc_batch = self._make_typed_candidate_decoy_batch(batch, disc_kind)
+                    if disc_batch is not None:
+                        disc_outputs = self.model(disc_batch, self.global_step, geometry_scorer_kwargs=scorer_kwargs_train)
+                        outs[f'ligand_discriminator_decoy_score_{disc_kind}'] = disc_outputs.get('ligand_discriminator_score', None)
             return outs
 
         try:
             if self.autocast_dtype is not None:
                 with self._autocast_context():
                     outputs = _do_forward_with_aux()
-                    losses = self.compute_loss(outputs, batch, self.global_step)
+                    losses = self.compute_loss(outputs, batch, self.global_step, scorer_kwargs_train)
                     loss = losses['total']
             else:
                 outputs = _do_forward_with_aux()
-                losses = self.compute_loss(outputs, batch, self.global_step)
+                losses = self.compute_loss(outputs, batch, self.global_step, scorer_kwargs_train)
                 loss = losses['total']
         except RuntimeError as e:
             # 捕获 CUDA 错误等
@@ -1761,6 +1957,11 @@ class Stage1Trainer:
                 'g_switch_dir': loss, 'g_switch_amp': loss, 'g_switch_rank': loss,
                 'g_antiharm': loss, 'g_decoy': loss,
                 'typed_candidate_energy': loss,
+                'typed_strict_rotamer': loss,
+                'decoy_contrastive': loss,
+                'ligand_discriminator': loss,
+                'ligand_guidance': loss,
+                'protein_ligand_contrastive': loss,
                 'expert_delta': loss, 'fape': loss, 'clash': loss
             }
 
@@ -1952,6 +2153,11 @@ class Stage1Trainer:
             'g_antiharm': 0.0,
             'g_decoy': 0.0,
             'typed_candidate_energy': 0.0,
+            'typed_strict_rotamer': 0.0,
+            'decoy_contrastive': 0.0,
+            'ligand_discriminator': 0.0,
+            'ligand_guidance': 0.0,
+            'protein_ligand_contrastive': 0.0,
             'expert_delta': 0.0,
             'clash': 0.0,
             'fape': 0.0,
@@ -1996,6 +2202,11 @@ class Stage1Trainer:
                     'lcon': f"{step_losses['ligand_contrastive']:.3f}",
                     'crnk': f"{step_losses['candidate_rerank']:.3f}",
                     'typed': f"{step_losses['typed_candidate_energy']:.3f}",
+                    'plcon': f"{step_losses['protein_ligand_contrastive']:.3f}",
+                    'trot': f"{step_losses['typed_strict_rotamer']:.3f}",
+                    'dcon': f"{step_losses['decoy_contrastive']:.3f}",
+                    'disc': f"{step_losses['ligand_discriminator']:.3f}",
+                    'guid': f"{step_losses['ligand_guidance']:.3f}",
                     'exp': f"{step_losses['expert_delta']:.3f}",
                     'fape': f"{step_losses['fape']:.3f}",
                     'clash': f"{step_losses['clash']:.3f}",
@@ -2029,7 +2240,12 @@ class Stage1Trainer:
                 'candidate_chi1': 0.0,
                 'ligand_contrastive': 0.0,
                 'candidate_rerank': 0.0,
-                'typed_candidate_energy': 0.0,
+            'typed_candidate_energy': 0.0,
+            'typed_strict_rotamer': 0.0,
+            'decoy_contrastive': 0.0,
+            'ligand_discriminator': 0.0,
+            'ligand_guidance': 0.0,
+            'protein_ligand_contrastive': 0.0,
                 'chi1_acc': 0.0,
                 'pocket_chi1_acc': 0.0,
                 'pocket_chi1_mae_deg': 0.0,
@@ -2072,6 +2288,11 @@ class Stage1Trainer:
             'g_antiharm': 0.0,
             'g_decoy': 0.0,
             'typed_candidate_energy': 0.0,
+            'typed_strict_rotamer': 0.0,
+            'decoy_contrastive': 0.0,
+            'ligand_discriminator': 0.0,
+            'ligand_guidance': 0.0,
+            'protein_ligand_contrastive': 0.0,
             'expert_delta': 0.0,
             'clash': 0.0,
             'fape': 0.0,
@@ -2105,6 +2326,32 @@ class Stage1Trainer:
             key: {'gap_sum': 0.0, 'correct_sum': 0.0, 'decoy_sum': 0.0, 'abs_sum': 0.0, 'total': 0}
             for key in ('switch', 'contact', 'contact_switch', 'pocket_switch')
         }
+        strict_control_kinds = ('scrambled', 'shuffled')
+        strict_ligand_lift_stats = {
+            kind: {
+                key: {'full_hits': 0.0, 'decoy_hits': 0.0, 'total': 0}
+                for key in ('switch', 'apo_wrong', 'contact', 'contact_switch', 'pocket_switch')
+            }
+            for kind in strict_control_kinds
+        }
+        strict_typed_energy_stats = {
+            kind: {
+                key: {
+                    'gap_sum': 0.0,
+                    'correct_sum': 0.0,
+                    'decoy_sum': 0.0,
+                    'abs_sum': 0.0,
+                    'positive': 0,
+                    'total': 0,
+                }
+                for key in ('switch', 'contact', 'contact_switch', 'pocket_switch')
+            }
+            for kind in strict_control_kinds
+        }
+        disc_switch_scores = {'correct': [], 'decoy': []}
+        disc_contact_switch_scores = {'correct': [], 'decoy': []}
+        guidance_switch_mags: List[float] = []
+        guidance_nonswitch_mags: List[float] = []
         angle_buffers: Dict[str, List[np.ndarray]] = {}
         chi_hits: Dict[str, float] = {}
         chi_totals: Dict[str, int] = {}
@@ -2173,12 +2420,44 @@ class Stage1Trainer:
                     )
                 geom_decoy_outputs = eval_model(geom_decoy_batch, self.global_step, geometry_scorer_kwargs=scorer_kwargs_eval)
                 outputs['geometry_chi1_decoy_logits'] = geom_decoy_outputs.get('geometry_chi1_logits', None)
-            if getattr(self.config, 'lambda_typed_candidate_energy', 0.0) > 0.0 and outputs.get('geometry_chi1_typed_energy') is not None:
-                typed_decoy_batch = self._make_typed_candidate_decoy_batch(batch)
-                typed_decoy_outputs = eval_model(typed_decoy_batch, self.global_step, geometry_scorer_kwargs=scorer_kwargs_eval)
-                outputs['geometry_chi1_typed_decoy_energy'] = typed_decoy_outputs.get('geometry_chi1_typed_energy', None)
-                outputs['geometry_chi1_decoy_logits'] = typed_decoy_outputs.get('geometry_chi1_logits', None)
-            losses = self.compute_loss(outputs, batch, self.global_step)
+            strict_controls_active = (
+                getattr(self.config, 'lambda_typed_candidate_energy', 0.0) > 0.0
+                or getattr(self.config, 'lambda_typed_strict_rotamer', 0.0) > 0.0
+                or getattr(self.config, 'lambda_decoy_contrastive', 0.0) > 0.0
+            )
+            if strict_controls_active and outputs.get('geometry_chi1_logits') is not None:
+                typed_decoy_kind = getattr(self.config, 'typed_candidate_decoy_kind', 'scrambled')
+                typed_decoy_outputs = None
+                if getattr(self.config, 'lambda_typed_candidate_energy', 0.0) > 0.0 and outputs.get('geometry_chi1_typed_energy') is not None:
+                    typed_decoy_batch = self._make_typed_candidate_decoy_batch(batch, typed_decoy_kind)
+                    typed_decoy_outputs = eval_model(typed_decoy_batch, self.global_step, geometry_scorer_kwargs=scorer_kwargs_eval)
+                    outputs['geometry_chi1_typed_decoy_energy'] = typed_decoy_outputs.get('geometry_chi1_typed_energy', None)
+                    outputs['geometry_chi1_decoy_logits'] = typed_decoy_outputs.get('geometry_chi1_logits', None)
+                for strict_kind in strict_control_kinds:
+                    if strict_kind == typed_decoy_kind and typed_decoy_outputs is not None:
+                        strict_outputs = typed_decoy_outputs
+                    else:
+                        strict_batch = self._make_typed_candidate_decoy_batch(batch, strict_kind)
+                        strict_outputs = eval_model(
+                            strict_batch,
+                            self.global_step,
+                            geometry_scorer_kwargs=scorer_kwargs_eval,
+                        )
+                    outputs[f'geometry_chi1_typed_control_energy_{strict_kind}'] = strict_outputs.get('geometry_chi1_typed_energy', None)
+                    outputs[f'geometry_chi1_control_logits_{strict_kind}'] = strict_outputs.get('geometry_chi1_logits', None)
+            if getattr(self.config, 'lambda_ligand_discriminator', 0.0) > 0.0:
+                base_model = eval_model
+                if getattr(base_model, 'ligand_discriminator', None) is not None:
+                    disc_kind = getattr(self.config, 'ligand_discriminator_decoy_kind', 'scrambled')
+                    disc_batch = self._make_typed_candidate_decoy_batch(batch, disc_kind)
+                    if disc_batch is not None:
+                        disc_outputs = eval_model(disc_batch, self.global_step, geometry_scorer_kwargs=scorer_kwargs_eval)
+                        outputs[f'ligand_discriminator_decoy_score_{disc_kind}'] = disc_outputs.get('ligand_discriminator_score', None)
+            if getattr(self.config, 'lambda_ligand_guidance', 0.0) > 0.0:
+                nolig_batch = self._make_nolig_batch(batch)
+                nolig_outputs = eval_model(nolig_batch, self.global_step, geometry_scorer_kwargs=scorer_kwargs_eval)
+                outputs['geometry_chi1_nolig_logits'] = nolig_outputs.get('geometry_chi1_logits', None)
+            losses = self.compute_loss(outputs, batch, self.global_step, scorer_kwargs_eval)
             n_batches += 1
 
             for k in val_losses:
@@ -2198,6 +2477,32 @@ class Stage1Trainer:
             for i in range(B):
                 node_mask_i = batch.node_mask[i].bool()
                 chi1_valid_mask = batch.chi_mask[i, :, 0].bool() & node_mask_i
+                holo_bins_for_i = self._chi1_rotamer_labels(batch.chi_holo[i, :, 0])
+                apo_bins_for_i = self._chi1_rotamer_labels(batch.torsion_apo[i, :, 3])
+                switch_mask_for_i = chi1_valid_mask & (apo_bins_for_i != holo_bins_for_i)
+                contact_switch_for_i = switch_mask_for_i & (batch.w_res[i] > 0.5) & node_mask_i
+
+                correct_score = outputs.get('ligand_discriminator_score')
+                disc_kind = getattr(self.config, 'ligand_discriminator_decoy_kind', 'scrambled')
+                decoy_score = outputs.get(f'ligand_discriminator_decoy_score_{disc_kind}')
+                if correct_score is not None and decoy_score is not None:
+                    if switch_mask_for_i.any():
+                        disc_switch_scores['correct'].append(correct_score[i][switch_mask_for_i].mean().item())
+                        disc_switch_scores['decoy'].append(decoy_score[i][switch_mask_for_i].mean().item())
+                    if contact_switch_for_i.any():
+                        disc_contact_switch_scores['correct'].append(correct_score[i][contact_switch_for_i].mean().item())
+                        disc_contact_switch_scores['decoy'].append(decoy_score[i][contact_switch_for_i].mean().item())
+
+                g_logits = outputs.get('geometry_chi1_logits')
+                g_nolig_logits = outputs.get('geometry_chi1_nolig_logits')
+                if g_logits is not None and g_nolig_logits is not None:
+                    guidance_i = (g_logits[i] - g_nolig_logits[i]).norm(dim=-1)
+                    nonswitch_mask_for_i = chi1_valid_mask & (apo_bins_for_i == holo_bins_for_i)
+                    if switch_mask_for_i.any():
+                        guidance_switch_mags.append(guidance_i[switch_mask_for_i].mean().item())
+                    if nonswitch_mask_for_i.any():
+                        guidance_nonswitch_mags.append(guidance_i[nonswitch_mask_for_i].mean().item())
+
                 chi1_errors = compute_angle_errors_deg(
                     pred_chi[i, :, 0],
                     batch.chi_holo[i, :, 0],
@@ -2277,6 +2582,19 @@ class Stage1Trainer:
                         if decoy_pred is not None:
                             stats['decoy_hits'] += float((decoy_pred[lift_mask] == true_subset).sum().item())
                         stats['total'] += int(lift_mask.sum().item())
+                    for strict_kind in strict_control_kinds:
+                        strict_logits = outputs.get(f'geometry_chi1_control_logits_{strict_kind}', None)
+                        if strict_logits is None:
+                            continue
+                        strict_pred = strict_logits[i].argmax(dim=-1)
+                        for lift_key, lift_mask in lift_masks.items():
+                            if not lift_mask.any():
+                                continue
+                            stats = strict_ligand_lift_stats[strict_kind][lift_key]
+                            true_subset = holo_bins[lift_mask]
+                            stats['full_hits'] += float((geom_pred[lift_mask] == true_subset).sum().item())
+                            stats['decoy_hits'] += float((strict_pred[lift_mask] == true_subset).sum().item())
+                            stats['total'] += int(lift_mask.sum().item())
 
                 typed_energy = outputs.get('geometry_chi1_typed_energy', None)
                 typed_decoy_energy = outputs.get('geometry_chi1_typed_decoy_energy', None)
@@ -2305,6 +2623,22 @@ class Stage1Trainer:
                         stats['decoy_sum'] += float(decoy_holo_energy[typed_mask].sum().item())
                         stats['abs_sum'] += float(gap.abs().sum().item())
                         stats['total'] += int(typed_mask.sum().item())
+                    for strict_kind in strict_control_kinds:
+                        strict_energy = outputs.get(f'geometry_chi1_typed_control_energy_{strict_kind}', None)
+                        if strict_energy is None:
+                            continue
+                        strict_holo_energy = strict_energy[i].gather(-1, gather_idx).squeeze(-1)
+                        for typed_key, typed_mask in typed_masks.items():
+                            if not typed_mask.any():
+                                continue
+                            gap = correct_holo_energy[typed_mask] - strict_holo_energy[typed_mask]
+                            stats = strict_typed_energy_stats[strict_kind][typed_key]
+                            stats['gap_sum'] += float(gap.sum().item())
+                            stats['correct_sum'] += float(correct_holo_energy[typed_mask].sum().item())
+                            stats['decoy_sum'] += float(strict_holo_energy[typed_mask].sum().item())
+                            stats['abs_sum'] += float(gap.abs().sum().item())
+                            stats['positive'] += int((gap > 0).sum().item())
+                            stats['total'] += int(typed_mask.sum().item())
 
                 mask_dict = {
                     'apo_distance_mask': (batch.w_res[i] > 0.5) & node_mask_i,
@@ -2492,6 +2826,81 @@ class Stage1Trainer:
             val_metrics[f'typed_energy_correct_{typed_key}'] = self._nanmean_from_sum_count(stats['correct_sum'], n_typed)
             val_metrics[f'typed_energy_decoy_{typed_key}'] = self._nanmean_from_sum_count(stats['decoy_sum'], n_typed)
             val_metrics[f'typed_energy_abs_gap_{typed_key}'] = self._nanmean_from_sum_count(stats['abs_sum'], n_typed)
+        for strict_kind, subset_stats in strict_ligand_lift_stats.items():
+            for lift_key, stats in subset_stats.items():
+                full_acc = self._nanmean_from_sum_count(stats['full_hits'], stats['total'])
+                decoy_acc = self._nanmean_from_sum_count(stats['decoy_hits'], stats['total'])
+                prefix = f'ligand_decoy_lift_{lift_key}_rotamer_{strict_kind}'
+                val_metrics[f'{prefix}_n'] = float(stats['total'])
+                val_metrics[f'{prefix}_full_acc'] = full_acc
+                val_metrics[f'{prefix}_decoy_acc'] = decoy_acc
+                val_metrics[f'{prefix}_acc'] = (
+                    full_acc - decoy_acc if math.isfinite(full_acc) and math.isfinite(decoy_acc) else float('nan')
+                )
+        for strict_kind, subset_stats in strict_typed_energy_stats.items():
+            for typed_key, stats in subset_stats.items():
+                n_typed = stats['total']
+                prefix = f'typed_energy_gap_{typed_key}_{strict_kind}'
+                val_metrics[f'{prefix}_n'] = float(n_typed)
+                val_metrics[prefix] = self._nanmean_from_sum_count(stats['gap_sum'], n_typed)
+                val_metrics[f'typed_energy_correct_{typed_key}_{strict_kind}'] = self._nanmean_from_sum_count(stats['correct_sum'], n_typed)
+                val_metrics[f'typed_energy_decoy_{typed_key}_{strict_kind}'] = self._nanmean_from_sum_count(stats['decoy_sum'], n_typed)
+                val_metrics[f'typed_energy_abs_gap_{typed_key}_{strict_kind}'] = self._nanmean_from_sum_count(stats['abs_sum'], n_typed)
+                val_metrics[f'typed_energy_gap_{typed_key}_frac_positive_{strict_kind}'] = (
+                    float(stats['positive'] / n_typed) if n_typed > 0 else float('nan')
+                )
+
+        def _finite_min_metric(*names: str) -> float:
+            values = [float(val_metrics.get(name, float('nan'))) for name in names]
+            return min(values) if all(math.isfinite(v) for v in values) else float('nan')
+
+        for typed_key in ('contact_switch', 'pocket_switch'):
+            strict_gap = _finite_min_metric(
+                f'typed_energy_gap_{typed_key}_scrambled',
+                f'typed_energy_gap_{typed_key}_shuffled',
+            )
+            strict_rotamer_lift = _finite_min_metric(
+                f'ligand_decoy_lift_{typed_key}_rotamer_scrambled_acc',
+                f'ligand_decoy_lift_{typed_key}_rotamer_shuffled_acc',
+            )
+            val_metrics[f'typed_strict_{typed_key}_energy_gap_min'] = strict_gap
+            val_metrics[f'typed_strict_{typed_key}_rotamer_lift_min'] = strict_rotamer_lift
+            val_metrics[f'typed_strict_{typed_key}_score'] = (
+                strict_gap + 0.01 * strict_rotamer_lift
+                if math.isfinite(strict_gap) and math.isfinite(strict_rotamer_lift)
+                else float('nan')
+            )
+        val_metrics['typed_strict_switch_score'] = _finite_min_metric(
+            'typed_strict_contact_switch_score',
+            'typed_strict_pocket_switch_score',
+        )
+        val_metrics['typed_strict_switch_energy_gap_min'] = _finite_min_metric(
+            'typed_strict_contact_switch_energy_gap_min',
+            'typed_strict_pocket_switch_energy_gap_min',
+        )
+
+        if disc_switch_scores['correct']:
+            val_metrics['ligand_discriminator_lift_switch'] = (
+                sum(disc_switch_scores['correct']) / len(disc_switch_scores['correct'])
+                - sum(disc_switch_scores['decoy']) / len(disc_switch_scores['decoy'])
+            )
+        else:
+            val_metrics['ligand_discriminator_lift_switch'] = float('nan')
+        if disc_contact_switch_scores['correct']:
+            val_metrics['ligand_discriminator_lift_contact_switch'] = (
+                sum(disc_contact_switch_scores['correct']) / len(disc_contact_switch_scores['correct'])
+                - sum(disc_contact_switch_scores['decoy']) / len(disc_contact_switch_scores['decoy'])
+            )
+        else:
+            val_metrics['ligand_discriminator_lift_contact_switch'] = float('nan')
+
+        val_metrics['ligand_guidance_switch_loss'] = (
+            sum(guidance_switch_mags) / len(guidance_switch_mags) if guidance_switch_mags else float('nan')
+        )
+        val_metrics['ligand_guidance_nonswitch_loss'] = (
+            sum(guidance_nonswitch_mags) / len(guidance_nonswitch_mags) if guidance_nonswitch_mags else float('nan')
+        )
+
         post_precision = float(metric_stats['contact_post_tp'] / max(metric_stats['contact_post_tp'] + metric_stats['contact_post_fp'], 1))
         post_recall = float(metric_stats['contact_post_tp'] / max(metric_stats['contact_post_tp'] + metric_stats['contact_post_fn'], 1))
         val_metrics['contact_posterior_precision'] = post_precision
@@ -2581,6 +2990,7 @@ class Stage1Trainer:
                 f"LCon:{train_losses['ligand_contrastive']:.2f} "
                 f"CRnk:{train_losses['candidate_rerank']:.2f} "
                 f"Typ:{train_losses['typed_candidate_energy']:.2f} "
+                f"PLCon:{train_losses['protein_ligand_contrastive']:.2f} "
                 f"Exp:{train_losses['expert_delta']:.2f} "
                 f"F:{train_losses['fape']:.2f} "
                 f"C:{train_losses['clash']:.2f} "
