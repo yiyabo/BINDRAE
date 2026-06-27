@@ -77,6 +77,7 @@ vendor/
 .qwen/
 .sisyphus/
 .claude/
+.codex/
 .omo/
 .playwright-mcp/
 
