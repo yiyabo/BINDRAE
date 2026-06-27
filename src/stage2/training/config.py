@@ -144,3 +144,7 @@ class TrainingConfig:
     distributed: bool = False
     local_rank: int = -1
     grad_accum_steps: int = 1
+
+    # Checkpoint resume (auto_resume reads save_dir/last_checkpoint.pt if present)
+    resume_from: Optional[str] = None
+    auto_resume: bool = True

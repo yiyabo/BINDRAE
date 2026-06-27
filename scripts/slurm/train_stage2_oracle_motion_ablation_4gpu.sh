@@ -67,6 +67,8 @@ REPA_DIM="${REPA_DIM:-128}"
 REPA_LOSS_TYPE="${REPA_LOSS_TYPE:-cosine}"
 REPA_MASK_MODE="${REPA_MASK_MODE:-motion_active_or_pocket}"
 REPA_TARGET_SHUFFLE_MODE="${REPA_TARGET_SHUFFLE_MODE:-none}"
+RESUME_FROM="${RESUME_FROM:-}"
+AUTO_RESUME="${AUTO_RESUME:-1}"
 GEOM_EVERY="${GEOM_EVERY:-1}"
 N_INTEGRATION_STEPS="${N_INTEGRATION_STEPS:-3}"
 INTEGRATION_CHI_CLIP="${INTEGRATION_CHI_CLIP:-1.0}"
@@ -430,9 +432,9 @@ if [[ "$PRECHECK_ONLY" == "1" ]]; then
   exit 0
 fi
 
-TAG="stage2_${TAG_SUFFIX}_train${TRAIN_N}_val${VAL_N}_e${MAX_EPOCHS}_bs${BATCH_SIZE}x${NPROC_PER_NODE}_$(date +%Y%m%d_%H%M%S)"
-SAVE_DIR="checkpoints/stage2/${TAG}"
-LOG_DIR="logs/stage2/${TAG}"
+TAG="${TAG:-stage2_${TAG_SUFFIX}_train${TRAIN_N}_val${VAL_N}_e${MAX_EPOCHS}_bs${BATCH_SIZE}x${NPROC_PER_NODE}_$(date +%Y%m%d_%H%M%S)}"
+SAVE_DIR="${SAVE_DIR:-checkpoints/stage2/${TAG}}"
+LOG_DIR="${LOG_DIR:-logs/stage2/${TAG}}"
 ESM_ARGS=()
 if [[ "$ESM_FUSION_ENABLED" == "1" ]]; then
   ESM_ARGS=(
@@ -452,6 +454,13 @@ if [[ "$REPA_ENABLED" == "1" ]]; then
     --repa_mask_mode "$REPA_MASK_MODE"
     --repa_target_shuffle_mode "$REPA_TARGET_SHUFFLE_MODE"
   )
+fi
+RESUME_ARGS=()
+if [[ -n "$RESUME_FROM" ]]; then
+  RESUME_ARGS+=(--resume_from "$RESUME_FROM")
+fi
+if [[ "$AUTO_RESUME" != "1" ]]; then
+  RESUME_ARGS+=(--no_auto_resume)
 fi
 
 echo "=============================================="
@@ -479,6 +488,8 @@ echo "REPA weight:     $REPA_WEIGHT"
 echo "REPA dim/loss:   $REPA_DIM / $REPA_LOSS_TYPE"
 echo "REPA mask:       $REPA_MASK_MODE"
 echo "REPA shuffle:    $REPA_TARGET_SHUFFLE_MODE"
+echo "Resume from:     ${RESUME_FROM:-OFF}"
+echo "Auto resume:     $AUTO_RESUME"
 echo "geom_every:      $GEOM_EVERY"
 echo "integration:     $N_INTEGRATION_STEPS"
 echo "chi clip:        $INTEGRATION_CHI_CLIP"
@@ -528,6 +539,7 @@ python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA {torch.versio
   --val_samples_file "$VAL_SUBSET_REL" \
   "${ESM_ARGS[@]}" \
   "${REPA_ARGS[@]}" \
+  "${RESUME_ARGS[@]}" \
   --save_dir "$SAVE_DIR" \
   --log_dir "$LOG_DIR" \
   --device cuda \

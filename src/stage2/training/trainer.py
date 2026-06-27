@@ -1,6 +1,7 @@
 """Stage-2 trainer (bridge flow on apo->holo paths)."""
 
 import datetime
+import hashlib
 import json
 import math
 import os
@@ -377,9 +378,10 @@ class Stage2Trainer:
         self.grad_accum_steps = max(getattr(config, 'grad_accum_steps', 1), 1)
         updates_per_epoch = math.ceil(len(self.train_loader) / self.grad_accum_steps)
         total_steps = updates_per_epoch * config.max_epochs
+        self.scheduler_t_max = max(total_steps - config.warmup_steps, 1)
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer,
-            T_max=max(total_steps - config.warmup_steps, 1),
+            T_max=self.scheduler_t_max,
             eta_min=config.lr * 0.01,
         )
 
@@ -392,10 +394,12 @@ class Stage2Trainer:
         self.best_val_metric = float('inf')
         self.patience_counter = 0
 
-        if self.is_main_process:
-            Path(config.save_dir).mkdir(parents=True, exist_ok=True)
-            Path(config.log_dir).mkdir(parents=True, exist_ok=True)
+        Path(config.save_dir).mkdir(parents=True, exist_ok=True)
+        Path(config.log_dir).mkdir(parents=True, exist_ok=True)
 
+        self._maybe_resume()
+
+        if self.is_main_process:
             print("✓ Stage-2 Trainer initialized")
             print(f"  - params: {sum(p.numel() for p in self.model.parameters()):,}")
             print(f"  - train samples: {len(self.train_loader.dataset)}")
@@ -403,6 +407,7 @@ class Stage2Trainer:
             print(f"  - total steps: {total_steps:,}")
             print(f"  - world_size: {self.world_size}")
             print(f"  - effective batch_size: {config.batch_size * self.world_size}")
+            print(f"  - resume epoch: {self.current_epoch}  global_step: {self.global_step}")
 
     def _resolve_amp_dtype(self) -> Optional[torch.dtype]:
         if not self.config.mixed_precision or self.device.type != 'cuda':
@@ -828,14 +833,40 @@ class Stage2Trainer:
         return (per_res * mask).sum() / denom
 
     @staticmethod
-    def _residue_shuffle_tensor(target: torch.Tensor, node_mask: torch.Tensor) -> torch.Tensor:
-        """Deterministically shuffle valid residue rows within each sample."""
+    def _residue_shuffle_tensor(
+        target: torch.Tensor,
+        node_mask: torch.Tensor,
+        sample_ids: Optional[List[str]] = None,
+        extra_seed: str = "repa_residue_shuffle",
+    ) -> torch.Tensor:
+        """Shuffle valid residue rows with a stable per-sample RNG seed."""
         shuffled = target.clone()
         valid_mask = node_mask.bool()
+        if sample_ids is not None and len(sample_ids) < target.shape[0]:
+            raise ValueError(
+                f"sample_ids length {len(sample_ids)} is smaller than batch size {target.shape[0]}"
+            )
         for batch_idx in range(target.shape[0]):
             valid_idx = valid_mask[batch_idx].nonzero(as_tuple=False).flatten()
-            if valid_idx.numel() > 1:
-                shuffled[batch_idx, valid_idx] = target[batch_idx, valid_idx.flip(0)]
+            if valid_idx.numel() <= 1:
+                continue
+            seed_key = (
+                sample_ids[batch_idx] if sample_ids is not None else f"_idx_{batch_idx}"
+            )
+            seed_str = f"{seed_key}|{extra_seed}"
+            seed = int.from_bytes(
+                hashlib.sha256(seed_str.encode("utf-8")).digest()[:8],
+                byteorder="little",
+                signed=False,
+            ) % (2**31)
+            cpu_gen = torch.Generator(device="cpu").manual_seed(seed)
+            perm_local = torch.randperm(valid_idx.numel(), generator=cpu_gen).to(
+                valid_idx.device
+            )
+            if torch.equal(perm_local, torch.arange(valid_idx.numel(), device=valid_idx.device)):
+                perm_local = torch.roll(perm_local, shifts=1)
+            permuted_idx = valid_idx[perm_local]
+            shuffled[batch_idx, valid_idx] = target[batch_idx, permuted_idx]
         return shuffled
 
     def _repa_target_features(self, batch) -> torch.Tensor:
@@ -848,7 +879,12 @@ class Stage2Trainer:
         if self.config.repa_target_shuffle_mode == 'none':
             return target
         if self.config.repa_target_shuffle_mode == 'residue':
-            return self._residue_shuffle_tensor(target, batch.node_mask)
+            sample_ids = getattr(batch, "pdb_ids", None)
+            return self._residue_shuffle_tensor(
+                target,
+                batch.node_mask,
+                sample_ids=sample_ids,
+            )
         raise ValueError(f"Unsupported repa_target_shuffle_mode={self.config.repa_target_shuffle_mode}")
 
     # FK module buffers are deterministic constants recomputed from
@@ -1749,17 +1785,169 @@ class Stage2Trainer:
         return {k: v / denom for k, v in val_losses.items()}
 
     def save_checkpoint(self, filepath: str, verbose: bool = True):
-        torch.save({
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
             'epoch': self.current_epoch,
             'global_step': self.global_step,
+            'optimizer_step_count': self.optimizer_step_count,
+            'patience_counter': self.patience_counter,
             'model_state_dict': self._raw_model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'best_val_metric': self.best_val_metric,
             'config': self.config,
-        }, filepath)
+        }
+        if self.scaler is not None:
+            payload['scaler_state_dict'] = self.scaler.state_dict()
+        tmp_path = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+        torch.save(payload, tmp_path)
+        os.replace(tmp_path, path)
         if verbose:
-            print(f"  ✓ Saved: {Path(filepath).name}")
+            print(f"  ✓ Saved: {path.name}")
+
+    @staticmethod
+    def _config_value(config_obj, name: str):
+        if config_obj is None:
+            return None
+        if isinstance(config_obj, dict):
+            return config_obj.get(name)
+        return getattr(config_obj, name, None)
+
+    def _validate_resume_config(self, ckpt_config) -> None:
+        if ckpt_config is None:
+            if self.is_main_process:
+                print("[Resume] WARNING: checkpoint has no config; skipping config compatibility checks")
+            return
+
+        strict_fields = (
+            # Dataset / feature-cache contract.
+            'data_dir',
+            'valid_samples_file',
+            'val_samples_file',
+            'batch_size',
+            'seed',
+            'stage1v2_train_cache_dir',
+            'stage1v2_val_cache_dir',
+            'stage1v2_train_label_dir',
+            'stage1v2_val_label_dir',
+            'stage1v2_posterior_feature_scale',
+            # Model architecture / input feature dimensions.
+            'esm_fusion_enabled',
+            'esm_num_layers',
+            'esm_fusion_mode',
+            'esm_layer_dropout',
+            'use_nma',
+            'nma_dim',
+            'stage1_prior_mode',
+            'use_stage1_prior',
+            'use_stage1_rigid_prior',
+            'stage1_chi_feature_scale',
+            'stage1v2_posterior_feature_mode',
+            'stage1v2_posterior_feature_names',
+            'interaction_prior_feature_mode',
+            'interaction_prior_feature_scale',
+            'repa_enabled',
+            'repa_dim',
+            'repa_loss_type',
+            'repa_mask_mode',
+            'repa_target_shuffle_mode',
+            # Optimizer state is restored, so these CLI values should not drift silently.
+            'lr',
+            'weight_decay',
+            'warmup_steps',
+            'grad_accum_steps',
+            # Loss contract.
+            'contact_loss_mode',
+            'w_fm_chi',
+            'w_fm_rigid',
+            'w_bg',
+            'w_smooth',
+            'w_clash',
+            'w_pep',
+            'w_contact',
+            'w_prior',
+            'w_interaction_prior',
+            'w_stage1v2_guidance',
+            'w_end',
+        )
+        mismatches = []
+        for field in strict_fields:
+            old = self._config_value(ckpt_config, field)
+            new = getattr(self.config, field, None)
+            if old != new:
+                mismatches.append((field, old, new))
+
+        if mismatches:
+            detail = ", ".join(
+                f"{field}: checkpoint={old!r} current={new!r}"
+                for field, old, new in mismatches
+            )
+            raise ValueError(
+                "Refusing to resume Stage-2 checkpoint with incompatible config. "
+                f"{detail}. Use a fresh save_dir or disable auto-resume for a new run."
+            )
+
+    def _maybe_resume(self) -> None:
+        explicit = self.config.resume_from
+        auto_path = Path(self.config.save_dir) / 'last_checkpoint.pt'
+
+        if explicit:
+            ckpt_path = Path(explicit)
+            if not ckpt_path.is_file():
+                raise FileNotFoundError(
+                    f"resume_from='{explicit}' not found"
+                )
+        elif self.config.auto_resume and auto_path.is_file():
+            ckpt_path = auto_path
+        else:
+            return
+
+        if self.is_main_process:
+            print(f"[Resume] Loading checkpoint: {ckpt_path}")
+
+        ckpt = torch.load(str(ckpt_path), map_location=self.device, weights_only=False)
+        self._validate_resume_config(ckpt.get('config') if isinstance(ckpt, dict) else None)
+
+        load_result = self._raw_model.load_state_dict(
+            ckpt['model_state_dict'], strict=False
+        )
+        unexpected = list(load_result.unexpected_keys)
+        missing = list(load_result.missing_keys)
+        if unexpected or missing:
+            raise RuntimeError(
+                f"Stage-2 checkpoint state_dict mismatch "
+                f"unexpected={unexpected}, missing={missing}"
+            )
+
+        self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        self.scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+        if getattr(self.scheduler, 'T_max', None) != self.scheduler_t_max:
+            old_t_max = getattr(self.scheduler, 'T_max', None)
+            self.scheduler.T_max = self.scheduler_t_max
+            if self.is_main_process:
+                print(
+                    f"[Resume] Adjusted scheduler T_max from {old_t_max} to "
+                    f"{self.scheduler_t_max} for current max_epochs={self.config.max_epochs}"
+                )
+
+        if self.scaler is not None and 'scaler_state_dict' in ckpt:
+            self.scaler.load_state_dict(ckpt['scaler_state_dict'])
+
+        self.current_epoch = int(ckpt.get('epoch', 0)) + 1
+        self.global_step = int(ckpt.get('global_step', 0))
+        self.optimizer_step_count = int(ckpt.get('optimizer_step_count', self.global_step))
+        self.patience_counter = int(ckpt.get('patience_counter', 0))
+        self.best_val_metric = float(ckpt.get('best_val_metric', float('inf')))
+
+        if self.is_main_process:
+            print(
+                f"[Resume] OK  next_epoch={self.current_epoch}  "
+                f"global_step={self.global_step}  best_val={self.best_val_metric:.4f}"
+            )
+
+        if self.distributed:
+            dist.barrier()
 
     def train(self):
         if self.is_main_process:
@@ -1783,6 +1971,7 @@ class Stage2Trainer:
 
             if epoch % 1 == 0:
                 val_results = self.validate()
+                should_stop = False
                 if self.is_main_process:
                     val_info = (
                         f" | Val Loss: {val_results['total']:.4f} "
@@ -1813,7 +2002,22 @@ class Stage2Trainer:
                         self.patience_counter += 1
                         if self.patience_counter >= self.config.early_stop_patience:
                             print("Early stopping triggered")
-                            break
+                            should_stop = True
+
+                    last_path = Path(self.config.save_dir) / 'last_checkpoint.pt'
+                    self.save_checkpoint(str(last_path), verbose=False)
+
+                if self.distributed:
+                    stop_tensor = torch.tensor(
+                        [1 if should_stop else 0],
+                        device=self.device,
+                        dtype=torch.int32,
+                    )
+                    dist.broadcast(stop_tensor, src=0)
+                    should_stop = bool(stop_tensor.item())
+
+                if should_stop:
+                    break
 
         if self.is_main_process:
             final_path = Path(self.config.save_dir) / 'final_model.pt'

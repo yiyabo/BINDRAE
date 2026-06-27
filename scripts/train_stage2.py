@@ -181,6 +181,10 @@ def parse_args():
                         help='Checkpoint保存目录')
     parser.add_argument('--log_dir', type=str, default='logs/stage2',
                         help='日志目录')
+    parser.add_argument('--resume_from', type=str, default=None,
+                        help='Explicit Stage-2 checkpoint path to resume from')
+    parser.add_argument('--no_auto_resume', action='store_true',
+                        help='Disable automatic resume from save_dir/last_checkpoint.pt')
 
     # 设备
     parser.add_argument('--device', type=str, default='cuda',
@@ -284,6 +288,8 @@ def main():
         geom_loss_every_n_steps=args.geom_loss_every_n_steps,
         save_dir=args.save_dir,
         log_dir=args.log_dir,
+        resume_from=args.resume_from,
+        auto_resume=not args.no_auto_resume,
         device=args.device,
         mixed_precision=not args.no_mixed_precision,
         amp_dtype=args.amp_dtype,
@@ -354,6 +360,8 @@ def main():
     print(f"  - geom_loss_every_n_steps: {config.geom_loss_every_n_steps}")
     print(f"  - seed: {config.seed}")
     print(f"  - val_t: {config.val_t}")
+    print(f"  - resume_from: {config.resume_from or 'OFF'}")
+    print(f"  - auto_resume: {config.auto_resume}")
     print(f"  - NMA: {config.use_nma}")
     print(f"  - 设备: {config.device}")
     print(f"  - 混合精度: {config.mixed_precision}")
