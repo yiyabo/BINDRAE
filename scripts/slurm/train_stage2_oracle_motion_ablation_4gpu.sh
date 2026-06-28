@@ -62,6 +62,8 @@ ESM_NUM_LAYERS="${ESM_NUM_LAYERS:-1}"
 ESM_FUSION_MODE="${ESM_FUSION_MODE:-sum}"
 ESM_LAYER_DROPOUT="${ESM_LAYER_DROPOUT:-0.0}"
 ESM_LAYER_ENTROPY_WEIGHT="${ESM_LAYER_ENTROPY_WEIGHT:-0.0}"
+ESM_GATE_BIAS="${ESM_GATE_BIAS:--3.0}"
+ESM_GATE_CONTEXT_MODE="${ESM_GATE_CONTEXT_MODE:-none}"
 REPA_ENABLED="${REPA_ENABLED:-0}"
 REPA_WEIGHT="${REPA_WEIGHT:-0.0}"
 REPA_DIM="${REPA_DIM:-128}"
@@ -109,6 +111,13 @@ case "$ESM_FUSION_MODE" in
   sum|mean|softmax_weighted|gated_residual) ;;
   *)
     echo "ERROR: ESM_FUSION_MODE must be one of sum, mean, softmax_weighted, gated_residual"
+    exit 1
+    ;;
+esac
+case "$ESM_GATE_CONTEXT_MODE" in
+  none|pocket_motion) ;;
+  *)
+    echo "ERROR: ESM_GATE_CONTEXT_MODE must be one of none, pocket_motion"
     exit 1
     ;;
 esac
@@ -452,6 +461,8 @@ if [[ "$ESM_FUSION_ENABLED" == "1" ]]; then
     --esm_fusion_mode "$ESM_FUSION_MODE"
     --esm_layer_dropout "$ESM_LAYER_DROPOUT"
     --esm_layer_entropy_weight "$ESM_LAYER_ENTROPY_WEIGHT"
+    --esm_gate_bias "$ESM_GATE_BIAS"
+    --esm_gate_context_mode "$ESM_GATE_CONTEXT_MODE"
   )
 fi
 REPA_ARGS=()
@@ -495,6 +506,8 @@ echo "ESM fusion:      $ESM_FUSION_ENABLED"
 echo "ESM layers/mode: $ESM_NUM_LAYERS / $ESM_FUSION_MODE"
 echo "ESM layer drop:  $ESM_LAYER_DROPOUT"
 echo "ESM entropy wt:  $ESM_LAYER_ENTROPY_WEIGHT"
+echo "ESM gate bias:   $ESM_GATE_BIAS"
+echo "ESM gate ctx:    $ESM_GATE_CONTEXT_MODE"
 echo "REPA enabled:    $REPA_ENABLED"
 echo "REPA weight:     $REPA_WEIGHT"
 echo "REPA dim/loss:   $REPA_DIM / $REPA_LOSS_TYPE"

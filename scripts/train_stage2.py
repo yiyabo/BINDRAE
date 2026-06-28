@@ -68,6 +68,11 @@ def parse_args():
                         help='Dropout applied to learned ESM layer weights during training')
     parser.add_argument('--esm_layer_entropy_weight', type=float, default=0.0,
                         help='Entropy regularization weight for gated_residual ESM layer weights (penalizes uniform weights)')
+    parser.add_argument('--esm_gate_bias', type=float, default=-3.0,
+                        help='Initial bias for gated_residual earlier-layer gates')
+    parser.add_argument('--esm_gate_context_mode', type=str, default='none',
+                        choices=['none', 'pocket_motion'],
+                        help='Optional context appended to gated_residual gate input')
 
     # Stage-1 prior
     parser.add_argument('--stage1_ckpt', type=str, default='checkpoints/stage1_best.pt',
@@ -242,6 +247,8 @@ def main():
         esm_fusion_mode=args.esm_fusion_mode,
         esm_layer_dropout=args.esm_layer_dropout,
         esm_layer_entropy_weight=args.esm_layer_entropy_weight,
+        esm_gate_bias=args.esm_gate_bias,
+        esm_gate_context_mode=args.esm_gate_context_mode,
         stage1_ckpt=args.stage1_ckpt,
         use_stage1_prior=not args.no_stage1_prior,
         stage1_prior_mode=args.stage1_prior_mode,
@@ -315,6 +322,8 @@ def main():
     print(f"  - ESM num layers: {config.esm_num_layers}")
     print(f"  - ESM fusion mode: {config.esm_fusion_mode}")
     print(f"  - ESM layer dropout: {config.esm_layer_dropout}")
+    print(f"  - ESM gate bias: {config.esm_gate_bias}")
+    print(f"  - ESM gate context: {config.esm_gate_context_mode}")
     print(f"  - Stage-1 prior: {config.use_stage1_prior}")
     print(f"  - Stage-1 prior mode: {config.stage1_prior_mode}")
     print(f"  - Stage-1 prior noise scale: {config.stage1_prior_noise_scale}")

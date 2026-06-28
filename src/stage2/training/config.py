@@ -40,6 +40,8 @@ class TrainingConfig:
     esm_fusion_mode: str = "sum"  # sum | mean | softmax_weighted | gated_residual
     esm_layer_dropout: float = 0.0
     esm_layer_entropy_weight: float = 0.0
+    esm_gate_bias: float = -3.0
+    esm_gate_context_mode: str = "none"
 
     # Stage-1 prior
     stage1_ckpt: str = "checkpoints/stage1_best.pt"

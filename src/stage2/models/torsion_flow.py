@@ -39,6 +39,8 @@ class TorsionFlowNetConfig:
     esm_num_layers: int = 1
     esm_fusion_mode: str = "sum"
     esm_layer_dropout: float = 0.0
+    esm_gate_bias: float = -3.0
+    esm_gate_context_dim: int = 0
 
     # EdgeEmbedder
     c_p: int = 128
@@ -98,6 +100,8 @@ class TorsionFlowNet(nn.Module):
                 fusion_mode=self.config.esm_fusion_mode,
                 layer_dropout=self.config.esm_layer_dropout,
                 dropout=self.config.dropout,
+                gate_bias=self.config.esm_gate_bias,
+                gate_context_dim=self.config.esm_gate_context_dim,
             )
         else:
             self.esm_adapter = ESMAdapter(
@@ -207,9 +211,10 @@ class TorsionFlowNet(nn.Module):
                 stage1_chi: Optional[torch.Tensor] = None,     # [B, N, 4]
                 stage1_rigids: Optional[Rigid] = None,         # Rigid[B, N]
                 stage1_chi_mask: Optional[torch.Tensor] = None, # [B, N]
-                interaction_prior: Optional[torch.Tensor] = None, # [B, N] or [B, N, D]
-                current_step: Optional[int] = None,
-                return_repa: bool = False) -> Dict[str, torch.Tensor]:
+                 interaction_prior: Optional[torch.Tensor] = None, # [B, N] or [B, N, D]
+                 esm_gate_context: Optional[torch.Tensor] = None,
+                 current_step: Optional[int] = None,
+                 return_repa: bool = False) -> Dict[str, torch.Tensor]:
         """
         Returns:
             dict with d_chi, d_rigid_rot, d_rigid_trans, gate
@@ -238,7 +243,10 @@ class TorsionFlowNet(nn.Module):
         t_emb = self.time_embed(t).unsqueeze(1).expand(B, N, -1)
 
         # ESM adapter
-        s = self.esm_adapter(esm)
+        if isinstance(self.esm_adapter, ESMLayerFusionAdapter):
+            s = self.esm_adapter(esm, gate_context=esm_gate_context)
+        else:
+            s = self.esm_adapter(esm)
         if prior_feature is not None and self.prior_residue_proj is not None:
             s = s + self.prior_residue_proj(prior_feature)
         # ligand conditioning (pre-IPA)

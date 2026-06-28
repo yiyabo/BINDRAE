@@ -237,6 +237,11 @@ class Stage2Trainer:
             raise ValueError(
                 f"esm_layer_dropout must be in [0, 1), got {config.esm_layer_dropout}"
             )
+        allowed_esm_gate_context_modes = {'none', 'pocket_motion'}
+        if config.esm_gate_context_mode not in allowed_esm_gate_context_modes:
+            raise ValueError(f"Unsupported esm_gate_context_mode={config.esm_gate_context_mode}")
+        if config.esm_gate_context_mode != 'none' and config.esm_fusion_mode != 'gated_residual':
+            raise ValueError("esm_gate_context_mode requires esm_fusion_mode=gated_residual")
         allowed_interaction_feature_modes = {'none', 'prior', 'zero', 'oracle_contact'}
         if config.interaction_prior_feature_mode not in allowed_interaction_feature_modes:
             raise ValueError(
@@ -328,11 +333,14 @@ class Stage2Trainer:
             else 0
         )
         interaction_prior_feature_dim = self.interaction_prior_feature_dim + self.stage1v2_feature_dim
+        esm_gate_context_dim = 2 if config.esm_gate_context_mode == 'pocket_motion' else 0
         model_config = TorsionFlowNetConfig(
             esm_fusion_enabled=config.esm_fusion_enabled,
             esm_num_layers=config.esm_num_layers,
             esm_fusion_mode=config.esm_fusion_mode,
             esm_layer_dropout=config.esm_layer_dropout,
+            esm_gate_bias=config.esm_gate_bias,
+            esm_gate_context_dim=esm_gate_context_dim,
             nma_dim=config.nma_dim,
             stage1_chi_feature_scale=config.stage1_chi_feature_scale,
             interaction_prior_feature_dim=interaction_prior_feature_dim,
@@ -736,6 +744,24 @@ class Stage2Trainer:
         out = torch.cat(features, dim=-1)
         return out * batch.node_mask.unsqueeze(-1).float()
 
+    def _esm_gate_context(self, batch) -> Optional[torch.Tensor]:
+        match self.config.esm_gate_context_mode:
+            case 'none':
+                return None
+            case 'pocket_motion':
+                motion = batch.w_res.new_zeros(batch.w_res.shape)
+                if batch.stage1v2_posterior_features is not None:
+                    try:
+                        motion_idx = self.stage1v2_feature_names.index('motion_active')
+                    except ValueError:
+                        motion_idx = -1
+                    if motion_idx >= 0:
+                        motion = batch.stage1v2_posterior_features[..., motion_idx].detach().float()
+                context = torch.stack([batch.w_res.detach().float(), motion], dim=-1)
+                return context * batch.node_mask.unsqueeze(-1).float()
+            case unreachable:
+                raise ValueError(f"Unsupported esm_gate_context_mode={unreachable}")
+
     @staticmethod
     def _clip_velocity(x: torch.Tensor, limit: float) -> torch.Tensor:
         limit = float(limit)
@@ -1132,7 +1158,8 @@ class Stage2Trainer:
                        stage1_chi=None,
                        stage1_rigids=None,
                        stage1_chi_mask=None,
-                       interaction_prior=None) -> Tuple[List[Rigid], List[torch.Tensor], List[float]]:
+                       interaction_prior=None,
+                       esm_gate_context=None) -> Tuple[List[Rigid], List[torch.Tensor], List[float]]:
         """Integrate vector field from t=0 to t=1, return states."""
         n_steps = self.config.n_integration_steps
         dt = 1.0 / n_steps
@@ -1164,6 +1191,7 @@ class Stage2Trainer:
                 stage1_rigids=stage1_rigids,
                 stage1_chi_mask=stage1_chi_mask,
                 interaction_prior=interaction_prior,
+                esm_gate_context=esm_gate_context,
                 current_step=self.global_step,
             )
 
@@ -1201,6 +1229,7 @@ class Stage2Trainer:
                 stage1_rigids=stage1_rigids,
                 stage1_chi_mask=stage1_chi_mask,
                 interaction_prior=interaction_prior,
+                esm_gate_context=esm_gate_context,
                 current_step=self.global_step,
             )
 
@@ -1263,6 +1292,7 @@ class Stage2Trainer:
             interaction_prior_prob = self._compute_apo_interaction_prior_prob(batch, rigids_apo)
         interaction_prior_feature = self._interaction_prior_feature(interaction_prior_prob, batch)
         combined_prior_features = self._combined_prior_features(interaction_prior_feature, batch)
+        esm_gate_context = self._esm_gate_context(batch)
         stage1v2_guidance_prob = self._stage1v2_guidance_prob(batch)
 
         stage1_chi = None
@@ -1291,6 +1321,7 @@ class Stage2Trainer:
             stage1_rigids=stage1_rigids,
             stage1_chi_mask=stage1_chi_mask,
             interaction_prior=combined_prior_features,
+            esm_gate_context=esm_gate_context,
             current_step=self.global_step,
             return_repa=self.config.repa_enabled and float(self.config.repa_weight) > 0.0,
         )
@@ -1366,6 +1397,7 @@ class Stage2Trainer:
                 stage1_rigids=stage1_rigids,
                 stage1_chi_mask=stage1_chi_mask,
                 interaction_prior=combined_prior_features,
+                esm_gate_context=esm_gate_context,
             )
 
             # Integration is part of the scientific contract. Do not silently
