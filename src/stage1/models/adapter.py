@@ -118,9 +118,12 @@ class ESMLayerFusionAdapter(nn.Module):
             n_earlier = num_layers - 1
             self.gate_proj = nn.Linear(esm_dim, n_earlier)
             # sigmoid(-3) ≈ 0.05 → start near single-layer behavior
+            nn.init.zeros_(self.gate_proj.weight)
             nn.init.constant_(self.gate_proj.bias, -3.0)
             self.layer_logits = nn.Parameter(torch.zeros(n_earlier))
+            self.layer_dropout_module = nn.Dropout(layer_dropout)
             self.last_layer_weights: Optional[torch.Tensor] = None
+            self.last_layer_gates: Optional[torch.Tensor] = None
             self.post_fusion = nn.Sequential(
                 nn.LayerNorm(output_dim),
                 nn.GELU(),
@@ -148,11 +151,12 @@ class ESMLayerFusionAdapter(nn.Module):
         s_base = s_layers[-1]
 
         n_earlier = K - 1
-        weights = torch.softmax(self.layer_logits, dim=0)
+        weights = self._layer_weights(dtype=s_base.dtype, device=s_base.device)
         self.last_layer_weights = weights
 
         ctx = esm_features[..., -1, :]
         gates = torch.sigmoid(self.gate_proj(ctx))
+        self.last_layer_gates = gates.detach()
 
         residual = s_base.new_zeros(B, N, self.output_dim)
         for k in range(n_earlier):

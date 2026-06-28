@@ -87,6 +87,22 @@ class Stage2Trainer:
         'end_rigid_uw',
         'end_chi_uw',
         'end',
+        'esm_entropy',
+        'esm_layer_weight_entropy_raw',
+        'esm_layer_weight_max',
+        'esm_gate_mean',
+        'esm_gate_pocket_mean',
+        'esm_gate_nonpocket_mean',
+        'esm_layer_weight_0',
+        'esm_layer_weight_1',
+        'esm_layer_weight_2',
+        'esm_layer_weight_3',
+        'esm_layer_weight_4',
+        'esm_layer_weight_5',
+        'esm_layer_weight_6',
+        'esm_layer_weight_7',
+        'esm_layer_weight_8',
+        'esm_layer_weight_9',
     )
 
     _REPA_MOTION_CONTINUOUS_FEATURES = (
@@ -1666,13 +1682,60 @@ class Stage2Trainer:
         )
         total = total_no_repa + self.config.repa_weight * L_repa.clamp(max=100.0)
 
-        L_esm_entropy = chi_ref.new_tensor(0.0)
-        if self.config.esm_layer_entropy_weight > 0.0:
-            esm_lw = out.get("esm_layer_weights")
-            if esm_lw is not None:
-                entropy = -(esm_lw * torch.log(esm_lw + 1e-8)).sum()
+        zero = chi_ref.new_tensor(0.0)
+        L_esm_entropy = zero
+        esm_layer_weight_entropy_raw = zero
+        esm_layer_weight_max = zero
+        esm_gate_mean = zero
+        esm_gate_pocket_mean = zero
+        esm_gate_nonpocket_mean = zero
+        esm_layer_weight_logs = {
+            f'esm_layer_weight_{idx}': zero
+            for idx in range(10)
+        }
+
+        esm_lw = out.get("esm_layer_weights")
+        if esm_lw is not None:
+            esm_lw_flat = esm_lw.float().reshape(-1)
+            entropy = -(esm_lw_flat * torch.log(esm_lw_flat + 1e-8)).sum()
+            esm_layer_weight_entropy_raw = entropy.detach()
+            esm_layer_weight_max = esm_lw_flat.max().detach()
+            for idx in range(min(10, esm_lw_flat.numel())):
+                esm_layer_weight_logs[f'esm_layer_weight_{idx}'] = esm_lw_flat[idx].detach()
+            if self.config.esm_layer_entropy_weight > 0.0:
                 L_esm_entropy = self.config.esm_layer_entropy_weight * entropy
                 total = total + L_esm_entropy
+
+        esm_gates = out.get("esm_layer_gates")
+        if esm_gates is not None:
+            gates = esm_gates.float()
+            node_mask = batch.node_mask.bool()
+            gate_mask = node_mask.unsqueeze(-1).expand_as(gates)
+            gate_mask_f = gate_mask.float()
+            esm_gate_mean = (
+                (gates * gate_mask_f).sum()
+                / gate_mask_f.sum().clamp(min=1.0)
+            ).detach()
+
+            pocket_mask = (
+                (batch.w_res > float(self.config.pocket_threshold))
+                & node_mask
+            ).unsqueeze(-1).expand_as(gates)
+            pocket_mask_f = pocket_mask.float()
+            esm_gate_pocket_mean = (
+                (gates * pocket_mask_f).sum()
+                / pocket_mask_f.sum().clamp(min=1.0)
+            ).detach()
+
+            nonpocket_mask = (
+                (batch.w_res <= float(self.config.pocket_threshold))
+                & node_mask
+            ).unsqueeze(-1).expand_as(gates)
+            nonpocket_mask_f = nonpocket_mask.float()
+            esm_gate_nonpocket_mean = (
+                (gates * nonpocket_mask_f).sum()
+                / nonpocket_mask_f.sum().clamp(min=1.0)
+            ).detach()
 
         return {
             'total': total,
@@ -1709,6 +1772,12 @@ class Stage2Trainer:
             'end_chi_uw': L_end_chi_uw,
             'end': L_end,
             'esm_entropy': L_esm_entropy,
+            'esm_layer_weight_entropy_raw': esm_layer_weight_entropy_raw,
+            'esm_layer_weight_max': esm_layer_weight_max,
+            'esm_gate_mean': esm_gate_mean,
+            'esm_gate_pocket_mean': esm_gate_pocket_mean,
+            'esm_gate_nonpocket_mean': esm_gate_nonpocket_mean,
+            **esm_layer_weight_logs,
         }
 
     def train_step(self, batch, *, accum_steps: int, should_step: bool) -> Dict[str, float]:
@@ -1893,6 +1962,7 @@ class Stage2Trainer:
             'esm_num_layers',
             'esm_fusion_mode',
             'esm_layer_dropout',
+            'esm_layer_entropy_weight',
             'use_nma',
             'nma_dim',
             'stage1_prior_mode',

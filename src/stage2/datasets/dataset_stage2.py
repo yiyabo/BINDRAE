@@ -127,8 +127,7 @@ class ApoHoloBridgeDataset(Dataset):
             valid_path = self.data_dir / valid_path
         
         if not valid_path.exists():
-            print(f"[WARN] valid_samples_file not found: {valid_path}")
-            return self.samples
+            raise FileNotFoundError(f"valid_samples_file not found: {valid_path}")
         
         with open(valid_path, 'r') as f:
             valid_ids = {line.strip() for line in f if line.strip()}

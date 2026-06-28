@@ -361,4 +361,7 @@ class TorsionFlowNet(nn.Module):
         esm_lw = getattr(self.esm_adapter, "last_layer_weights", None)
         if esm_lw is not None:
             out["esm_layer_weights"] = esm_lw
+        esm_gates = getattr(self.esm_adapter, "last_layer_gates", None)
+        if esm_gates is not None:
+            out["esm_layer_gates"] = esm_gates
         return out
