@@ -214,7 +214,7 @@ class Stage2Trainer:
             raise ValueError(f"Unsupported stage1_prior_mode={config.stage1_prior_mode}")
         if config.esm_num_layers < 1:
             raise ValueError(f"esm_num_layers must be >= 1, got {config.esm_num_layers}")
-        allowed_esm_fusion_modes = {'sum', 'mean', 'softmax_weighted'}
+        allowed_esm_fusion_modes = {'sum', 'mean', 'softmax_weighted', 'gated_residual'}
         if config.esm_fusion_mode not in allowed_esm_fusion_modes:
             raise ValueError(f"Unsupported esm_fusion_mode={config.esm_fusion_mode}")
         if not 0.0 <= config.esm_layer_dropout < 1.0:
