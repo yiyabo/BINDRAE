@@ -62,10 +62,12 @@ def parse_args():
     parser.add_argument('--esm_num_layers', type=int, default=1,
                         help='Number of ESM layers expected when --esm_fusion_enabled is active')
     parser.add_argument('--esm_fusion_mode', type=str, default='sum',
-                        choices=['sum', 'mean', 'softmax_weighted'],
+                        choices=['sum', 'mean', 'softmax_weighted', 'gated_residual'],
                         help='How to fuse [B,N,K,D] ESM features')
     parser.add_argument('--esm_layer_dropout', type=float, default=0.0,
                         help='Dropout applied to learned ESM layer weights during training')
+    parser.add_argument('--esm_layer_entropy_weight', type=float, default=0.0,
+                        help='Entropy regularization weight for gated_residual ESM layer weights (penalizes uniform weights)')
 
     # Stage-1 prior
     parser.add_argument('--stage1_ckpt', type=str, default='checkpoints/stage1_best.pt',
@@ -239,6 +241,7 @@ def main():
         esm_num_layers=args.esm_num_layers,
         esm_fusion_mode=args.esm_fusion_mode,
         esm_layer_dropout=args.esm_layer_dropout,
+        esm_layer_entropy_weight=args.esm_layer_entropy_weight,
         stage1_ckpt=args.stage1_ckpt,
         use_stage1_prior=not args.no_stage1_prior,
         stage1_prior_mode=args.stage1_prior_mode,

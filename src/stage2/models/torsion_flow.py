@@ -241,7 +241,6 @@ class TorsionFlowNet(nn.Module):
         s = self.esm_adapter(esm)
         if prior_feature is not None and self.prior_residue_proj is not None:
             s = s + self.prior_residue_proj(prior_feature)
-
         # ligand conditioning (pre-IPA)
         s = self.ligand_conditioner(
             s,
@@ -358,10 +357,8 @@ class TorsionFlowNet(nn.Module):
             if return_repa:
                 out["repa_student"] = repa_student
             else:
-                # Keep the optional REPA head in the autograd graph for DDP
-                # runs where Stage-2 computes one loss from multiple model
-                # forwards. This zero-valued dependency does not change the
-                # velocity outputs, but prevents DDP from treating the head as
-                # unused on integration forwards.
                 out["d_chi"] = out["d_chi"] + repa_student.sum() * 0.0
+        esm_lw = getattr(self.esm_adapter, "last_layer_weights", None)
+        if esm_lw is not None:
+            out["esm_layer_weights"] = esm_lw
         return out

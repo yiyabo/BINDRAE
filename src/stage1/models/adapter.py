@@ -8,6 +8,8 @@ Author: BINDRAE Team
 Date: 2025-10-28
 """
 
+from typing import Optional
+
 import torch
 import torch.nn as nn
 
@@ -70,7 +72,16 @@ class ESMLayerFusionAdapter(nn.Module):
         - [B, N, K, esm_dim]: last-K ESM，先融合 K 层再投影。
     输出:
         - [B, N, output_dim]
+
+    Fusion modes:
+        - sum / mean / softmax_weighted: 先融合 K 层再统一投影
+        - gated_residual: 每层独立投影, last layer 作为 base,
+          earlier layers 作为 per-residue gated 残差补充.
+          ``last_layer_weights`` 属性暴露 softmax(layer_logits) 供外部
+          entropy 正则使用.
     """
+
+    _VALID_MODES = {"sum", "mean", "softmax_weighted", "gated_residual"}
 
     def __init__(
         self,
@@ -84,19 +95,42 @@ class ESMLayerFusionAdapter(nn.Module):
         super().__init__()
         if num_layers < 1:
             raise ValueError(f"num_layers must be >= 1, got {num_layers}")
-        if fusion_mode not in {"sum", "mean", "softmax_weighted"}:
+        if fusion_mode not in self._VALID_MODES:
             raise ValueError(f"Unsupported ESM fusion mode: {fusion_mode}")
         if not 0.0 <= layer_dropout < 1.0:
             raise ValueError(f"layer_dropout must be in [0, 1), got {layer_dropout}")
+        if fusion_mode == "gated_residual" and num_layers < 2:
+            raise ValueError(
+                "gated_residual fusion requires num_layers >= 2, "
+                f"got {num_layers}"
+            )
 
         self.esm_dim = esm_dim
         self.output_dim = output_dim
         self.num_layers = num_layers
         self.fusion_mode = fusion_mode
         self.layer_dropout = layer_dropout
-        self.layer_logits = nn.Parameter(torch.zeros(num_layers))
-        self.layer_dropout_module = nn.Dropout(layer_dropout)
-        self.adapter = ESMAdapter(esm_dim=esm_dim, output_dim=output_dim, dropout=dropout)
+
+        if fusion_mode == "gated_residual":
+            self.layer_projs = nn.ModuleList([
+                nn.Linear(esm_dim, output_dim) for _ in range(num_layers)
+            ])
+            n_earlier = num_layers - 1
+            self.gate_proj = nn.Linear(esm_dim, n_earlier)
+            # sigmoid(-3) ≈ 0.05 → start near single-layer behavior
+            nn.init.constant_(self.gate_proj.bias, -3.0)
+            self.layer_logits = nn.Parameter(torch.zeros(n_earlier))
+            self.last_layer_weights: Optional[torch.Tensor] = None
+            self.post_fusion = nn.Sequential(
+                nn.LayerNorm(output_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            )
+            self._ddp_marker = nn.Parameter(torch.zeros(1), requires_grad=False)
+        else:
+            self.layer_logits = nn.Parameter(torch.zeros(num_layers))
+            self.layer_dropout_module = nn.Dropout(layer_dropout)
+            self.adapter = ESMAdapter(esm_dim=esm_dim, output_dim=output_dim, dropout=dropout)
 
     def _layer_weights(self, *, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
         logits = self.layer_logits.to(device=device, dtype=dtype)
@@ -108,7 +142,45 @@ class ESMLayerFusionAdapter(nn.Module):
                 weights = dropped / denom
         return weights
 
+    def _forward_gated_residual(self, esm_features: torch.Tensor) -> torch.Tensor:
+        B, N, K, D = esm_features.shape
+        s_layers = [proj(esm_features[..., k, :]) for k, proj in enumerate(self.layer_projs)]
+        s_base = s_layers[-1]
+
+        n_earlier = K - 1
+        weights = torch.softmax(self.layer_logits, dim=0)
+        self.last_layer_weights = weights
+
+        ctx = esm_features[..., -1, :]
+        gates = torch.sigmoid(self.gate_proj(ctx))
+
+        residual = s_base.new_zeros(B, N, self.output_dim)
+        for k in range(n_earlier):
+            res_k = s_layers[k] - s_base
+            residual = residual + gates[..., k:k + 1] * weights[k] * res_k
+
+        fused = s_base + residual
+        return self.post_fusion(fused)
+
     def forward(self, esm_features: torch.Tensor) -> torch.Tensor:
+        if self.fusion_mode == "gated_residual":
+            if esm_features.ndim == 3:
+                raise ValueError(
+                    "gated_residual fusion requires [B, N, K, D] input, "
+                    f"got single-layer {tuple(esm_features.shape)}"
+                )
+            if esm_features.ndim != 4:
+                raise ValueError(
+                    f"ESMLayerFusionAdapter (gated_residual) expects [B, N, K, D], "
+                    f"got {tuple(esm_features.shape)}"
+                )
+            if esm_features.shape[-2] != self.num_layers:
+                raise ValueError(
+                    f"ESM layer count mismatch: input K={esm_features.shape[-2]} "
+                    f"but adapter num_layers={self.num_layers}"
+                )
+            return self._forward_gated_residual(esm_features)
+
         if esm_features.ndim == 3:
             if self.num_layers != 1:
                 raise ValueError(

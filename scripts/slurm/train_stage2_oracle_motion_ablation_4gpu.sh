@@ -61,6 +61,7 @@ ESM_FUSION_ENABLED="${ESM_FUSION_ENABLED:-0}"
 ESM_NUM_LAYERS="${ESM_NUM_LAYERS:-1}"
 ESM_FUSION_MODE="${ESM_FUSION_MODE:-sum}"
 ESM_LAYER_DROPOUT="${ESM_LAYER_DROPOUT:-0.0}"
+ESM_LAYER_ENTROPY_WEIGHT="${ESM_LAYER_ENTROPY_WEIGHT:-0.0}"
 REPA_ENABLED="${REPA_ENABLED:-0}"
 REPA_WEIGHT="${REPA_WEIGHT:-0.0}"
 REPA_DIM="${REPA_DIM:-128}"
@@ -105,9 +106,9 @@ if [[ "$ESM_FUSION_ENABLED" == "1" && "$ESM_NUM_LAYERS" -lt 1 ]]; then
   exit 1
 fi
 case "$ESM_FUSION_MODE" in
-  sum|mean|softmax_weighted) ;;
+  sum|mean|softmax_weighted|gated_residual) ;;
   *)
-    echo "ERROR: ESM_FUSION_MODE must be one of sum, mean, softmax_weighted"
+    echo "ERROR: ESM_FUSION_MODE must be one of sum, mean, softmax_weighted, gated_residual"
     exit 1
     ;;
 esac
@@ -450,6 +451,7 @@ if [[ "$ESM_FUSION_ENABLED" == "1" ]]; then
     --esm_num_layers "$ESM_NUM_LAYERS"
     --esm_fusion_mode "$ESM_FUSION_MODE"
     --esm_layer_dropout "$ESM_LAYER_DROPOUT"
+    --esm_layer_entropy_weight "$ESM_LAYER_ENTROPY_WEIGHT"
   )
 fi
 REPA_ARGS=()
@@ -492,6 +494,7 @@ echo "w_contact:       $W_CONTACT"
 echo "ESM fusion:      $ESM_FUSION_ENABLED"
 echo "ESM layers/mode: $ESM_NUM_LAYERS / $ESM_FUSION_MODE"
 echo "ESM layer drop:  $ESM_LAYER_DROPOUT"
+echo "ESM entropy wt:  $ESM_LAYER_ENTROPY_WEIGHT"
 echo "REPA enabled:    $REPA_ENABLED"
 echo "REPA weight:     $REPA_WEIGHT"
 echo "REPA dim/loss:   $REPA_DIM / $REPA_LOSS_TYPE"

@@ -1666,6 +1666,14 @@ class Stage2Trainer:
         )
         total = total_no_repa + self.config.repa_weight * L_repa.clamp(max=100.0)
 
+        L_esm_entropy = chi_ref.new_tensor(0.0)
+        if self.config.esm_layer_entropy_weight > 0.0:
+            esm_lw = out.get("esm_layer_weights")
+            if esm_lw is not None:
+                entropy = -(esm_lw * torch.log(esm_lw + 1e-8)).sum()
+                L_esm_entropy = self.config.esm_layer_entropy_weight * entropy
+                total = total + L_esm_entropy
+
         return {
             'total': total,
             'total_no_repa': total_no_repa,
@@ -1700,6 +1708,7 @@ class Stage2Trainer:
             'end_rigid_uw': L_end_rigid_uw,
             'end_chi_uw': L_end_chi_uw,
             'end': L_end,
+            'esm_entropy': L_esm_entropy,
         }
 
     def train_step(self, batch, *, accum_steps: int, should_step: bool) -> Dict[str, float]:
