@@ -23,7 +23,7 @@ unset LD_PRELOAD
 unset PROXYCHAINS_CONF_FILE
 unset PROXYCHAINS_QUIET_MODE
 
-ROOT=/mnt/inaisfs/data/home/zhaozc_criait/XinxiangWang/BINDRAE
+ROOT="${ROOT:-/mnt/inaisfs/data/home/zhaozc_criait/XinxiangWang/BINDRAE}"
 ENV_PREFIX=/mnt/inaisfs/data/home/zhaozc_criait/miniconda3/envs/BINDRAE
 
 export PATH=/data/soft/slurm/24.11.4/bin:$ENV_PREFIX/bin:$PATH
