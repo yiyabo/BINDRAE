@@ -24,7 +24,7 @@ So the fair comparison should be layered, not one-table-fits-all:
 |---|---|---|
 | A. Endpoint complex quality | Can the method recover a plausible holo complex? | AF3 / Boltz / Chai / FlowDock / NeuralPLexer / DynamicBind-style systems |
 | B. Apo-holo induced-fit quality | Does ligand-conditioned motion improve apo->holo active residues? | BINDRAE zero / shuffled / oracle-motion / cubic interpolation / NMA-like controls |
-| C. Trajectory reliability | Are intermediate frames usable, smooth, and low-clash? | BINDRAE learned path vs cubic SE(3)+chi interpolation; later short MD relaxation/stability |
+| C. Trajectory / ensemble recovery | Does the method generate or cover useful apo->holo paths and holo-like conformers? | BINDRAE learned path vs cubic SE(3)+chi interpolation, NMA/elastic paths, AlphaFlow/P2DFlow/EigenFold-style ensembles, and MD-lite panels |
 | D. Downstream utility | Do generated intermediates help docking, pocket exposure, or lead optimization? | redocking/enrichment into generated ensembles; MD-lite validation |
 
 The current strongest BINDRAE claim is not "we beat AF3 at endpoint complex prediction." It is:
@@ -64,13 +64,18 @@ For BINDRAE, these should be used as endpoint reference teachers, external basel
 
 ### 3. Protein Ensemble / Flow / Dynamics Generators
 
-These methods are relevant to the trajectory/ensemble side but often lack explicit ligand conditioning.
+These methods are relevant to the trajectory/ensemble side. Many lack explicit
+ligand conditioning; this is a meaningful baseline setting rather than a reason
+to exclude them. BINDRAE should be allowed to use the known ligand pose because
+that is the task definition. Ligand-agnostic methods should be evaluated on the
+same apo/holo systems to test whether ligand conditioning improves apo->holo path
+recovery beyond generic conformational dynamics.
 
 | Method | Typical input | Output | Dataset/benchmark habits | Common metrics | Relation to BINDRAE |
 |---|---|---|---|---|---|
-| **AlphaFlow** | sequence / AF-style representation | protein conformational ensembles | MD ensembles / structural ensemble benchmarks | ensemble coverage, RMSF/contact-map consistency, diversity, lDDT/TM-style structure metrics | Relevant for ensemble generation and flow matching, but usually not ligand-conditioned apo+pose->holo path. |
-| **P2DFlow** | protein structure/representation | SE(3) flow-based protein ensembles | ensemble/conformation benchmarks | coverage/diversity, RMSD/contact distribution metrics | Architecturally adjacent. Good related work, less direct as ligand-conditioned induced fit. |
-| **EigenFold / Str2Str-like models** | single protein structure or sequence | alternative conformations / structure-to-structure samples | apo/holo or ensemble benchmarks depending on paper | RMSD to alternative states, diversity, distribution coverage | Useful conceptual baselines for protein conformational change but not ligand-specific endpoint/path with a known ligand pose. |
+| **AlphaFlow** | sequence / AF-style representation | protein conformational ensembles | MD ensembles / structural ensemble benchmarks | ensemble coverage, RMSF/contact-map consistency, diversity, lDDT/TM-style structure metrics | Direct path/ensemble comparison for apo->holo coverage. It may not use ligand input; that input-setting difference should be reported, not used to avoid comparison. |
+| **P2DFlow** | protein structure/representation | SE(3) flow-based protein ensembles | ensemble/conformation benchmarks | coverage/diversity, RMSD/contact distribution metrics | Direct path/ensemble comparison for SE(3)-style conformational generation. Evaluate best-of-K holo coverage and path/geometry validity where outputs are ordered. |
+| **EigenFold / Str2Str-like models** | single protein structure or sequence | alternative conformations / structure-to-structure samples | apo/holo or ensemble benchmarks depending on paper | RMSD to alternative states, diversity, distribution coverage | Useful direct conformational-change baseline. Evaluate whether generated conformers recover holo-like pocket states without ligand conditioning. |
 | **MD / enhanced sampling** | all-atom system with force field | physical trajectories | system-specific MD, MISATO/DD-style trajectory datasets, cryptic-pocket studies | RMSD/RMSF, contact lifetimes, energy, clashes, pocket volume, transition/path CVs | Gold-standard-ish for physical plausibility, but expensive and not a supervised ML baseline at BINDRAE scale. Best used for post-hoc validation on selected systems. |
 
 ### 4. Classical / Cheap Controls
@@ -182,6 +187,12 @@ cubic_ref/path/peptide_loss
 cubic_ref/path/clash_penalty
 ```
 
+For unordered ensemble baselines, report best-of-K endpoint/contact coverage and
+validity metrics. For ordered paths or MD-like trajectories, additionally report
+smoothness and path-profile metrics. The same aligned ligand pose can be used at
+evaluation time to measure contact formation even when the baseline did not use
+the ligand as input.
+
 ### Ensemble / Downstream Metrics
 
 These are important for the eventual useful-for-drug-design story.
@@ -230,7 +241,24 @@ Run or cite carefully:
 
 For external baselines, compare only endpoint holo-like complex quality, pocket side-chain/contact recovery, protein clash/validity, and not time-ordered path reliability unless the method outputs a path.
 
-### Tier 3: Physics Validation
+### Tier 3: External Path / Ensemble Baselines
+
+Run or cite carefully:
+
+| Baseline | Use |
+|---|---|
+| AlphaFlow | sequence/AF-style ensemble baseline; compare best-of-K holo coverage and ensemble validity |
+| P2DFlow | SE(3) flow/conformation baseline; compare coverage/diversity and path validity if ordered outputs are available |
+| EigenFold / Str2Str-like models | single-structure conformational-change baseline; compare holo-like pocket recovery and ensemble coverage |
+| NMA / elastic sampling | cheap physics-inspired path/ensemble baseline; report path metrics and best-of-K endpoint coverage |
+| short MD / enhanced sampling | small-panel physical trajectory reference; report contact/path stability and runtime budget |
+
+For ligand-agnostic path/ensemble methods, state that they do not receive the
+ligand pose. This is a baseline limitation and a central part of the comparison:
+BINDRAE tests whether using the ligand as a condition improves apo->holo path
+recovery and ligand-contact formation.
+
+### Tier 4: Physics Validation
 
 Use on a smaller curated panel:
 
@@ -249,7 +277,7 @@ A paper-grade story should show all of the following:
 2. **Path is not fake interpolation**: learned path has much lower peptide/clash penalties than cubic endpoint interpolation.
 3. **Endpoint is useful**: final frames recover holo-like pocket contacts and side-chain geometry better than apo/zero controls.
 4. **Scale holds**: train4096 results replicate on train12000 or larger.
-5. **External context is fair**: endpoint numbers are compared against FlowDock/DynamicBind/AF3/Boltz/Chai-like baselines where possible, while path metrics are presented as BINDRAE-specific because competitors do not target explicit apo->holo trajectories.
+5. **External context is fair**: endpoint numbers are compared against FlowDock/DynamicBind/AF3/Boltz/Chai-like baselines where possible, while path/ensemble metrics are compared against AlphaFlow/P2DFlow/EigenFold/NMA/MD-style baselines with input-setting differences clearly stated.
 6. **Physics sanity holds**: selected generated frames survive minimization/short MD and retain plausible contacts.
 
 ## Novelty Assessment

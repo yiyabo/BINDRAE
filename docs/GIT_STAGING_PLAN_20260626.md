@@ -5,6 +5,50 @@ Date: 2026-06-26
 This plan splits the current dirty worktree into reviewable commits. It is a
 staging guide only; do not use `git add .` for this branch.
 
+## 2026-07-08 Update: Boundary/Endpoint Worktree Split
+
+The worktree now contains Stage-2 exact-endpoint boundary work, external path
+baselines, evaluator updates, documentation, and sampler/dataset reliability
+fixes. Keep these split. Do not fold all current dirty files into the older
+OracleMotion/ESM/REPA commit.
+
+Recommended current split:
+
+1. Stage-2 boundary and path-evaluator implementation:
+   - `src/stage2/training/config.py`
+   - `src/stage2/training/trainer.py`
+   - `scripts/train_stage2.py`
+   - `scripts/evaluate_stage2_transition_paths.py`
+   - `scripts/evaluate_stage2_trajectory_reliability.py`
+   - matching Stage-2 Slurm launchers
+2. External baseline implementation:
+   - `scripts/run_anm_baseline.py`
+   - `scripts/run_adaptive_anm_baseline.py`
+   - `scripts/run_ca_morph_baseline.py`
+   - `scripts/run_ebdims2_baseline.py`
+   - `scripts/evaluate_ebdims2_ca_paths.py`
+   - matching CPU Slurm launchers
+3. Documentation and experiment ledgers:
+   - `docs/STAGE2_ENDPOINT_BOUNDARY_STATUS_20260708.md`
+   - `docs/STAGE2_COMPARISON_METRICS_AND_BASELINES_20260701.md`
+   - `docs/PATH_BASELINE_LITERATURE_SCAN_20260630.md`
+   - `docs/BINDRAE_POSITIONING_AND_BENCHMARK_STRATEGY_20260629.md`
+   - `docs/CODEX_HANDOFF_FULLSCALE_20260630.md`
+   - `docs/INDEX.md`
+4. Dataset/sampler reliability and feature-cache fixes:
+   - `src/stage1/datasets/samplers.py`
+   - `src/stage2/datasets/dataset_stage2.py`
+   - `src/stage2/datasets/features.py`
+   - `scripts/export_oracle_motion_features.py`
+   - matching export Slurm launcher
+
+Current decision from the 2026-07-08 endpoint work:
+
+- keep free-flow as learned-path teacher / upper-bound evidence;
+- keep `pure_bridge` as the clean exact-endpoint baseline;
+- keep ligand-clearance and hard-negative clearance as negative ablations;
+- stop expanding clearance/anchor sweeps unless a new model target is defined.
+
 ## Commit 1: Local Hygiene And Agent Guides
 
 Purpose: keep local generated state out of git and make the active operating

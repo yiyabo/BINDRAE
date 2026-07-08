@@ -7,12 +7,22 @@ baseline and the first ESM last-K / REPA enhancement checks.
 
 ## Current Stable Baseline
 
-The stable Stage-2 starting point is:
+As of 2026-06-29, the strongest same-budget 12k/e10 candidate is:
 
 ```text
 OracleMotion conditioning
-+ ESM last-7 softmax fusion
++ ESM last-7 gated_residual fusion
++ gate_bias=-2.0
++ gate_context=none
 + no REPA
+```
+
+The previous ESM last-7 softmax baseline is now a historical control. It
+underperformed because the global layer weights stayed near uniform and diluted
+the last-layer ESM signal. The current gated-residual record is frozen in:
+
+```text
+docs/STAGE2_GATED_REPRESENTATION_EXPERIMENTS_20260629.md
 ```
 
 Known comparable baseline:
@@ -46,7 +56,7 @@ Proceed if:
 - target-shuffled REPA does not reproduce any matched gain.
 
 If matched REPA is neutral or harmful, keep full-scale training on the no-REPA
-last-K baseline and move REPA to a separate ablation branch.
+gated-residual baseline and move REPA to a separate ablation branch.
 
 ## DDP Graph Contract
 
@@ -92,9 +102,13 @@ Initial scale-up ladder:
 
 ```text
 train12000 / val512 / e10
-train24000 / val512 / e10
-full valid train cache / val512 / e10+
+train24000 / val2048 / e10
+full valid train cache / val2048+ / e10+
 ```
+
+The 512-sample validation lane is useful for fast screening, but it is too small
+for final selection when comparable candidates differ by approximately 0.01 in
+`val_total_no_repa`.
 
 Keep `save_dir` and `log_dir` unique. Do not overwrite the frozen OracleMotion
 baseline or the same-budget REPA comparison directories.
@@ -130,7 +144,8 @@ Minimum internal comparisons:
 - apo/static baseline.
 - cubic SE(3)+chi interpolation baseline.
 - OracleMotion direct upper-bound application.
-- Stage-2 no-REPA last-K baseline.
+- Stage-2 no-REPA single-ESM baseline.
+- Stage-2 no-REPA gated-residual baseline.
 - Stage-2 matched REPA, if validated.
 - Stage-2 target-shuffled REPA control.
 
@@ -152,7 +167,25 @@ Training:
 ```text
 scripts/train_stage2.py
 scripts/slurm/train_stage2_oracle_motion_ablation_4gpu.sh
+scripts/slurm/submit_stage2_24k_resumable.sh
 ```
+
+For the active 24k OracleMotion / ESM7 matrix, use the resumable submitter rather
+than retyping `sbatch --export` by hand:
+
+```bash
+scripts/slurm/submit_stage2_24k_resumable.sh single
+scripts/slurm/submit_stage2_24k_resumable.sh gm2
+scripts/slurm/submit_stage2_24k_resumable.sh gm15
+scripts/slurm/submit_stage2_24k_resumable.sh grm
+scripts/slurm/submit_stage2_24k_resumable.sh grs
+```
+
+Each variant pins `TAG`, `SAVE_DIR`, and `LOG_DIR` to the existing interrupted
+24k run directory and sets `AUTO_RESUME=1`. Re-submitting the same variant should
+continue from `checkpoints/stage2/<TAG>/last_checkpoint.pt` instead of starting a
+new timestamped run. Do not set `AUTO_RESUME=0` for long screening jobs unless a
+fresh-from-epoch-0 rerun is intentional.
 
 OracleMotion cache:
 
@@ -176,6 +209,7 @@ Before submission:
 ```bash
 python -m py_compile src/stage2/models/torsion_flow.py src/stage2/training/config.py src/stage2/training/trainer.py scripts/train_stage2.py
 bash -n scripts/slurm/train_stage2_oracle_motion_ablation_4gpu.sh
+bash -n scripts/slurm/submit_stage2_24k_resumable.sh
 ```
 
 After submission:
