@@ -44,7 +44,10 @@ def _load_manifest_paths(cache_dir: Optional[str], data_dir: Path) -> Dict[str, 
             manifest = json.load(f)
         for record in manifest.get("records", []):
             sample_id = record.get("sample_id")
-            path = record.get("path")
+            # Prefer portable manifest entries.  Some historical OracleMotion
+            # exports carried absolute paths from another checkout; using
+            # relative_path keeps the cache movable and avoids stale roots.
+            path = record.get("relative_path") or record.get("path")
             if not sample_id or not path:
                 continue
             p = Path(path)

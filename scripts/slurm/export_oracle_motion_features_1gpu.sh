@@ -57,6 +57,8 @@ DISTANCE_SCALE="${DISTANCE_SCALE:-5.0}"
 DEVICE="${DEVICE:-cuda}"
 SKIP_BAD_SAMPLES="${SKIP_BAD_SAMPLES:-0}"
 BAD_SAMPLES_OUT="${BAD_SAMPLES_OUT:-}"
+SHARD_ID="${SHARD_ID:-0}"
+NUM_SHARDS="${NUM_SHARDS:-1}"
 
 echo "=============================================="
 echo "BINDRAE OracleMotion-UB feature export"
@@ -73,6 +75,7 @@ echo "Max batches:        $MAX_BATCHES"
 echo "Max samples:        $MAX_SAMPLES"
 echo "Skip bad samples:   $SKIP_BAD_SAMPLES"
 echo "Bad samples out:    ${BAD_SAMPLES_OUT:-OFF}"
+echo "Shard:              $SHARD_ID / $NUM_SHARDS"
 echo "Contact dist/tau:   $CONTACT_DIST / $CONTACT_TAU"
 echo "Moving thresholds:  trans=$MOVING_TRANS_THRESHOLD rot=$MOVING_ROT_THRESHOLD chi_deg=$MOVING_CHI_THRESHOLD_DEG"
 echo "Scales:             translation=$TRANSLATION_SCALE distance=$DISTANCE_SCALE"
@@ -101,6 +104,8 @@ ARGS=(
   --moving_chi_threshold_deg "$MOVING_CHI_THRESHOLD_DEG"
   --translation_scale "$TRANSLATION_SCALE"
   --distance_scale "$DISTANCE_SCALE"
+  --shard_id "$SHARD_ID"
+  --num_shards "$NUM_SHARDS"
 )
 
 if [[ -n "$VALID_SAMPLES_FILE" ]]; then

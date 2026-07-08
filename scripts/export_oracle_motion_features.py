@@ -114,6 +114,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--bad_samples_out", default=None)
     parser.add_argument("--log_every", type=int, default=25)
+    parser.add_argument("--shard_id", type=int, default=0, help="0-indexed shard id for parallel export")
+    parser.add_argument("--num_shards", type=int, default=1, help="total number of shards for parallel export")
     return parser.parse_args()
 
 
@@ -551,6 +553,8 @@ def iter_batches_skip_bad(args: argparse.Namespace):
     bad_records = []
 
     for idx in range(len(dataset)):
+        if args.num_shards > 1 and idx % args.num_shards != args.shard_id:
+            continue
         sample_id = dataset.samples[idx].get("id", f"sample_{idx}")
         try:
             sample = dataset[idx]

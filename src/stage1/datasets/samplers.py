@@ -133,10 +133,11 @@ class DistributedLengthBatchSampler(Sampler[List[int]]):
                 rank_batches[replica].append(idx)
                 rank_costs[replica] += self.sample_costs[idx]
 
+            if any(len(batch) == 0 for batch in rank_batches):
+                continue
             if self.drop_last and any(len(batch) != self.batch_size for batch in rank_batches):
                 continue
-            if any(rank_batches):
-                batches.append(rank_batches)
+            batches.append(rank_batches)
 
         return batches
 
@@ -161,7 +162,7 @@ class DistributedLengthBatchSampler(Sampler[List[int]]):
                 rank_batches[replica].append(idx)
                 rank_costs[replica] = self.sample_costs[idx]
 
-            if self.drop_last and any(len(batch) == 0 for batch in rank_batches):
+            if any(len(batch) == 0 for batch in rank_batches):
                 break
 
             made_progress = True
@@ -195,7 +196,6 @@ class DistributedLengthBatchSampler(Sampler[List[int]]):
                     if all(len(batch) >= self.batch_size for batch in rank_batches):
                         break
 
-            if any(rank_batches):
-                batches.append(rank_batches)
+            batches.append(rank_batches)
 
         return batches

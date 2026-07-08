@@ -83,7 +83,8 @@ class ApoHoloBridgeDataset(Dataset):
                  stage1v2_posterior_cache_dir: Optional[str] = None,
                  stage1v2_posterior_feature_mode: str = "none",
                  stage1v2_posterior_feature_names: Optional[str] = None,
-                 esm_num_layers: int = 1):
+                 esm_num_layers: int = 1,
+                 trust_prechecked_samples: bool = False):
         self.data_dir = Path(data_dir)
         self.split = split
         self.max_lig_tokens = max_lig_tokens
@@ -95,18 +96,28 @@ class ApoHoloBridgeDataset(Dataset):
         self.stage1v2_posterior_feature_mode = str(stage1v2_posterior_feature_mode or "none")
         self.stage1v2_posterior_feature_names = _parse_feature_names(stage1v2_posterior_feature_names)
         self.stage1v2_posterior_cache_map = _load_manifest_paths(stage1v2_posterior_cache_dir, self.data_dir)
+        self.trust_prechecked_samples = bool(trust_prechecked_samples)
+        self._sample_lengths: Optional[List[int]] = None
 
         self.samples = self._load_index(index_file)
         
         # Filter by valid_samples_file if provided
         if valid_samples_file:
             self.samples = self._filter_by_valid_samples(valid_samples_file)
-        
-        # Filter out samples with missing required files
-        self.samples = self._filter_valid_samples()
 
-        if self.stage1v2_posterior_feature_mode in STAGE1V2_FILE_FEATURE_MODES:
-            self.samples = self._filter_stage1v2_posterior_samples()
+        if self.trust_prechecked_samples and not valid_samples_file:
+            raise ValueError("trust_prechecked_samples requires valid_samples_file")
+        
+        if self.trust_prechecked_samples:
+            print(
+                "  Trusting prechecked sample subset; skipping startup file/cache existence scans"
+            )
+        else:
+            # Filter out samples with missing required files
+            self.samples = self._filter_valid_samples()
+
+            if self.stage1v2_posterior_feature_mode in STAGE1V2_FILE_FEATURE_MODES:
+                self.samples = self._filter_stage1v2_posterior_samples()
         self.stage1v2_sample_shuffle_sources: Dict[int, int] = {}
         if self.stage1v2_posterior_feature_mode in SAMPLE_SHUFFLED_FEATURE_MODES:
             self.stage1v2_sample_shuffle_sources = self._build_same_length_shuffle_sources()
@@ -212,6 +223,21 @@ class ApoHoloBridgeDataset(Dataset):
             if "n_residues" not in data:
                 raise ValueError(f"{path} missing n_residues; cannot build strict sample-shuffled control")
             return _scalar_int(data["n_residues"])
+
+    def get_sample_lengths(self) -> List[int]:
+        """Return per-sample residue counts for length-aware batching."""
+        if self._sample_lengths is not None:
+            return self._sample_lengths
+        if not self.stage1v2_posterior_cache_dir:
+            raise ValueError(
+                "Length-aware Stage-2 batching requires a Stage-1-v2/oracle "
+                "feature cache with n_residues metadata"
+            )
+        self._sample_lengths = [
+            self._feature_cache_n_res(sample)
+            for sample in self.samples
+        ]
+        return self._sample_lengths
 
     def _build_same_length_shuffle_sources(self) -> Dict[int, int]:
         by_len: Dict[int, List[int]] = {}
@@ -522,6 +548,7 @@ def create_stage2_dataloader(data_dir: str,
                              batch_size: int = 2,
                              shuffle: bool = True,
                              num_workers: int = 0,
+                             prefetch_factor: int = 4,
                              valid_samples_file: Optional[str] = None,
                              **kwargs):
     from torch.utils.data import DataLoader
@@ -532,11 +559,16 @@ def create_stage2_dataloader(data_dir: str,
         valid_samples_file=valid_samples_file,
         **kwargs
     )
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        collate_fn=collate_stage2_batch,
-        pin_memory=True,
-    )
+    loader_kwargs = {
+        'batch_size': batch_size,
+        'shuffle': shuffle,
+        'num_workers': num_workers,
+        'collate_fn': collate_stage2_batch,
+        'pin_memory': True,
+    }
+    if num_workers > 0:
+        loader_kwargs.update(
+            persistent_workers=True,
+            prefetch_factor=prefetch_factor,
+        )
+    return DataLoader(dataset, **loader_kwargs)
