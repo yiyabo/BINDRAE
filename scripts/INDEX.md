@@ -13,6 +13,7 @@ to revive that lane.
 - `audit_stage1v2_posterior.py` - audits a trained Stage-1-v2 posterior checkpoint with threshold, ranking, calibration, and ligand-control metrics.
 - `export_stage1v2_posterior_cache.py` - exports per-sample Stage-1-v2 student posterior `.npz` caches for Stage-2 consumption.
 - `export_oracle_motion_features.py` - exports OracleMotion-UB apo-to-holo motion features and direct oracle-apply audits.
+- `export_stage2_teacher_residual_cache.py` - exports free-flow teacher residual targets for endpoint-preserving boundary-residual Stage-2 students.
 - `validate_triplets_data.py` - validates Stage-1 triplet datasets.
 - `audit_ligand_sensitive_dataset.py` - ligand-sensitive dataset audit.
 - `diagnose_stage1_prior.py` - Stage-1 diagnostic entrypoint.
@@ -25,6 +26,11 @@ to revive that lane.
 - `evaluate_stage2_trajectory_reliability.py` - internal trajectory reliability benchmark against cubic SE(3)+chi interpolation.
 - `evaluate_stage2_path_critic.py` - Stage-2 path critic/evaluator helper.
 - `generate_stage2_trajectories.py` - exports generated Stage-2 trajectory files for visualization.
+- `run_ca_morph_baseline.py` - simple static/linear/smoothstep CA path baselines.
+- `run_anm_baseline.py` - CA-ANM projection path baseline.
+- `run_adaptive_anm_baseline.py` - adaptive CA-ANM path baseline.
+- `run_ebdims2_baseline.py` - eBDIMS2 external endpoint-conditioned CA path baseline runner.
+- `evaluate_ebdims2_ca_paths.py` - common CA path evaluator for eBDIMS2, ANM, adaptive ANM, and CA morph baselines.
 
 ## Current Stage-2 Run Path
 

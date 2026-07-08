@@ -23,11 +23,18 @@ records, not templates.
 - `train_stage2_smoke.sh` - Stage-2 smoke.
 - `train_stage2_ddp.sh` - Stage-2 DDP training.
 - `export_oracle_motion_features_1gpu.sh` - OracleMotion-UB feature export and direct oracle-apply audit wrapper.
+- `export_stage2_teacher_residual_cache_1gpu.sh` - exports free-flow teacher residual targets for endpoint-preserving boundary-residual Stage-2 students.
 - `train_stage2_oracle_motion_smoke_1gpu.sh` - Stage-2 smoke with OracleMotion-UB matched/zero/shuffled controls.
 - `train_stage2_oracle_motion_ablation_4gpu.sh` - active Stage-2 OracleMotion / ESM last-K / REPA ablation launcher; legacy filename, defaults to 2xA100 on the current cluster and supports matched plus REPA-target-shuffled controls.
+- `submit_stage2_24k_resumable.sh` - fixed-tag submitter for the 24k OracleMotion / ESM7 / REPA matrix; reuses the interrupted run directories and keeps `AUTO_RESUME=1` so resubmission continues from `last_checkpoint.pt`.
 - `evaluate_stage2_transition_paths_1gpu.sh` - residue-level transition evaluator.
 - `evaluate_stage2_trajectory_reliability_1gpu.sh` - internal physical/contact trajectory reliability benchmark against cubic interpolation.
 - `generate_stage2_trajectories_1gpu.sh` - trajectory export wrapper for visualization.
+- `run_ca_morph_baseline_cpu.sh` - simple static/linear/smoothstep CA path baseline plus common CA evaluation.
+- `run_anm_baseline_cpu.sh` - CA-ANM projection baseline plus common CA evaluation.
+- `run_adaptive_anm_baseline_cpu.sh` - adaptive CA-ANM baseline plus common CA evaluation.
+- `run_ebdims2_baseline_cpu.sh` - eBDIMS2 external path baseline plus common CA evaluation.
+- `evaluate_ebdims2_ca_paths_cpu.sh` - evaluates already generated CA path baseline manifests.
 
 ## Full-Scale Submission Notes
 
