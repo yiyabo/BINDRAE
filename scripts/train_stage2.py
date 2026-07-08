@@ -33,10 +33,17 @@ def parse_args():
                         help='数据目录')
     parser.add_argument('--batch_size', type=int, default=2,
                         help='批大小')
+    parser.add_argument('--val_batch_size', type=int, default=None,
+                        help='Validation batch size; defaults to training batch size')
     parser.add_argument('--valid_samples_file', type=str, default=None,
                         help='训练样本筛选文件')
     parser.add_argument('--val_samples_file', type=str, default=None,
                         help='验证样本筛选文件')
+    parser.add_argument('--val_split', type=str, default='val',
+                        choices=['train', 'val', 'test'],
+                        help='Dataset split used for validation loader')
+    parser.add_argument('--trust_prechecked_samples', action='store_true',
+                        help='Skip startup file/cache existence scans when valid sample files were prechecked')
 
     # 训练
     parser.add_argument('--lr', type=float, default=1e-4,
@@ -49,12 +56,56 @@ def parse_args():
                         help='梯度累积步数')
     parser.add_argument('--num_workers', type=int, default=4,
                         help='DataLoader worker 数')
+    parser.add_argument('--prefetch_factor', type=int, default=4,
+                        help='DataLoader prefetch batches per worker when num_workers > 0')
     parser.add_argument('--warmup_steps', type=int, default=1000,
                         help='学习率 warmup 步数')
     parser.add_argument('--seed', type=int, default=42,
                         help='随机种子')
     parser.add_argument('--val_t', type=float, default=0.5,
                         help='Validation t value; set negative for random validation t')
+    parser.add_argument('--path_parameterization', type=str, default='flow',
+                        choices=['flow', 'boundary_residual_v1', 'boundary_residual', 'projected_flow'],
+                        help='Path construction used by geometry losses/evaluation')
+    parser.add_argument('--boundary_residual_envelope', type=str, default='sin2',
+                        choices=['sin2', 'poly'],
+                        help='Endpoint-zero envelope for boundary_residual paths')
+    parser.add_argument('--boundary_residual_scale', type=float, default=1.0,
+                        help='Scale applied to boundary_residual model outputs')
+    parser.add_argument('--terminal_projection_schedule', type=str, default='smootherstep',
+                        choices=['smoothstep', 'smootherstep', 'late_smoother', 'quadratic'],
+                        help='Correction schedule for projected_flow terminal projection')
+    parser.add_argument('--init_from_checkpoint', type=str, default=None,
+                        help='Warm-start model weights only; does not restore optimizer, scheduler, or epoch')
+    parser.add_argument('--teacher_residual_cache_dir', type=str, default=None,
+                        help='Optional cache of free-flow teacher residuals relative to the apo-holo bridge')
+    parser.add_argument('--w_teacher_residual', type=float, default=0.0,
+                        help='Loss weight for boundary-residual teacher-shape distillation')
+    parser.add_argument('--teacher_residual_loss_type', type=str, default='mse',
+                        choices=['mse', 'huber'],
+                        help='Loss type for teacher residual distillation')
+    parser.add_argument('--teacher_residual_huber_delta', type=float, default=1.0,
+                        help='Smooth-L1 beta for teacher residual Huber loss')
+    parser.add_argument('--teacher_residual_t_min', type=float, default=0.08,
+                        help='Earliest interior t supervised by teacher residual cache')
+    parser.add_argument('--teacher_residual_t_max', type=float, default=0.92,
+                        help='Latest interior t supervised by teacher residual cache')
+    parser.add_argument('--teacher_residual_mask_mode', type=str, default='motion_active_or_pocket',
+                        choices=[
+                            'node',
+                            'pocket',
+                            'motion_active',
+                            'motion_active_or_pocket',
+                            'clash_relief',
+                            'clash_relief_or_motion_active',
+                            'clash_relief_or_pocket',
+                        ],
+                        help='Residue mask used for teacher residual distillation')
+    parser.add_argument('--teacher_residual_clash_weight_threshold', type=float, default=1e-4,
+                        help='Minimum cached clash-relief weight for clash-relief teacher masks')
+    parser.add_argument('--teacher_residual_missing_policy', type=str, default='error',
+                        choices=['error', 'skip'],
+                        help='How to handle samples missing teacher residual cache files')
 
     # ESM representation adapter
     parser.add_argument('--esm_fusion_enabled', action='store_true',
@@ -172,6 +223,45 @@ def parse_args():
                         help='Shuffle only the REPA target while leaving Stage-2 conditioning features unchanged')
     parser.add_argument('--w_contact', type=float, default=0.1,
                         help='Stage-2 path contact loss 权重')
+    parser.add_argument('--w_fm_chi', type=float, default=1.0,
+                        help='CFM chi velocity loss weight')
+    parser.add_argument('--w_fm_rigid', type=float, default=1.0,
+                        help='CFM rigid velocity loss weight')
+    parser.add_argument('--w_bg', type=float, default=0.1,
+                        help='Background stability loss weight')
+    parser.add_argument('--w_smooth', type=float, default=0.05,
+                        help='Path smoothness loss weight')
+    parser.add_argument('--w_clash', type=float, default=0.1,
+                        help='Path clash loss weight')
+    parser.add_argument('--w_ligand_clearance', type=float, default=0.0,
+                        help='Path sidechain-ligand clearance loss weight')
+    parser.add_argument('--ligand_clearance_dist', type=float, default=2.2,
+                        help='Minimum sidechain-ligand distance encouraged along interior path')
+    parser.add_argument('--ligand_clearance_mask_mode', type=str, default='pocket',
+                        choices=['pocket', 'node', 'motion_active', 'pocket_or_motion_active'],
+                        help='Residues supervised by ligand clearance loss')
+    parser.add_argument('--ligand_clearance_loss_mode', type=str, default='all',
+                        choices=['all', 'hard_negative'],
+                        help='all averages clearance over the mask; hard_negative only supervises current clash residues')
+    parser.add_argument('--ligand_clearance_hard_negative_dist', type=float, default=2.2,
+                        help='Current path distance cutoff used to select hard-negative ligand clashes')
+    parser.add_argument('--ligand_clearance_t_min', type=float, default=0.05,
+                        help='Earliest path time supervised by ligand clearance loss')
+    parser.add_argument('--ligand_clearance_t_max', type=float, default=0.95,
+                        help='Latest path time supervised by ligand clearance loss')
+    parser.add_argument('--w_bridge_anchor', type=float, default=0.0,
+                        help='Weight for bridge-anchor regularization on non-clash path states')
+    parser.add_argument('--bridge_anchor_mask_mode', type=str, default='non_clash_node',
+                        choices=['non_clash_node', 'non_clash_pocket', 'node', 'pocket'],
+                        help='Residues regularized toward the analytic bridge')
+    parser.add_argument('--bridge_anchor_t_min', type=float, default=0.05,
+                        help='Earliest path time supervised by bridge-anchor regularization')
+    parser.add_argument('--bridge_anchor_t_max', type=float, default=0.95,
+                        help='Latest path time supervised by bridge-anchor regularization')
+    parser.add_argument('--w_pep', type=float, default=0.1,
+                        help='Peptide geometry loss weight')
+    parser.add_argument('--w_end', type=float, default=0.1,
+                        help='Endpoint loss weight')
     parser.add_argument('--contact_loss_mode', type=str, default='holo_target',
                         choices=['holo_target', 'monotonic_increase'],
                         help='Contact path loss: holo_target fits apo->holo contact trajectory; monotonic_increase is legacy')
@@ -208,6 +298,22 @@ def parse_args():
     # 分布式
     parser.add_argument('--distributed', action='store_true',
                         help='启用 DDP 分布式训练')
+    parser.add_argument('--length_bucketed_train', action='store_true',
+                        help='Use length-bucketed DDP train batches for variable-length proteins')
+    parser.add_argument('--length_bucket_multiplier', type=int, default=8,
+                        help='Bucket size multiplier for length-bucketed training batches')
+    parser.add_argument('--length_bucket_drop_last', dest='length_bucket_drop_last',
+                        action='store_true', default=True,
+                        help='Drop the last incomplete length-bucketed global batch')
+    parser.add_argument('--no_length_bucket_drop_last', dest='length_bucket_drop_last',
+                        action='store_false',
+                        help='Keep the last incomplete length-bucketed global batch')
+    parser.add_argument('--length_bucket_lengths_file', type=str, default=None,
+                        help='Optional TSV/CSV/whitespace file with sample_id and n_residues for length bucketing')
+    parser.add_argument('--length_bucket_residue_budget', type=int, default=None,
+                        help='Optional per-rank residue budget for length-bucketed variable batch packing')
+    parser.add_argument('--progress_log_every', type=int, default=100,
+                        help='Training progress log interval in batches; <=0 disables sparse batch logging')
 
     # Smoke-test / geometry control
     parser.add_argument('--n_integration_steps', type=int, default=5,
@@ -232,9 +338,13 @@ def main():
     config = TrainingConfig(
         data_dir=args.data_dir,
         batch_size=args.batch_size,
+        val_batch_size=args.val_batch_size,
         num_workers=args.num_workers,
+        prefetch_factor=args.prefetch_factor,
         valid_samples_file=args.valid_samples_file,
         val_samples_file=args.val_samples_file,
+        val_split=args.val_split,
+        trust_prechecked_samples=args.trust_prechecked_samples,
         lr=args.lr,
         max_epochs=args.max_epochs,
         grad_clip=args.grad_clip,
@@ -242,6 +352,20 @@ def main():
         warmup_steps=args.warmup_steps,
         seed=args.seed,
         val_t=args.val_t if args.val_t >= 0.0 else None,
+        path_parameterization=args.path_parameterization,
+        boundary_residual_envelope=args.boundary_residual_envelope,
+        boundary_residual_scale=args.boundary_residual_scale,
+        terminal_projection_schedule=args.terminal_projection_schedule,
+        init_from_checkpoint=args.init_from_checkpoint,
+        teacher_residual_cache_dir=args.teacher_residual_cache_dir,
+        w_teacher_residual=args.w_teacher_residual,
+        teacher_residual_loss_type=args.teacher_residual_loss_type,
+        teacher_residual_huber_delta=args.teacher_residual_huber_delta,
+        teacher_residual_t_min=args.teacher_residual_t_min,
+        teacher_residual_t_max=args.teacher_residual_t_max,
+        teacher_residual_mask_mode=args.teacher_residual_mask_mode,
+        teacher_residual_clash_weight_threshold=args.teacher_residual_clash_weight_threshold,
+        teacher_residual_missing_policy=args.teacher_residual_missing_policy,
         esm_fusion_enabled=args.esm_fusion_enabled,
         esm_num_layers=args.esm_num_layers,
         esm_fusion_mode=args.esm_fusion_mode,
@@ -286,7 +410,25 @@ def main():
         repa_mask_mode=args.repa_mask_mode,
         repa_target_mode=args.repa_target_mode,
         repa_target_shuffle_mode=args.repa_target_shuffle_mode,
+        w_fm_chi=args.w_fm_chi,
+        w_fm_rigid=args.w_fm_rigid,
+        w_bg=args.w_bg,
+        w_smooth=args.w_smooth,
+        w_clash=args.w_clash,
+        w_ligand_clearance=args.w_ligand_clearance,
+        ligand_clearance_dist=args.ligand_clearance_dist,
+        ligand_clearance_mask_mode=args.ligand_clearance_mask_mode,
+        ligand_clearance_loss_mode=args.ligand_clearance_loss_mode,
+        ligand_clearance_hard_negative_dist=args.ligand_clearance_hard_negative_dist,
+        ligand_clearance_t_min=args.ligand_clearance_t_min,
+        ligand_clearance_t_max=args.ligand_clearance_t_max,
+        w_bridge_anchor=args.w_bridge_anchor,
+        bridge_anchor_mask_mode=args.bridge_anchor_mask_mode,
+        bridge_anchor_t_min=args.bridge_anchor_t_min,
+        bridge_anchor_t_max=args.bridge_anchor_t_max,
+        w_pep=args.w_pep,
         w_contact=args.w_contact,
+        w_end=args.w_end,
         contact_loss_mode=args.contact_loss_mode,
         contact_eps=args.contact_eps,
         contact_direction_eps=args.contact_direction_eps,
@@ -308,6 +450,12 @@ def main():
         mixed_precision=not args.no_mixed_precision,
         amp_dtype=args.amp_dtype,
         distributed=args.distributed,
+        length_bucketed_train=args.length_bucketed_train,
+        length_bucket_multiplier=args.length_bucket_multiplier,
+        length_bucket_drop_last=args.length_bucket_drop_last,
+        length_bucket_lengths_file=args.length_bucket_lengths_file,
+        length_bucket_residue_budget=args.length_bucket_residue_budget,
+        progress_log_every=args.progress_log_every,
     )
 
     print(f"\n{'='*80}")
@@ -315,7 +463,10 @@ def main():
     print(f"{'='*80}")
     print("\n配置:")
     print(f"  - 数据目录: {config.data_dir}")
+    print(f"  - validation split: {config.val_split}")
+    print(f"  - trust prechecked samples: {config.trust_prechecked_samples}")
     print(f"  - 批大小: {config.batch_size}")
+    print(f"  - val 批大小: {config.val_batch_size or config.batch_size}")
     print(f"  - 学习率: {config.lr}")
     print(f"  - 最大轮数: {config.max_epochs}")
     print(f"  - ESM fusion enabled: {config.esm_fusion_enabled}")
@@ -369,6 +520,7 @@ def main():
     print(f"  - t_mid: {config.t_mid}")
     print(f"  - warmup_steps: {config.warmup_steps}")
     print(f"  - num_workers: {config.num_workers}")
+    print(f"  - prefetch_factor: {config.prefetch_factor}")
     print(f"  - n_integration_steps: {config.n_integration_steps}")
     print(f"  - integration_chi_clip: {config.integration_chi_clip}")
     print(f"  - integration_rot_clip: {config.integration_rot_clip}")
@@ -377,12 +529,34 @@ def main():
     print(f"  - geom_loss_every_n_steps: {config.geom_loss_every_n_steps}")
     print(f"  - seed: {config.seed}")
     print(f"  - val_t: {config.val_t}")
+    print(f"  - path_parameterization: {config.path_parameterization}")
+    print(f"  - boundary_residual_envelope: {config.boundary_residual_envelope}")
+    print(f"  - boundary_residual_scale: {config.boundary_residual_scale}")
+    print(f"  - terminal_projection_schedule: {config.terminal_projection_schedule}")
+    print(f"  - init_from_checkpoint: {config.init_from_checkpoint or 'OFF'}")
+    print(f"  - teacher_residual_cache_dir: {config.teacher_residual_cache_dir or 'OFF'}")
+    print(f"  - w_teacher_residual: {config.w_teacher_residual}")
+    print(f"  - teacher_residual_loss_type: {config.teacher_residual_loss_type}")
+    print(f"  - teacher_residual_huber_delta: {config.teacher_residual_huber_delta}")
+    print(f"  - teacher_residual_t_range: {config.teacher_residual_t_min}-{config.teacher_residual_t_max}")
+    print(f"  - teacher_residual_mask_mode: {config.teacher_residual_mask_mode}")
+    print(f"  - teacher_residual_clash_weight_threshold: {config.teacher_residual_clash_weight_threshold}")
+    print(f"  - teacher_residual_missing_policy: {config.teacher_residual_missing_policy}")
+    print(f"  - ligand_clearance: w={config.w_ligand_clearance} dist={config.ligand_clearance_dist} hard_dist={config.ligand_clearance_hard_negative_dist} mode={config.ligand_clearance_loss_mode} mask={config.ligand_clearance_mask_mode} t={config.ligand_clearance_t_min}-{config.ligand_clearance_t_max}")
+    print(f"  - bridge_anchor: w={config.w_bridge_anchor} mask={config.bridge_anchor_mask_mode} t={config.bridge_anchor_t_min}-{config.bridge_anchor_t_max}")
+    print(f"  - loss weights: fm_chi={config.w_fm_chi} fm_rigid={config.w_fm_rigid} bg={config.w_bg} smooth={config.w_smooth} clash={config.w_clash} ligand_clearance={config.w_ligand_clearance} bridge_anchor={config.w_bridge_anchor} pep={config.w_pep} end={config.w_end}")
     print(f"  - resume_from: {config.resume_from or 'OFF'}")
     print(f"  - auto_resume: {config.auto_resume}")
     print(f"  - NMA: {config.use_nma}")
     print(f"  - 设备: {config.device}")
     print(f"  - 混合精度: {config.mixed_precision}")
     print(f"  - AMP dtype: {config.amp_dtype}")
+    print(f"  - length_bucketed_train: {config.length_bucketed_train}")
+    print(f"  - length_bucket_multiplier: {config.length_bucket_multiplier}")
+    print(f"  - length_bucket_drop_last: {config.length_bucket_drop_last}")
+    print(f"  - length_bucket_lengths_file: {config.length_bucket_lengths_file or 'OFF'}")
+    print(f"  - length_bucket_residue_budget: {config.length_bucket_residue_budget or 'OFF'}")
+    print(f"  - progress_log_every: {config.progress_log_every}")
     print(f"\n{'='*80}\n")
 
     trainer = Stage2Trainer(config)

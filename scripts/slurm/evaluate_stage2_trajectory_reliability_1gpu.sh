@@ -17,7 +17,7 @@ unset LD_PRELOAD
 unset PROXYCHAINS_CONF_FILE
 unset PROXYCHAINS_QUIET_MODE
 
-ROOT=/mnt/inaisfs/data/home/zhaozc_criait/XinxiangWang/BINDRAE
+ROOT="${ROOT:-/mnt/inaisfs/data/home/zhaozc_criait/XinxiangWang/BINDRAE}"
 ENV_PREFIX=/mnt/inaisfs/data/home/zhaozc_criait/miniconda3/envs/BINDRAE
 
 export PATH=/data/soft/slurm/24.11.4/bin:$ENV_PREFIX/bin:$PATH
@@ -37,6 +37,7 @@ STAGE1V2_CACHE_DIR="${STAGE1V2_CACHE_DIR:-logs/stage2_oracle_motion/oracle_motio
 STAGE1V2_FEATURES="${STAGE1V2_FEATURES:-}"
 STAGE1V2_FEATURE_SCALE="${STAGE1V2_FEATURE_SCALE:-}"
 VALID_SAMPLES_FILE="${VALID_SAMPLES_FILE:-}"
+INDEX_FILE="${INDEX_FILE:-}"
 VAL_N="${VAL_N:-64}"
 SUBSET_SEED="${SUBSET_SEED:-20260623}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
@@ -46,9 +47,21 @@ N_INTEGRATION_STEPS="${N_INTEGRATION_STEPS:-12}"
 INTEGRATION_CHI_CLIP="${INTEGRATION_CHI_CLIP:-}"
 INTEGRATION_ROT_CLIP="${INTEGRATION_ROT_CLIP:-}"
 INTEGRATION_TRANS_CLIP="${INTEGRATION_TRANS_CLIP:-}"
+INCLUDE_BOUNDARY_RESIDUAL="${INCLUDE_BOUNDARY_RESIDUAL:-0}"
+INCLUDE_BOUNDARY_NATIVE="${INCLUDE_BOUNDARY_NATIVE:-0}"
+BOUNDARY_RESIDUAL_ENVELOPE="${BOUNDARY_RESIDUAL_ENVELOPE:-sin2}"
+BOUNDARY_RESIDUAL_SCALE="${BOUNDARY_RESIDUAL_SCALE:-1.0}"
 OUTPUT="${OUTPUT:-logs/stage2/trajectory_reliability/${TAG}.json}"
 
-if [[ -z "$VALID_SAMPLES_FILE" ]]; then
+case "$BOUNDARY_RESIDUAL_ENVELOPE" in
+  sin2|poly) ;;
+  *)
+    echo "ERROR: BOUNDARY_RESIDUAL_ENVELOPE must be sin2 or poly"
+    exit 1
+    ;;
+esac
+
+if [[ -z "$VALID_SAMPLES_FILE" && -z "$INDEX_FILE" ]]; then
   SUBSET_REL="ablation_subsets/stage2_traj_reliability_val_${VAL_N}_seed${SUBSET_SEED}.txt"
   SUBSET_PATH="processed_data/triplets/${SUBSET_REL}"
   python - <<PY
@@ -80,6 +93,7 @@ echo "Job ID:            ${SLURM_JOB_ID:-NA}"
 echo "Node:              ${SLURM_NODELIST:-NA}"
 echo "Checkpoint:        $CHECKPOINT"
 echo "Tag:               $TAG"
+echo "Index file:        ${INDEX_FILE:-split_default}"
 echo "Valid samples:     $VALID_SAMPLES_FILE"
 echo "Stage1v2 mode:     ${STAGE1V2_MODE:-checkpoint_default}"
 echo "Stage1v2 cache:    ${STAGE1V2_CACHE_DIR:-checkpoint_default}"
@@ -90,6 +104,10 @@ echo "Integration steps: $N_INTEGRATION_STEPS"
 echo "Chi clip:          ${INTEGRATION_CHI_CLIP:-checkpoint_default}"
 echo "Rot clip:          ${INTEGRATION_ROT_CLIP:-checkpoint_default}"
 echo "Trans clip:        ${INTEGRATION_TRANS_CLIP:-checkpoint_default}"
+echo "Boundary residual: $INCLUDE_BOUNDARY_RESIDUAL"
+echo "Boundary native:   $INCLUDE_BOUNDARY_NATIVE"
+echo "Boundary env:      $BOUNDARY_RESIDUAL_ENVELOPE"
+echo "Boundary scale:    $BOUNDARY_RESIDUAL_SCALE"
 echo "Output:            $OUTPUT"
 echo "Start:             $(date)"
 echo "=============================================="
@@ -98,7 +116,6 @@ ARGS=(
   --checkpoint "$CHECKPOINT"
   --data_dir processed_data/triplets
   --split val
-  --valid_samples_file "$VALID_SAMPLES_FILE"
   --batch_size "$BATCH_SIZE"
   --num_workers "$NUM_WORKERS"
   --n_integration_steps "$N_INTEGRATION_STEPS"
@@ -106,6 +123,12 @@ ARGS=(
   --output "$OUTPUT"
 )
 
+if [[ -n "$INDEX_FILE" ]]; then
+  ARGS+=(--index_file "$INDEX_FILE")
+fi
+if [[ -n "$VALID_SAMPLES_FILE" ]]; then
+  ARGS+=(--valid_samples_file "$VALID_SAMPLES_FILE")
+fi
 if [[ -n "$MAX_BATCHES" ]]; then
   ARGS+=(--max_batches "$MAX_BATCHES")
 fi
@@ -117,6 +140,16 @@ if [[ -n "$INTEGRATION_ROT_CLIP" ]]; then
 fi
 if [[ -n "$INTEGRATION_TRANS_CLIP" ]]; then
   ARGS+=(--integration_trans_clip "$INTEGRATION_TRANS_CLIP")
+fi
+if [[ "$INCLUDE_BOUNDARY_RESIDUAL" == "1" || "$INCLUDE_BOUNDARY_RESIDUAL" == "true" ]]; then
+  ARGS+=(--include_boundary_residual)
+fi
+if [[ "$INCLUDE_BOUNDARY_NATIVE" == "1" || "$INCLUDE_BOUNDARY_NATIVE" == "true" ]]; then
+  ARGS+=(
+    --include_boundary_native
+    --boundary_residual_envelope "$BOUNDARY_RESIDUAL_ENVELOPE"
+    --boundary_residual_scale "$BOUNDARY_RESIDUAL_SCALE"
+  )
 fi
 if [[ -n "$STAGE1V2_MODE" ]]; then
   ARGS+=(--stage1v2_posterior_feature_mode "$STAGE1V2_MODE")

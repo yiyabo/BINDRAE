@@ -9,9 +9,13 @@ class TrainingConfig:
     # Data
     data_dir: str = "data/apo_holo_triplets"
     batch_size: int = 2
+    val_batch_size: Optional[int] = None
     num_workers: int = 4
+    prefetch_factor: int = 4
     valid_samples_file: Optional[str] = None
     val_samples_file: Optional[str] = None
+    val_split: str = "val"
+    trust_prechecked_samples: bool = False
 
     # Training
     lr: float = 2e-5
@@ -102,6 +106,25 @@ class TrainingConfig:
 
     # Bridge / FM
     alpha: float = 1.5
+    path_parameterization: str = "flow"  # flow | boundary_residual_v1 | boundary_residual | projected_flow
+    boundary_residual_envelope: str = "sin2"  # sin2 | poly
+    boundary_residual_scale: float = 1.0
+    terminal_projection_schedule: str = "smootherstep"  # smoothstep | smootherstep | late_smoother | quadratic
+    init_from_checkpoint: Optional[str] = None
+
+    # Boundary-residual teacher distillation. The cache stores free-flow
+    # teacher residuals relative to the apo-holo bridge at interior times.
+    teacher_residual_cache_dir: Optional[str] = None
+    w_teacher_residual: float = 0.0
+    teacher_residual_loss_type: str = "mse"  # mse | huber
+    teacher_residual_huber_delta: float = 1.0
+    teacher_residual_t_min: float = 0.08
+    teacher_residual_t_max: float = 0.92
+    # node | pocket | motion_active | motion_active_or_pocket |
+    # clash_relief | clash_relief_or_motion_active | clash_relief_or_pocket
+    teacher_residual_mask_mode: str = "motion_active_or_pocket"
+    teacher_residual_clash_weight_threshold: float = 1e-4
+    teacher_residual_missing_policy: str = "error"  # error | skip
 
     # Loss weights
     w_fm_chi: float = 1.0
@@ -111,6 +134,17 @@ class TrainingConfig:
     w_end_fape: float = 0.1
     w_smooth: float = 0.05
     w_clash: float = 0.1
+    w_ligand_clearance: float = 0.0
+    ligand_clearance_dist: float = 2.2
+    ligand_clearance_mask_mode: str = "pocket"  # pocket | node | motion_active | pocket_or_motion_active
+    ligand_clearance_loss_mode: str = "all"  # all | hard_negative
+    ligand_clearance_hard_negative_dist: float = 2.2
+    ligand_clearance_t_min: float = 0.05
+    ligand_clearance_t_max: float = 0.95
+    w_bridge_anchor: float = 0.0
+    bridge_anchor_mask_mode: str = "non_clash_node"  # non_clash_node | non_clash_pocket | node | pocket
+    bridge_anchor_t_min: float = 0.05
+    bridge_anchor_t_max: float = 0.95
     w_pep: float = 0.1
     w_contact: float = 0.1
     w_prior: float = 0.1
@@ -148,6 +182,12 @@ class TrainingConfig:
     distributed: bool = False
     local_rank: int = -1
     grad_accum_steps: int = 1
+    length_bucketed_train: bool = False
+    length_bucket_multiplier: int = 8
+    length_bucket_drop_last: bool = True
+    length_bucket_lengths_file: Optional[str] = None
+    length_bucket_residue_budget: Optional[int] = None
+    progress_log_every: int = 100
 
     # Checkpoint resume (auto_resume reads save_dir/last_checkpoint.pt if present)
     resume_from: Optional[str] = None

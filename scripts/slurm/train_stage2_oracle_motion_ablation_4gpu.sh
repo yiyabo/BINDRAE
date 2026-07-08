@@ -52,11 +52,34 @@ SUBSET_SEED="${SUBSET_SEED:-20260623}"
 SUBSET_TAG="${SUBSET_TAG:-}"
 MAX_EPOCHS="${MAX_EPOCHS:-3}"
 BATCH_SIZE="${BATCH_SIZE:-2}"
-NUM_WORKERS="${NUM_WORKERS:-2}"
+VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-$BATCH_SIZE}"
+NUM_WORKERS="${NUM_WORKERS:-4}"
+PREFETCH_FACTOR="${PREFETCH_FACTOR:-4}"
+LENGTH_BUCKETED_TRAIN="${LENGTH_BUCKETED_TRAIN:-0}"
+LENGTH_BUCKET_MULTIPLIER="${LENGTH_BUCKET_MULTIPLIER:-8}"
+LENGTH_BUCKET_DROP_LAST="${LENGTH_BUCKET_DROP_LAST:-1}"
+LENGTH_BUCKET_LENGTHS_FILE="${LENGTH_BUCKET_LENGTHS_FILE:-}"
+LENGTH_BUCKET_RESIDUE_BUDGET="${LENGTH_BUCKET_RESIDUE_BUDGET:-}"
+PROGRESS_LOG_EVERY="${PROGRESS_LOG_EVERY:-100}"
 LR="${LR:-2e-5}"
 VAL_T="${VAL_T:-0.5}"
+VAL_SPLIT="${VAL_SPLIT:-val}"
 SEED="${SEED:-42}"
 AMP_DTYPE="${AMP_DTYPE:-bf16}"
+PATH_PARAMETERIZATION="${PATH_PARAMETERIZATION:-boundary_residual_v1}"
+BOUNDARY_RESIDUAL_ENVELOPE="${BOUNDARY_RESIDUAL_ENVELOPE:-sin2}"
+BOUNDARY_RESIDUAL_SCALE="${BOUNDARY_RESIDUAL_SCALE:-1.0}"
+TERMINAL_PROJECTION_SCHEDULE="${TERMINAL_PROJECTION_SCHEDULE:-smootherstep}"
+INIT_FROM_CHECKPOINT="${INIT_FROM_CHECKPOINT:-}"
+TEACHER_RESIDUAL_CACHE_DIR="${TEACHER_RESIDUAL_CACHE_DIR:-}"
+W_TEACHER_RESIDUAL="${W_TEACHER_RESIDUAL:-0.0}"
+TEACHER_RESIDUAL_LOSS_TYPE="${TEACHER_RESIDUAL_LOSS_TYPE:-mse}"
+TEACHER_RESIDUAL_HUBER_DELTA="${TEACHER_RESIDUAL_HUBER_DELTA:-1.0}"
+TEACHER_RESIDUAL_T_MIN="${TEACHER_RESIDUAL_T_MIN:-0.08}"
+TEACHER_RESIDUAL_T_MAX="${TEACHER_RESIDUAL_T_MAX:-0.92}"
+TEACHER_RESIDUAL_MASK_MODE="${TEACHER_RESIDUAL_MASK_MODE:-motion_active_or_pocket}"
+TEACHER_RESIDUAL_CLASH_WEIGHT_THRESHOLD="${TEACHER_RESIDUAL_CLASH_WEIGHT_THRESHOLD:-1e-4}"
+TEACHER_RESIDUAL_MISSING_POLICY="${TEACHER_RESIDUAL_MISSING_POLICY:-error}"
 ESM_FUSION_ENABLED="${ESM_FUSION_ENABLED:-0}"
 ESM_NUM_LAYERS="${ESM_NUM_LAYERS:-1}"
 ESM_FUSION_MODE="${ESM_FUSION_MODE:-sum}"
@@ -79,14 +102,34 @@ INTEGRATION_CHI_CLIP="${INTEGRATION_CHI_CLIP:-1.0}"
 INTEGRATION_ROT_CLIP="${INTEGRATION_ROT_CLIP:-0.1}"
 INTEGRATION_TRANS_CLIP="${INTEGRATION_TRANS_CLIP:-0.2}"
 N_GEOM_STEPS="${N_GEOM_STEPS:-4}"
+W_FM_CHI="${W_FM_CHI:-}"
+W_FM_RIGID="${W_FM_RIGID:-}"
+W_BG="${W_BG:-0.1}"
+W_SMOOTH="${W_SMOOTH:-0.05}"
+W_CLASH="${W_CLASH:-0.1}"
+W_LIGAND_CLEARANCE="${W_LIGAND_CLEARANCE:-0.0}"
+LIGAND_CLEARANCE_DIST="${LIGAND_CLEARANCE_DIST:-2.2}"
+LIGAND_CLEARANCE_MASK_MODE="${LIGAND_CLEARANCE_MASK_MODE:-pocket}"
+LIGAND_CLEARANCE_LOSS_MODE="${LIGAND_CLEARANCE_LOSS_MODE:-all}"
+LIGAND_CLEARANCE_HARD_NEGATIVE_DIST="${LIGAND_CLEARANCE_HARD_NEGATIVE_DIST:-2.2}"
+LIGAND_CLEARANCE_T_MIN="${LIGAND_CLEARANCE_T_MIN:-0.05}"
+LIGAND_CLEARANCE_T_MAX="${LIGAND_CLEARANCE_T_MAX:-0.95}"
+W_BRIDGE_ANCHOR="${W_BRIDGE_ANCHOR:-0.0}"
+BRIDGE_ANCHOR_MASK_MODE="${BRIDGE_ANCHOR_MASK_MODE:-non_clash_node}"
+BRIDGE_ANCHOR_T_MIN="${BRIDGE_ANCHOR_T_MIN:-0.05}"
+BRIDGE_ANCHOR_T_MAX="${BRIDGE_ANCHOR_T_MAX:-0.95}"
+W_PEP="${W_PEP:-0.1}"
 W_CONTACT="${W_CONTACT:-0.1}"
-TAG_SUFFIX="${TAG_SUFFIX:-omotion_${STAGE1V2_MODE}}"
+W_END="${W_END:-0.1}"
+TAG_SUFFIX="${TAG_SUFFIX:-omotion_${STAGE1V2_MODE}_${PATH_PARAMETERIZATION}}"
 PRECHECK_ONLY="${PRECHECK_ONLY:-0}"
 STRICT_CACHE_NPZ_PRECHECK="${STRICT_CACHE_NPZ_PRECHECK:-0}"
 AATYPE_PRECHECK="${AATYPE_PRECHECK:-1}"
 NODE_MASK_PRECHECK="${NODE_MASK_PRECHECK:-1}"
 USE_EXISTING_SUBSETS="${USE_EXISTING_SUBSETS:-0}"
+TRUST_PRECHECKED_SAMPLES="${TRUST_PRECHECKED_SAMPLES:-$USE_EXISTING_SUBSETS}"
 PRECHECK_WORKERS="${PRECHECK_WORKERS:-8}"
+GPU_MONITOR_INTERVAL="${GPU_MONITOR_INTERVAL:-30}"
 
 case "$STAGE1V2_MODE" in
   zero|oracle_motion|oracle_motion_residue_shuffled|oracle_motion_sample_shuffled) ;;
@@ -114,6 +157,138 @@ case "$ESM_FUSION_MODE" in
     exit 1
     ;;
 esac
+case "$PATH_PARAMETERIZATION" in
+  flow|boundary_residual_v1|boundary_residual|projected_flow) ;;
+  *)
+    echo "ERROR: PATH_PARAMETERIZATION must be flow, boundary_residual_v1, boundary_residual, or projected_flow"
+    exit 1
+    ;;
+esac
+if [[ -z "$W_FM_CHI" ]]; then
+  case "$PATH_PARAMETERIZATION" in
+    boundary_residual_v1|boundary_residual)
+      W_FM_CHI="0.1"
+      ;;
+    *)
+      W_FM_CHI="1.0"
+      ;;
+  esac
+fi
+if [[ -z "$W_FM_RIGID" ]]; then
+  case "$PATH_PARAMETERIZATION" in
+    boundary_residual_v1|boundary_residual)
+      W_FM_RIGID="0.1"
+      ;;
+    *)
+      W_FM_RIGID="1.0"
+      ;;
+  esac
+fi
+case "$BOUNDARY_RESIDUAL_ENVELOPE" in
+  sin2|poly) ;;
+  *)
+    echo "ERROR: BOUNDARY_RESIDUAL_ENVELOPE must be sin2 or poly"
+    exit 1
+    ;;
+esac
+case "$TEACHER_RESIDUAL_MASK_MODE" in
+  node|pocket|motion_active|motion_active_or_pocket|clash_relief|clash_relief_or_motion_active|clash_relief_or_pocket) ;;
+  *)
+    echo "ERROR: TEACHER_RESIDUAL_MASK_MODE must be node, pocket, motion_active, motion_active_or_pocket, clash_relief, clash_relief_or_motion_active, or clash_relief_or_pocket"
+    exit 1
+    ;;
+esac
+python - <<PY
+threshold = float("$TEACHER_RESIDUAL_CLASH_WEIGHT_THRESHOLD")
+if threshold < 0.0:
+    raise SystemExit("ERROR: TEACHER_RESIDUAL_CLASH_WEIGHT_THRESHOLD must be >= 0")
+PY
+case "$TEACHER_RESIDUAL_MISSING_POLICY" in
+  error|skip) ;;
+  *)
+    echo "ERROR: TEACHER_RESIDUAL_MISSING_POLICY must be error or skip"
+    exit 1
+    ;;
+esac
+case "$TEACHER_RESIDUAL_LOSS_TYPE" in
+  mse|huber) ;;
+  *)
+    echo "ERROR: TEACHER_RESIDUAL_LOSS_TYPE must be mse or huber"
+    exit 1
+    ;;
+esac
+python - <<PY
+delta = float("$TEACHER_RESIDUAL_HUBER_DELTA")
+if delta <= 0.0:
+    raise SystemExit("ERROR: TEACHER_RESIDUAL_HUBER_DELTA must be > 0")
+PY
+if python - <<PY
+import sys
+sys.exit(0 if float("$W_TEACHER_RESIDUAL") > 0.0 else 1)
+PY
+then
+  if [[ -z "$TEACHER_RESIDUAL_CACHE_DIR" ]]; then
+    echo "ERROR: W_TEACHER_RESIDUAL > 0 requires TEACHER_RESIDUAL_CACHE_DIR"
+    exit 1
+  fi
+  case "$PATH_PARAMETERIZATION" in
+    boundary_residual_v1|boundary_residual) ;;
+    *)
+      echo "ERROR: teacher residual distillation requires boundary_residual path mode"
+      exit 1
+      ;;
+  esac
+fi
+case "$TERMINAL_PROJECTION_SCHEDULE" in
+  smoothstep|smootherstep|late_smoother|quadratic) ;;
+  *)
+    echo "ERROR: TERMINAL_PROJECTION_SCHEDULE must be smoothstep, smootherstep, late_smoother, or quadratic"
+    exit 1
+    ;;
+esac
+case "$LIGAND_CLEARANCE_MASK_MODE" in
+  pocket|node|motion_active|pocket_or_motion_active) ;;
+  *)
+    echo "ERROR: LIGAND_CLEARANCE_MASK_MODE must be pocket, node, motion_active, or pocket_or_motion_active"
+    exit 1
+    ;;
+esac
+case "$LIGAND_CLEARANCE_LOSS_MODE" in
+  all|hard_negative) ;;
+  *)
+    echo "ERROR: LIGAND_CLEARANCE_LOSS_MODE must be all or hard_negative"
+    exit 1
+    ;;
+esac
+case "$BRIDGE_ANCHOR_MASK_MODE" in
+  non_clash_node|non_clash_pocket|node|pocket) ;;
+  *)
+    echo "ERROR: BRIDGE_ANCHOR_MASK_MODE must be non_clash_node, non_clash_pocket, node, or pocket"
+    exit 1
+    ;;
+esac
+python - <<PY
+w = float("$W_LIGAND_CLEARANCE")
+dist = float("$LIGAND_CLEARANCE_DIST")
+hard_dist = float("$LIGAND_CLEARANCE_HARD_NEGATIVE_DIST")
+t_min = float("$LIGAND_CLEARANCE_T_MIN")
+t_max = float("$LIGAND_CLEARANCE_T_MAX")
+anchor_w = float("$W_BRIDGE_ANCHOR")
+anchor_t_min = float("$BRIDGE_ANCHOR_T_MIN")
+anchor_t_max = float("$BRIDGE_ANCHOR_T_MAX")
+if w < 0.0:
+    raise SystemExit("ERROR: W_LIGAND_CLEARANCE must be >= 0")
+if dist <= 0.0:
+    raise SystemExit("ERROR: LIGAND_CLEARANCE_DIST must be > 0")
+if hard_dist <= 0.0:
+    raise SystemExit("ERROR: LIGAND_CLEARANCE_HARD_NEGATIVE_DIST must be > 0")
+if not (0.0 <= t_min < t_max <= 1.0):
+    raise SystemExit("ERROR: LIGAND_CLEARANCE_T_MIN/MAX must satisfy 0 <= min < max <= 1")
+if anchor_w < 0.0:
+    raise SystemExit("ERROR: W_BRIDGE_ANCHOR must be >= 0")
+if not (0.0 <= anchor_t_min < anchor_t_max <= 1.0):
+    raise SystemExit("ERROR: BRIDGE_ANCHOR_T_MIN/MAX must satisfy 0 <= min < max <= 1")
+PY
 case "$ESM_GATE_CONTEXT_MODE" in
   none|pocket_motion) ;;
   *)
@@ -163,6 +338,24 @@ case "$PRECHECK_ONLY" in
     exit 1
     ;;
 esac
+case "$LENGTH_BUCKETED_TRAIN" in
+  0|1) ;;
+  *)
+    echo "ERROR: LENGTH_BUCKETED_TRAIN must be 0 or 1"
+    exit 1
+    ;;
+esac
+case "$LENGTH_BUCKET_DROP_LAST" in
+  0|1) ;;
+  *)
+    echo "ERROR: LENGTH_BUCKET_DROP_LAST must be 0 or 1"
+    exit 1
+    ;;
+esac
+if [[ "$LENGTH_BUCKET_MULTIPLIER" -lt 1 ]]; then
+  echo "ERROR: LENGTH_BUCKET_MULTIPLIER must be >= 1"
+  exit 1
+fi
 case "$STRICT_CACHE_NPZ_PRECHECK" in
   0|1) ;;
   *)
@@ -188,6 +381,20 @@ case "$USE_EXISTING_SUBSETS" in
   0|1) ;;
   *)
     echo "ERROR: USE_EXISTING_SUBSETS must be 0 or 1"
+    exit 1
+    ;;
+esac
+case "$TRUST_PRECHECKED_SAMPLES" in
+  0|1) ;;
+  *)
+    echo "ERROR: TRUST_PRECHECKED_SAMPLES must be 0 or 1"
+    exit 1
+    ;;
+esac
+case "$VAL_SPLIT" in
+  train|val|test) ;;
+  *)
+    echo "ERROR: VAL_SPLIT must be one of train, val, test"
     exit 1
     ;;
 esac
@@ -442,6 +649,7 @@ if [[ "$PRECHECK_ONLY" == "1" ]]; then
   echo "Mode:         $STAGE1V2_MODE"
   echo "Train cache:  $STAGE1V2_TRAIN_CACHE_DIR"
   echo "Val cache:    $STAGE1V2_VAL_CACHE_DIR"
+  echo "Val split:    $VAL_SPLIT"
   echo "Train subset: $TRAIN_SUBSET"
   echo "Val subset:   $VAL_SUBSET"
   echo "TRAIN_N:      $TRAIN_N"
@@ -453,6 +661,22 @@ fi
 TAG="${TAG:-stage2_${TAG_SUFFIX}_train${TRAIN_N}_val${VAL_N}_e${MAX_EPOCHS}_bs${BATCH_SIZE}x${NPROC_PER_NODE}_$(date +%Y%m%d_%H%M%S)}"
 SAVE_DIR="${SAVE_DIR:-checkpoints/stage2/${TAG}}"
 LOG_DIR="${LOG_DIR:-logs/stage2/${TAG}}"
+mkdir -p "$LOG_DIR"
+GPU_MONITOR_PID=""
+if [[ "$GPU_MONITOR_INTERVAL" -gt 0 ]]; then
+  GPU_MONITOR_LOG="$LOG_DIR/gpu_util_${SLURM_JOB_ID:-manual}.csv"
+  nvidia-smi \
+    --query-gpu=timestamp,index,utilization.gpu,utilization.memory,memory.used,memory.total,power.draw \
+    --format=csv \
+    -l "$GPU_MONITOR_INTERVAL" > "$GPU_MONITOR_LOG" 2>/dev/null &
+  GPU_MONITOR_PID="$!"
+  cleanup_gpu_monitor() {
+    if [[ -n "$GPU_MONITOR_PID" ]]; then
+      kill "$GPU_MONITOR_PID" 2>/dev/null || true
+    fi
+  }
+  trap cleanup_gpu_monitor EXIT
+fi
 ESM_ARGS=()
 if [[ "$ESM_FUSION_ENABLED" == "1" ]]; then
   ESM_ARGS=(
@@ -481,8 +705,46 @@ RESUME_ARGS=()
 if [[ -n "$RESUME_FROM" ]]; then
   RESUME_ARGS+=(--resume_from "$RESUME_FROM")
 fi
+if [[ -n "$INIT_FROM_CHECKPOINT" ]]; then
+  RESUME_ARGS+=(--init_from_checkpoint "$INIT_FROM_CHECKPOINT")
+fi
 if [[ "$AUTO_RESUME" != "1" ]]; then
   RESUME_ARGS+=(--no_auto_resume)
+fi
+TEACHER_RESIDUAL_ARGS=(
+  --w_teacher_residual "$W_TEACHER_RESIDUAL"
+  --teacher_residual_loss_type "$TEACHER_RESIDUAL_LOSS_TYPE"
+  --teacher_residual_huber_delta "$TEACHER_RESIDUAL_HUBER_DELTA"
+  --teacher_residual_t_min "$TEACHER_RESIDUAL_T_MIN"
+  --teacher_residual_t_max "$TEACHER_RESIDUAL_T_MAX"
+  --teacher_residual_mask_mode "$TEACHER_RESIDUAL_MASK_MODE"
+  --teacher_residual_clash_weight_threshold "$TEACHER_RESIDUAL_CLASH_WEIGHT_THRESHOLD"
+  --teacher_residual_missing_policy "$TEACHER_RESIDUAL_MISSING_POLICY"
+)
+if [[ -n "$TEACHER_RESIDUAL_CACHE_DIR" ]]; then
+  TEACHER_RESIDUAL_ARGS+=(--teacher_residual_cache_dir "$TEACHER_RESIDUAL_CACHE_DIR")
+fi
+LENGTH_BUCKET_ARGS=()
+if [[ "$LENGTH_BUCKETED_TRAIN" == "1" ]]; then
+  LENGTH_BUCKET_ARGS=(
+    --length_bucketed_train
+    --length_bucket_multiplier "$LENGTH_BUCKET_MULTIPLIER"
+  )
+  if [[ "$LENGTH_BUCKET_DROP_LAST" == "1" ]]; then
+    LENGTH_BUCKET_ARGS+=(--length_bucket_drop_last)
+  else
+    LENGTH_BUCKET_ARGS+=(--no_length_bucket_drop_last)
+  fi
+  if [[ -n "$LENGTH_BUCKET_LENGTHS_FILE" ]]; then
+    LENGTH_BUCKET_ARGS+=(--length_bucket_lengths_file "$LENGTH_BUCKET_LENGTHS_FILE")
+  fi
+  if [[ -n "$LENGTH_BUCKET_RESIDUE_BUDGET" ]]; then
+    LENGTH_BUCKET_ARGS+=(--length_bucket_residue_budget "$LENGTH_BUCKET_RESIDUE_BUDGET")
+  fi
+fi
+DATASET_ARGS=()
+if [[ "$TRUST_PRECHECKED_SAMPLES" == "1" ]]; then
+  DATASET_ARGS+=(--trust_prechecked_samples)
 fi
 
 echo "=============================================="
@@ -498,10 +760,50 @@ echo "Train cache:     $STAGE1V2_TRAIN_CACHE_DIR"
 echo "Val cache:       $STAGE1V2_VAL_CACHE_DIR"
 echo "Train subset:    $TRAIN_SUBSET"
 echo "Val subset:      $VAL_SUBSET"
+echo "Val split:       $VAL_SPLIT"
+echo "Trust precheck:  $TRUST_PRECHECKED_SAMPLES"
 echo "max_epochs:      $MAX_EPOCHS"
 echo "batch/GPU:       $BATCH_SIZE"
+echo "val batch/GPU:   $VAL_BATCH_SIZE"
+echo "num_workers/GPU: $NUM_WORKERS"
+echo "prefetch factor: $PREFETCH_FACTOR"
+echo "length buckets:  $LENGTH_BUCKETED_TRAIN"
+echo "bucket mult:     $LENGTH_BUCKET_MULTIPLIER"
+echo "bucket drop_last:$LENGTH_BUCKET_DROP_LAST"
+echo "bucket lengths:  ${LENGTH_BUCKET_LENGTHS_FILE:-OFF}"
+echo "bucket res budget:${LENGTH_BUCKET_RESIDUE_BUDGET:-OFF}"
+echo "progress every:  $PROGRESS_LOG_EVERY"
 echo "lr:              $LR"
+echo "path param:      $PATH_PARAMETERIZATION"
+echo "boundary env:    $BOUNDARY_RESIDUAL_ENVELOPE"
+echo "boundary scale:  $BOUNDARY_RESIDUAL_SCALE"
+echo "projection sched:$TERMINAL_PROJECTION_SCHEDULE"
+echo "init ckpt:       ${INIT_FROM_CHECKPOINT:-OFF}"
+echo "teacher cache:   ${TEACHER_RESIDUAL_CACHE_DIR:-OFF}"
+echo "w_teacher_resid: $W_TEACHER_RESIDUAL"
+echo "teacher loss:    $TEACHER_RESIDUAL_LOSS_TYPE"
+echo "teacher huber d: $TEACHER_RESIDUAL_HUBER_DELTA"
+echo "teacher t range: $TEACHER_RESIDUAL_T_MIN-$TEACHER_RESIDUAL_T_MAX"
+echo "teacher mask:    $TEACHER_RESIDUAL_MASK_MODE"
+echo "teacher cw thr:  $TEACHER_RESIDUAL_CLASH_WEIGHT_THRESHOLD"
+echo "teacher missing: $TEACHER_RESIDUAL_MISSING_POLICY"
+echo "w_fm_chi:        $W_FM_CHI"
+echo "w_fm_rigid:      $W_FM_RIGID"
+echo "w_bg:            $W_BG"
+echo "w_smooth:        $W_SMOOTH"
+echo "w_clash:         $W_CLASH"
+echo "w_lig_clear:     $W_LIGAND_CLEARANCE"
+echo "lig clear dist:  $LIGAND_CLEARANCE_DIST"
+echo "lig hard dist:   $LIGAND_CLEARANCE_HARD_NEGATIVE_DIST"
+echo "lig clear mode:  $LIGAND_CLEARANCE_LOSS_MODE"
+echo "lig clear mask:  $LIGAND_CLEARANCE_MASK_MODE"
+echo "lig clear t:     $LIGAND_CLEARANCE_T_MIN-$LIGAND_CLEARANCE_T_MAX"
+echo "w_bridge_anchor: $W_BRIDGE_ANCHOR"
+echo "bridge mask:     $BRIDGE_ANCHOR_MASK_MODE"
+echo "bridge t:        $BRIDGE_ANCHOR_T_MIN-$BRIDGE_ANCHOR_T_MAX"
+echo "w_pep:           $W_PEP"
 echo "w_contact:       $W_CONTACT"
+echo "w_end:           $W_END"
 echo "ESM fusion:      $ESM_FUSION_ENABLED"
 echo "ESM layers/mode: $ESM_NUM_LAYERS / $ESM_FUSION_MODE"
 echo "ESM layer drop:  $ESM_LAYER_DROPOUT"
@@ -524,6 +826,7 @@ echo "trans clip:      $INTEGRATION_TRANS_CLIP"
 echo "geom steps:      $N_GEOM_STEPS"
 echo "Save dir:        $SAVE_DIR"
 echo "Log dir:         $LOG_DIR"
+echo "GPU monitor:     ${GPU_MONITOR_LOG:-OFF}"
 echo "Start:           $(date)"
 echo "=============================================="
 
@@ -533,7 +836,10 @@ python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA {torch.versio
 "$ENV_PREFIX/bin/torchrun" --standalone --nproc_per_node="$NPROC_PER_NODE" scripts/train_stage2.py \
   --data_dir processed_data/triplets \
   --batch_size "$BATCH_SIZE" \
+  --val_batch_size "$VAL_BATCH_SIZE" \
   --num_workers "$NUM_WORKERS" \
+  --prefetch_factor "$PREFETCH_FACTOR" \
+  --progress_log_every "$PROGRESS_LOG_EVERY" \
   --max_epochs "$MAX_EPOCHS" \
   --lr "$LR" \
   --grad_clip 0.3 \
@@ -541,6 +847,12 @@ python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA {torch.versio
   --warmup_steps 0 \
   --seed "$SEED" \
   --val_t "$VAL_T" \
+  --path_parameterization "$PATH_PARAMETERIZATION" \
+  --boundary_residual_envelope "$BOUNDARY_RESIDUAL_ENVELOPE" \
+  --boundary_residual_scale "$BOUNDARY_RESIDUAL_SCALE" \
+  --terminal_projection_schedule "$TERMINAL_PROJECTION_SCHEDULE" \
+  "${TEACHER_RESIDUAL_ARGS[@]}" \
+  --val_split "$VAL_SPLIT" \
   --no_stage1_prior \
   --w_prior 0.0 \
   --interaction_prior_feature_mode none \
@@ -554,7 +866,25 @@ python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA {torch.versio
   --stage1v2_loss_weight_alpha 0.0 \
   --w_stage1v2_guidance 0.0 \
   --contact_loss_mode holo_target \
+  --w_fm_chi "$W_FM_CHI" \
+  --w_fm_rigid "$W_FM_RIGID" \
+  --w_bg "$W_BG" \
+  --w_smooth "$W_SMOOTH" \
+  --w_clash "$W_CLASH" \
+  --w_ligand_clearance "$W_LIGAND_CLEARANCE" \
+  --ligand_clearance_dist "$LIGAND_CLEARANCE_DIST" \
+  --ligand_clearance_mask_mode "$LIGAND_CLEARANCE_MASK_MODE" \
+  --ligand_clearance_loss_mode "$LIGAND_CLEARANCE_LOSS_MODE" \
+  --ligand_clearance_hard_negative_dist "$LIGAND_CLEARANCE_HARD_NEGATIVE_DIST" \
+  --ligand_clearance_t_min "$LIGAND_CLEARANCE_T_MIN" \
+  --ligand_clearance_t_max "$LIGAND_CLEARANCE_T_MAX" \
+  --w_bridge_anchor "$W_BRIDGE_ANCHOR" \
+  --bridge_anchor_mask_mode "$BRIDGE_ANCHOR_MASK_MODE" \
+  --bridge_anchor_t_min "$BRIDGE_ANCHOR_T_MIN" \
+  --bridge_anchor_t_max "$BRIDGE_ANCHOR_T_MAX" \
+  --w_pep "$W_PEP" \
   --w_contact "$W_CONTACT" \
+  --w_end "$W_END" \
   --n_integration_steps "$N_INTEGRATION_STEPS" \
   --integration_chi_clip "$INTEGRATION_CHI_CLIP" \
   --integration_rot_clip "$INTEGRATION_ROT_CLIP" \
@@ -563,6 +893,8 @@ python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA {torch.versio
   --geom_loss_every_n_steps "$GEOM_EVERY" \
   --valid_samples_file "$TRAIN_SUBSET_REL" \
   --val_samples_file "$VAL_SUBSET_REL" \
+  "${DATASET_ARGS[@]}" \
+  "${LENGTH_BUCKET_ARGS[@]}" \
   "${ESM_ARGS[@]}" \
   "${REPA_ARGS[@]}" \
   "${RESUME_ARGS[@]}" \

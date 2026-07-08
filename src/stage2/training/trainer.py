@@ -5,7 +5,9 @@ import hashlib
 import json
 import math
 import os
+import re
 import sys
+import time
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +16,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+import numpy as np
 from torch.cuda.amp import autocast, GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
@@ -47,6 +50,7 @@ from src.stage1.models.interaction_prior import (
     min_sidechain_ligand_dist,
     sidechain_atom_mask,
 )
+from src.stage1.datasets.samplers import DistributedLengthBatchSampler
 from src.stage1.modules.losses import clash_penalty, fape_loss
 
 
@@ -58,9 +62,23 @@ class Stage2Trainer:
         'total_no_repa',
         'fm_chi',
         'fm_rigid',
+        'teacher_residual',
+        'teacher_residual_rigid',
+        'teacher_residual_chi',
+        'teacher_residual_target_norm',
+        'teacher_residual_pred_norm',
+        'teacher_residual_t_error',
+        'teacher_residual_weight_mean',
+        'teacher_residual_mask_frac',
         'bg',
         'smooth',
         'clash',
+        'ligand_clearance',
+        'ligand_clearance_active_frac',
+        'ligand_clearance_min_dist',
+        'bridge_anchor',
+        'bridge_anchor_mask_frac',
+        'bridge_anchor_residual_norm',
         'pep',
         'contact',
         'stage1v2_guidance',
@@ -190,6 +208,66 @@ class Stage2Trainer:
             else self.config.stage1v2_val_cache_dir
         )
 
+    def _load_length_bucket_costs(self) -> List[int]:
+        lengths_file = self.config.length_bucket_lengths_file
+        if not lengths_file:
+            return self.train_loader.dataset.get_sample_lengths()
+
+        path = Path(lengths_file)
+        if not path.is_absolute() and not path.exists():
+            path = Path(self.config.data_dir) / path
+        if not path.exists():
+            raise FileNotFoundError(f"length_bucket_lengths_file not found: {path}")
+
+        length_by_id: Dict[str, int] = {}
+        with open(path, 'r') as handle:
+            for line_no, line in enumerate(handle, start=1):
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                parts = line.replace(',', '\t').split()
+                if len(parts) < 2:
+                    continue
+                sample_id, value = parts[0], parts[1]
+                if line_no == 1 and sample_id.lower() in {'sample_id', 'id'}:
+                    continue
+                try:
+                    length_by_id[sample_id] = int(value)
+                except ValueError as exc:
+                    raise ValueError(f"{path}:{line_no} invalid n_residues={value!r}") from exc
+
+        lengths: List[int] = []
+        missing: List[str] = []
+        for idx, sample in enumerate(self.train_loader.dataset.samples):
+            sample_id = sample.get('id', f'sample_{idx}')
+            n_res = length_by_id.get(sample_id)
+            if n_res is None:
+                missing.append(sample_id)
+                if len(missing) >= 8:
+                    break
+            else:
+                lengths.append(n_res)
+        if missing:
+            raise ValueError(
+                f"{path} is missing training sample lengths; examples={missing}"
+            )
+        return lengths
+
+    @staticmethod
+    def _format_length_stats(lengths: List[int]) -> str:
+        if not lengths:
+            return "empty"
+        ordered = sorted(lengths)
+
+        def quantile(q: float) -> int:
+            pos = min(int(round(q * (len(ordered) - 1))), len(ordered) - 1)
+            return ordered[pos]
+
+        return (
+            f"min={ordered[0]} median={quantile(0.5)} "
+            f"p95={quantile(0.95)} p99={quantile(0.99)} max={ordered[-1]}"
+        )
+
     def __init__(self, config: TrainingConfig):
         self.config = config
         self.distributed = config.distributed
@@ -199,9 +277,8 @@ class Stage2Trainer:
 
         if self.distributed:
             os.environ.setdefault('NCCL_TIMEOUT', '1800000')
-            os.environ.setdefault('NCCL_BLOCKING_WAIT', '1')
-            os.environ.setdefault('NCCL_ASYNC_ERROR_HANDLING', '1')
             os.environ.setdefault('NCCL_DEBUG', 'WARN')
+            os.environ.setdefault('TORCH_NCCL_BLOCKING_WAIT', '1')
             os.environ.setdefault('TORCH_NCCL_ASYNC_ERROR_HANDLING', '1')
             dist.init_process_group(backend='nccl', timeout=datetime.timedelta(seconds=1800))
             self.local_rank = int(os.environ.get('LOCAL_RANK', 0))
@@ -283,6 +360,104 @@ class Stage2Trainer:
         allowed_contact_loss_modes = {'holo_target', 'monotonic_increase'}
         if config.contact_loss_mode not in allowed_contact_loss_modes:
             raise ValueError(f"Unsupported contact_loss_mode={config.contact_loss_mode}")
+        allowed_path_parameterizations = {
+            'flow', 'boundary_residual_v1', 'boundary_residual', 'projected_flow'
+        }
+        if config.path_parameterization not in allowed_path_parameterizations:
+            raise ValueError(f"Unsupported path_parameterization={config.path_parameterization}")
+        allowed_boundary_envelopes = {'sin2', 'poly'}
+        if config.boundary_residual_envelope not in allowed_boundary_envelopes:
+            raise ValueError(f"Unsupported boundary_residual_envelope={config.boundary_residual_envelope}")
+        allowed_teacher_residual_mask_modes = {
+            'node',
+            'pocket',
+            'motion_active',
+            'motion_active_or_pocket',
+            'clash_relief',
+            'clash_relief_or_motion_active',
+            'clash_relief_or_pocket',
+        }
+        if config.teacher_residual_mask_mode not in allowed_teacher_residual_mask_modes:
+            raise ValueError(
+                f"Unsupported teacher_residual_mask_mode={config.teacher_residual_mask_mode}"
+            )
+        if config.teacher_residual_clash_weight_threshold < 0.0:
+            raise ValueError("teacher_residual_clash_weight_threshold must be >= 0")
+        allowed_teacher_residual_missing = {'error', 'skip'}
+        if config.teacher_residual_missing_policy not in allowed_teacher_residual_missing:
+            raise ValueError(
+                "Unsupported teacher_residual_missing_policy="
+                f"{config.teacher_residual_missing_policy}"
+            )
+        if config.w_teacher_residual > 0.0 and not config.teacher_residual_cache_dir:
+            raise ValueError("w_teacher_residual > 0 requires teacher_residual_cache_dir")
+        if config.w_teacher_residual > 0.0 and config.path_parameterization not in {
+            'boundary_residual_v1', 'boundary_residual'
+        }:
+            raise ValueError("teacher residual distillation requires boundary_residual path mode")
+        allowed_teacher_residual_losses = {'mse', 'huber'}
+        if config.teacher_residual_loss_type not in allowed_teacher_residual_losses:
+            raise ValueError(
+                f"Unsupported teacher_residual_loss_type={config.teacher_residual_loss_type}"
+            )
+        if config.teacher_residual_huber_delta <= 0.0:
+            raise ValueError("teacher_residual_huber_delta must be > 0")
+        if not (0.0 <= config.teacher_residual_t_min < config.teacher_residual_t_max <= 1.0):
+            raise ValueError(
+                "teacher_residual_t_min/max must satisfy 0 <= min < max <= 1"
+            )
+        allowed_projection_schedules = {'smoothstep', 'smootherstep', 'late_smoother', 'quadratic'}
+        if config.terminal_projection_schedule not in allowed_projection_schedules:
+            raise ValueError(
+                f"Unsupported terminal_projection_schedule={config.terminal_projection_schedule}"
+            )
+        if config.n_integration_steps <= 0:
+            raise ValueError(f"n_integration_steps must be > 0, got {config.n_integration_steps}")
+        if config.n_geom_steps <= 0:
+            raise ValueError(f"n_geom_steps must be > 0, got {config.n_geom_steps}")
+        if config.geom_loss_every_n_steps <= 0:
+            raise ValueError(
+                f"geom_loss_every_n_steps must be > 0, got {config.geom_loss_every_n_steps}"
+            )
+        if config.ligand_clearance_dist <= 0.0:
+            raise ValueError("ligand_clearance_dist must be > 0")
+        if config.ligand_clearance_hard_negative_dist <= 0.0:
+            raise ValueError("ligand_clearance_hard_negative_dist must be > 0")
+        if not (0.0 <= config.ligand_clearance_t_min < config.ligand_clearance_t_max <= 1.0):
+            raise ValueError(
+                "ligand_clearance_t_min/max must satisfy 0 <= min < max <= 1"
+            )
+        allowed_clearance_loss_modes = {'all', 'hard_negative'}
+        if config.ligand_clearance_loss_mode not in allowed_clearance_loss_modes:
+            raise ValueError(
+                "Unsupported ligand_clearance_loss_mode="
+                f"{config.ligand_clearance_loss_mode}"
+            )
+        allowed_clearance_masks = {'pocket', 'node', 'motion_active', 'pocket_or_motion_active'}
+        if config.ligand_clearance_mask_mode not in allowed_clearance_masks:
+            raise ValueError(
+                "Unsupported ligand_clearance_mask_mode="
+                f"{config.ligand_clearance_mask_mode}"
+            )
+        if not (0.0 <= config.bridge_anchor_t_min < config.bridge_anchor_t_max <= 1.0):
+            raise ValueError(
+                "bridge_anchor_t_min/max must satisfy 0 <= min < max <= 1"
+            )
+        allowed_anchor_masks = {'non_clash_node', 'non_clash_pocket', 'node', 'pocket'}
+        if config.bridge_anchor_mask_mode not in allowed_anchor_masks:
+            raise ValueError(
+                "Unsupported bridge_anchor_mask_mode="
+                f"{config.bridge_anchor_mask_mode}"
+            )
+        if (
+            config.path_parameterization in {'boundary_residual_v1', 'boundary_residual'}
+            and config.geom_loss_every_n_steps > 1
+            and self.is_main_process
+        ):
+            print(
+                "WARNING: boundary_residual_v1 learns from path geometry/contact losses; "
+                "geom_loss_every_n_steps > 1 makes residual supervision sparse."
+            )
         if config.interaction_prior_feature_mode == 'prior' and not config.interaction_prior_ckpt:
             raise ValueError("interaction_prior_ckpt must be set when interaction_prior_feature_mode=prior")
         if config.w_interaction_prior > 0.0 and not config.interaction_prior_ckpt:
@@ -323,6 +498,16 @@ class Stage2Trainer:
             print("WARNING: repa_enabled=True but repa_weight <= 0; REPA head will train with zero weight")
         if config.repa_weight > 0.0 and not config.repa_enabled:
             raise ValueError("repa_weight > 0 requires repa_enabled=True")
+        if config.length_bucketed_train and not config.distributed:
+            raise ValueError("length_bucketed_train currently requires distributed=True")
+        if config.length_bucket_multiplier <= 0:
+            raise ValueError(
+                f"length_bucket_multiplier must be positive, got {config.length_bucket_multiplier}"
+            )
+        if config.prefetch_factor <= 0:
+            raise ValueError(
+                f"prefetch_factor must be positive, got {config.prefetch_factor}"
+            )
 
         # Model
         print("Creating Stage-2 model...")
@@ -350,6 +535,13 @@ class Stage2Trainer:
             repa_target_dim=self.repa_target_dim,
         )
         self.model = TorsionFlowNet(model_config).to(self.device)
+        resume_target_exists = bool(config.resume_from) or (
+            bool(config.auto_resume) and (Path(config.save_dir) / 'last_checkpoint.pt').is_file()
+        )
+        if config.init_from_checkpoint and not resume_target_exists:
+            self._init_model_from_checkpoint(config.init_from_checkpoint)
+        elif config.init_from_checkpoint and self.is_main_process:
+            print("[Init] Skipping init_from_checkpoint because this run will resume from its own checkpoint")
 
         # Stage-1 prior model
         self.stage1_model = None
@@ -384,26 +576,42 @@ class Stage2Trainer:
             batch_size=config.batch_size,
             shuffle=not self.distributed,
             num_workers=config.num_workers,
+            prefetch_factor=config.prefetch_factor,
             require_nma=config.use_nma,
             valid_samples_file=config.valid_samples_file,
             esm_num_layers=(config.esm_num_layers if config.esm_fusion_enabled else 1),
             stage1v2_posterior_cache_dir=train_stage1v2_dir,
             stage1v2_posterior_feature_mode=config.stage1v2_posterior_feature_mode,
             stage1v2_posterior_feature_names=config.stage1v2_posterior_feature_names,
+            trust_prechecked_samples=config.trust_prechecked_samples,
         )
         self.val_loader = create_stage2_dataloader(
             config.data_dir,
-            split='val',
-            batch_size=config.batch_size,
+            split=config.val_split,
+            batch_size=config.val_batch_size or config.batch_size,
             shuffle=False,
             num_workers=config.num_workers,
+            prefetch_factor=config.prefetch_factor,
             require_nma=config.use_nma,
             valid_samples_file=config.val_samples_file,
             esm_num_layers=(config.esm_num_layers if config.esm_fusion_enabled else 1),
             stage1v2_posterior_cache_dir=val_stage1v2_dir,
             stage1v2_posterior_feature_mode=config.stage1v2_posterior_feature_mode,
             stage1v2_posterior_feature_names=config.stage1v2_posterior_feature_names,
+            trust_prechecked_samples=config.trust_prechecked_samples,
         )
+        train_size = len(self.train_loader.dataset)
+        val_size = len(self.val_loader.dataset)
+        if train_size <= 0:
+            raise ValueError(
+                "Stage-2 train dataset is empty after filtering. "
+                f"valid_samples_file={config.valid_samples_file!r}"
+            )
+        if val_size <= 0:
+            raise ValueError(
+                "Stage-2 validation dataset is empty after filtering. "
+                f"val_split={config.val_split!r} val_samples_file={config.val_samples_file!r}"
+            )
 
         # Wrap model with DDP
         if self.distributed:
@@ -417,19 +625,94 @@ class Stage2Trainer:
                 # use the faster non-unused DDP path here.
                 find_unused_parameters=False,
             )
-            self.train_loader = torch.utils.data.DataLoader(
-                self.train_loader.dataset,
-                batch_size=config.batch_size,
-                shuffle=False,
-                num_workers=config.num_workers,
-                collate_fn=self.train_loader.collate_fn,
-                pin_memory=True,
-                sampler=DistributedSampler(
+            if config.length_bucketed_train:
+                lengths_obj = [None]
+                if self.local_rank == 0:
+                    lengths_obj[0] = self._load_length_bucket_costs()
+                dist.broadcast_object_list(lengths_obj, src=0)
+                sample_lengths = lengths_obj[0]
+                if sample_lengths is None:
+                    raise RuntimeError("Failed to broadcast Stage-2 sample lengths")
+                train_batch_sampler = DistributedLengthBatchSampler(
+                    sample_lengths,
+                    batch_size=config.batch_size,
+                    num_replicas=self.world_size,
+                    rank=self.local_rank,
+                    shuffle=True,
+                    drop_last=config.length_bucket_drop_last,
+                    seed=config.seed,
+                    bucket_size_multiplier=config.length_bucket_multiplier,
+                    residue_budget=config.length_bucket_residue_budget,
+                )
+                loader_kwargs = {
+                    'num_workers': config.num_workers,
+                    'collate_fn': self.train_loader.collate_fn,
+                    'pin_memory': True,
+                    'batch_sampler': train_batch_sampler,
+                }
+                if config.num_workers > 0:
+                    loader_kwargs.update(
+                        persistent_workers=True,
+                        prefetch_factor=config.prefetch_factor,
+                    )
+                self.train_loader = torch.utils.data.DataLoader(
+                    self.train_loader.dataset,
+                    **loader_kwargs,
+                )
+                if self.is_main_process:
+                    print(
+                        "[DDP] Length-bucketed train batches enabled: "
+                        f"bucket_multiplier={config.length_bucket_multiplier} "
+                        f"drop_last={config.length_bucket_drop_last} "
+                        f"residue_budget={config.length_bucket_residue_budget or 'OFF'} "
+                        f"lengths={self._format_length_stats(sample_lengths)}"
+                    )
+            else:
+                train_sampler = DistributedSampler(
                     self.train_loader.dataset,
                     num_replicas=self.world_size,
                     rank=self.local_rank,
                     shuffle=True,
-                ),
+                )
+                loader_kwargs = {
+                    'batch_size': config.batch_size,
+                    'shuffle': False,
+                    'num_workers': config.num_workers,
+                    'collate_fn': self.train_loader.collate_fn,
+                    'pin_memory': True,
+                    'sampler': train_sampler,
+                }
+                if config.num_workers > 0:
+                    loader_kwargs.update(
+                        persistent_workers=True,
+                        prefetch_factor=config.prefetch_factor,
+                    )
+                self.train_loader = torch.utils.data.DataLoader(
+                    self.train_loader.dataset,
+                    **loader_kwargs,
+                )
+            val_sampler = DistributedSampler(
+                self.val_loader.dataset,
+                num_replicas=self.world_size,
+                rank=self.local_rank,
+                shuffle=False,
+            )
+            loader_kwargs = {
+                'batch_size': config.val_batch_size or config.batch_size,
+                'shuffle': False,
+                'num_workers': config.num_workers,
+                'collate_fn': self.val_loader.collate_fn,
+                'pin_memory': True,
+                'sampler': val_sampler,
+            }
+            if config.num_workers > 0:
+                loader_kwargs.update(
+                    persistent_workers=True,
+                    prefetch_factor=config.prefetch_factor,
+                )
+            self.val_loader = torch.utils.data.DataLoader(
+                self.val_loader.dataset,
+                **loader_kwargs,
             )
             if self.is_main_process:
                 print(f"[DDP] Model wrapped with DistributedDataParallel")
@@ -513,6 +796,26 @@ class Stage2Trainer:
                     break
         if bad:
             raise FloatingPointError(f"Non-finite Stage-2 gradients: {bad}")
+
+    def _init_model_from_checkpoint(self, checkpoint_path: str) -> None:
+        path = Path(checkpoint_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"init_from_checkpoint='{checkpoint_path}' not found")
+        if self.is_main_process:
+            print(f"[Init] Loading model weights only from: {path}")
+        ckpt = torch.load(str(path), map_location=self.device, weights_only=False)
+        state = ckpt.get('model_state_dict') if isinstance(ckpt, dict) else None
+        if state is None:
+            raise ValueError(f"Checkpoint lacks model_state_dict: {path}")
+        result = self.model.load_state_dict(state, strict=False)
+        unexpected = list(result.unexpected_keys)
+        missing = list(result.missing_keys)
+        if unexpected or missing:
+            raise RuntimeError(
+                f"Warm-start state_dict mismatch unexpected={unexpected}, missing={missing}"
+            )
+        if self.is_main_process:
+            print("[Init] Model warm-start OK; optimizer/scheduler/epoch remain fresh")
 
     def _all_reduce_loss_sums(self, sums: Dict[str, float], count: int) -> Tuple[Dict[str, float], int]:
         if not self.distributed:
@@ -869,6 +1172,47 @@ class Stage2Trainer:
         loss = -torch.log(contact_prob.clamp(min=1e-6, max=1.0))
         return (loss * weights).sum() / denom
 
+    def _ligand_clearance_residue_mask(self, batch) -> torch.Tensor:
+        node = batch.node_mask.bool()
+        pocket = (batch.w_res > float(self.config.pocket_threshold)) & node
+        pocket_feature = self._stage1v2_feature_tensor(batch, 'pocket_mask', strict=False)
+        if pocket_feature is not None:
+            pocket = pocket | ((pocket_feature > 0.5) & node)
+
+        motion = torch.zeros_like(batch.w_res, dtype=torch.bool)
+        motion_feature = self._stage1v2_feature_tensor(batch, 'motion_active', strict=False)
+        if motion_feature is not None:
+            motion = (motion_feature > 0.5) & node
+
+        mode = self.config.ligand_clearance_mask_mode
+        if mode == 'node':
+            return node
+        if mode == 'pocket':
+            return pocket
+        if mode == 'motion_active':
+            return motion
+        if mode == 'pocket_or_motion_active':
+            return pocket | motion
+        raise ValueError(f"Unsupported ligand_clearance_mask_mode={mode}")
+
+    def _bridge_anchor_residue_mask(
+        self,
+        batch,
+        clearance_mask: torch.Tensor,
+        hard_negative_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        node = batch.node_mask.bool()
+        mode = self.config.bridge_anchor_mask_mode
+        if mode == 'node':
+            return node
+        if mode == 'pocket':
+            return clearance_mask & node
+        if mode == 'non_clash_pocket':
+            return clearance_mask & node & (~hard_negative_mask)
+        if mode == 'non_clash_node':
+            return node & (~hard_negative_mask)
+        raise ValueError(f"Unsupported bridge_anchor_mask_mode={mode}")
+
     def _repa_alignment_mask(self, batch) -> torch.Tensor:
         mode = self.config.repa_mask_mode
         node = batch.node_mask.bool()
@@ -1151,6 +1495,331 @@ class Stage2Trainer:
 
         return chi_ref, rigids_ref, d_chi_ref, d_rot_ref, d_trans_ref, rigids_apo, rigids_holo
 
+    def _interpolate_endpoints(
+        self,
+        batch,
+        rigids_apo: Rigid,
+        rigids_holo: Rigid,
+        t_value: float,
+    ) -> Tuple[Rigid, torch.Tensor]:
+        t_scalar = float(t_value)
+        gamma = 3.0 * t_scalar * t_scalar - 2.0 * t_scalar * t_scalar * t_scalar
+        chi0 = batch.torsion_apo[..., 3:7]
+        chi1 = batch.torsion_holo[..., 3:7]
+        chi_t = wrap_to_pi(chi0 + gamma * wrap_to_pi(chi1 - chi0))
+
+        R0, t0 = self._rigid_to_rt(rigids_apo)
+        R1, t1 = self._rigid_to_rt(rigids_holo)
+        R0_inv, t0_inv = rigid_inverse(R0, t0)
+        R_delta, t_delta = rigid_compose(R0_inv, t0_inv, R1, t1)
+        xi = se3_log(R_delta, t_delta)
+        R_inc, t_inc = se3_exp(xi * gamma)
+        R_t, trans_t = rigid_compose(R0, t0, R_inc, t_inc)
+        return self._rt_to_rigid(R_t, trans_t), chi_t
+
+    def _boundary_residual_envelope(self, t_value: float) -> float:
+        t_scalar = min(max(float(t_value), 0.0), 1.0)
+        if t_scalar <= 0.0 or t_scalar >= 1.0:
+            return 0.0
+        if self.config.boundary_residual_envelope == 'poly':
+            return 4.0 * t_scalar * (1.0 - t_scalar)
+        return math.sin(math.pi * t_scalar) ** 2
+
+    def _boundary_residual_envelope_tensor(self, t: torch.Tensor) -> torch.Tensor:
+        t_clamped = t.float().clamp(0.0, 1.0)
+        if self.config.boundary_residual_envelope == 'poly':
+            beta = 4.0 * t_clamped * (1.0 - t_clamped)
+        else:
+            beta = torch.sin(math.pi * t_clamped) ** 2
+        interior = (t_clamped > 0.0) & (t_clamped < 1.0)
+        return torch.where(interior, beta, torch.zeros_like(beta))
+
+    @staticmethod
+    def _safe_sample_id(sample_id: str) -> str:
+        return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(sample_id))
+
+    def _teacher_residual_cache_path(self, sample_id: str) -> Path:
+        if not self.config.teacher_residual_cache_dir:
+            raise RuntimeError("teacher_residual_cache_dir is not set")
+        return Path(self.config.teacher_residual_cache_dir) / f"{self._safe_sample_id(sample_id)}.npz"
+
+    def _load_teacher_residual_targets(
+        self,
+        batch,
+        t: torch.Tensor,
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        if not self.config.teacher_residual_cache_dir or self.config.w_teacher_residual <= 0.0:
+            return None
+
+        bsz, max_n = batch.node_mask.shape
+        target_rot = torch.zeros((bsz, max_n, 3), dtype=torch.float32)
+        target_trans = torch.zeros((bsz, max_n, 3), dtype=torch.float32)
+        target_chi = torch.zeros((bsz, max_n, 4), dtype=torch.float32)
+        target_mask = torch.zeros((bsz, max_n), dtype=torch.bool)
+        target_chi_mask = torch.zeros((bsz, max_n, 4), dtype=torch.bool)
+        target_motion_active = torch.zeros((bsz, max_n), dtype=torch.bool)
+        target_pocket = torch.zeros((bsz, max_n), dtype=torch.bool)
+        target_clash_relief_weight = torch.zeros((bsz, max_n), dtype=torch.float32)
+        t_error = torch.zeros((bsz,), dtype=torch.float32)
+        loaded = 0
+        loaded_clash_relief = 0
+        missing = []
+
+        t_cpu = t.detach().float().cpu().tolist()
+        for b, sample_id in enumerate(getattr(batch, "pdb_ids", [])):
+            n_res = int(batch.n_residues[b])
+            if not (
+                float(self.config.teacher_residual_t_min)
+                <= float(t_cpu[b])
+                <= float(self.config.teacher_residual_t_max)
+            ):
+                continue
+            path = self._teacher_residual_cache_path(str(sample_id))
+            if not path.is_file():
+                missing.append(str(path))
+                continue
+
+            with np.load(path, allow_pickle=False) as data:
+                cached_id = str(data["sample_id"].item()) if "sample_id" in data else str(sample_id)
+                if cached_id != str(sample_id):
+                    raise ValueError(f"{path} sample_id={cached_id!r}, expected {sample_id!r}")
+                cached_n = int(data["n_residues"].item()) if "n_residues" in data else n_res
+                if cached_n != n_res:
+                    raise ValueError(f"{path} n_residues={cached_n}, expected {n_res}")
+                t_values = np.asarray(data["t_values"], dtype=np.float32)
+                if t_values.ndim != 1 or t_values.size == 0:
+                    raise ValueError(f"{path} has invalid t_values")
+                idx = int(np.abs(t_values - float(t_cpu[b])).argmin())
+                target_rot[b, :n_res] = torch.from_numpy(np.asarray(data["residual_rot"][idx, :n_res]))
+                target_trans[b, :n_res] = torch.from_numpy(np.asarray(data["residual_trans"][idx, :n_res]))
+                target_chi[b, :n_res] = torch.from_numpy(np.asarray(data["residual_chi"][idx, :n_res]))
+                if "node_mask" in data:
+                    target_mask[b, :n_res] = torch.from_numpy(np.asarray(data["node_mask"][:n_res]).astype(bool))
+                else:
+                    target_mask[b, :n_res] = batch.node_mask[b, :n_res].detach().cpu()
+                if "chi_mask" in data:
+                    target_chi_mask[b, :n_res] = torch.from_numpy(
+                        np.asarray(data["chi_mask"][:n_res]).astype(bool)
+                    )
+                else:
+                    target_chi_mask[b, :n_res] = batch.chi_mask[b, :n_res].detach().cpu()
+                if "motion_active" in data:
+                    target_motion_active[b, :n_res] = torch.from_numpy(
+                        np.asarray(data["motion_active"][:n_res]).astype(bool)
+                    )
+                if "pocket_mask" in data:
+                    target_pocket[b, :n_res] = torch.from_numpy(
+                        np.asarray(data["pocket_mask"][:n_res]).astype(bool)
+                    )
+                else:
+                    target_pocket[b, :n_res] = (
+                        batch.w_res[b, :n_res].detach().cpu()
+                        > float(self.config.pocket_threshold)
+                    )
+                if "clash_relief_weight" in data:
+                    weight = np.asarray(data["clash_relief_weight"], dtype=np.float32)
+                    if weight.ndim != 2:
+                        raise ValueError(f"{path} clash_relief_weight must have shape [T, N]")
+                    target_clash_relief_weight[b, :n_res] = torch.from_numpy(
+                        np.nan_to_num(weight[idx, :n_res], nan=0.0, posinf=0.0, neginf=0.0)
+                    ).clamp(min=0.0)
+                    loaded_clash_relief += 1
+                t_error[b] = abs(float(t_values[idx]) - float(t_cpu[b]))
+                loaded += 1
+
+        if missing and self.config.teacher_residual_missing_policy == 'error':
+            shown = ", ".join(missing[:3])
+            extra = "" if len(missing) <= 3 else f" ... (+{len(missing) - 3})"
+            raise FileNotFoundError(f"Missing teacher residual cache: {shown}{extra}")
+        if loaded == 0:
+            return None
+
+        target_rot = target_rot.to(self.device)
+        target_trans = target_trans.to(self.device)
+        target_chi = target_chi.to(self.device)
+        target_mask = target_mask.to(self.device) & batch.node_mask.bool()
+        target_chi_mask = target_chi_mask.to(self.device) & batch.chi_mask.bool()
+        target_motion_active = target_motion_active.to(self.device)
+        target_pocket = target_pocket.to(self.device)
+        target_clash_relief_weight = target_clash_relief_weight.to(self.device).clamp(min=0.0)
+        if not target_motion_active.any():
+            residual_mag = (
+                torch.linalg.norm(target_rot, dim=-1)
+                + torch.linalg.norm(target_trans, dim=-1)
+                + (target_chi.abs() * target_chi_mask.float()).sum(dim=-1)
+            )
+            target_motion_active = residual_mag > 1e-4
+
+        mask_mode = self.config.teacher_residual_mask_mode
+        if mask_mode.startswith('clash_relief') and loaded_clash_relief != loaded:
+            raise ValueError(
+                "teacher_residual_mask_mode="
+                f"{mask_mode} requires v2 teacher residual cache with clash_relief_weight "
+                f"for every loaded sample, got {loaded_clash_relief}/{loaded}"
+            )
+        clash_relief = (
+            target_clash_relief_weight
+            > float(self.config.teacher_residual_clash_weight_threshold)
+        )
+        if mask_mode == 'node':
+            loss_mask = target_mask
+        elif mask_mode == 'pocket':
+            loss_mask = target_mask & target_pocket
+        elif mask_mode == 'motion_active':
+            loss_mask = target_mask & target_motion_active
+        elif mask_mode == 'motion_active_or_pocket':
+            loss_mask = target_mask & (target_motion_active | target_pocket)
+        elif mask_mode == 'clash_relief':
+            loss_mask = target_mask & clash_relief
+        elif mask_mode == 'clash_relief_or_motion_active':
+            loss_mask = target_mask & (clash_relief | target_motion_active)
+        else:
+            loss_mask = target_mask & (clash_relief | target_pocket)
+
+        base_weight = torch.ones_like(target_clash_relief_weight)
+        relief_weight = target_clash_relief_weight.clamp(min=0.0)
+        if mask_mode.startswith('clash_relief'):
+            teacher_weight = torch.where(
+                relief_weight > 0.0,
+                relief_weight,
+                base_weight,
+            )
+        else:
+            teacher_weight = base_weight
+        teacher_weight = teacher_weight * loss_mask.float()
+
+        return {
+            'rot': target_rot,
+            'trans': target_trans,
+            'chi': target_chi,
+            'mask': loss_mask,
+            'weight': teacher_weight,
+            'chi_mask': target_chi_mask & loss_mask.unsqueeze(-1),
+            't_error': t_error.to(self.device),
+        }
+
+    def boundary_residual_path(
+        self,
+        batch,
+        rigids_apo: Rigid,
+        rigids_holo: Rigid,
+        stage1_chi=None,
+        stage1_rigids=None,
+        stage1_chi_mask=None,
+        interaction_prior=None,
+        esm_gate_context=None,
+    ) -> Tuple[List[Rigid], List[torch.Tensor], List[float]]:
+        n_steps = self.config.n_integration_steps
+        rigids_list: List[Rigid] = []
+        chi_list: List[torch.Tensor] = []
+        t_list: List[float] = []
+        bsz = batch.esm.shape[0]
+        residual_scale = float(self.config.boundary_residual_scale)
+
+        for k in range(int(n_steps) + 1):
+            t_val = k / max(int(n_steps), 1)
+            interp_rigids, interp_chi = self._interpolate_endpoints(batch, rigids_apo, rigids_holo, t_val)
+            beta = self._boundary_residual_envelope(t_val)
+
+            if beta == 0.0:
+                rigids_list.append(interp_rigids)
+                chi_list.append(interp_chi)
+                t_list.append(t_val)
+                continue
+
+            t_tensor = torch.full((bsz,), t_val, device=self.device)
+            out = self._model_forward(
+                chi=interp_chi,
+                rigids=interp_rigids,
+                esm=batch.esm,
+                lig_points=batch.lig_points,
+                lig_types=batch.lig_types,
+                lig_mask=batch.lig_mask,
+                w_res=batch.w_res,
+                t=t_tensor,
+                node_mask=batch.node_mask,
+                nma_features=batch.nma_features,
+                stage1_chi=stage1_chi,
+                stage1_rigids=stage1_rigids,
+                stage1_chi_mask=stage1_chi_mask,
+                interaction_prior=interaction_prior,
+                esm_gate_context=esm_gate_context,
+                current_step=self.global_step,
+            )
+            d_chi = self._clip_velocity(out['d_chi'], self.config.integration_chi_clip)
+            d_rot = self._clip_velocity(out['d_rigid_rot'], self.config.integration_rot_clip)
+            d_trans = self._clip_velocity(out['d_rigid_trans'], self.config.integration_trans_clip)
+            residual_weight = beta * residual_scale
+
+            chi_t = wrap_to_pi(interp_chi + residual_weight * d_chi)
+            R_ref, t_ref = self._rigid_to_rt(interp_rigids)
+            R_res, t_res = se3_exp(torch.cat([d_rot, d_trans], dim=-1) * residual_weight)
+            R_t, trans_t = rigid_compose(R_ref, t_ref, R_res, t_res)
+            rigids_list.append(self._rt_to_rigid(R_t, trans_t))
+            chi_list.append(chi_t)
+            t_list.append(t_val)
+
+        return rigids_list, chi_list, t_list
+
+    def _terminal_projection_weight(self, t_value: float) -> float:
+        t_scalar = min(max(float(t_value), 0.0), 1.0)
+        if self.config.terminal_projection_schedule == 'quadratic':
+            return t_scalar * t_scalar
+        if self.config.terminal_projection_schedule == 'smoothstep':
+            return 3.0 * t_scalar * t_scalar - 2.0 * t_scalar * t_scalar * t_scalar
+        if self.config.terminal_projection_schedule == 'late_smoother':
+            late_t = t_scalar**3
+            return (
+                10.0 * late_t**3
+                - 15.0 * late_t**4
+                + 6.0 * late_t**5
+            )
+        return (
+            10.0 * t_scalar**3
+            - 15.0 * t_scalar**4
+            + 6.0 * t_scalar**5
+        )
+
+    def project_terminal_path(
+        self,
+        rigids_list: List[Rigid],
+        chi_list: List[torch.Tensor],
+        t_list: List[float],
+        rigids_holo: Rigid,
+        chi_holo: torch.Tensor,
+    ) -> Tuple[List[Rigid], List[torch.Tensor], List[float]]:
+        """Project a free path onto the holo endpoint with a smooth SE(3)/chi correction."""
+        if not rigids_list or not chi_list or len(rigids_list) != len(chi_list):
+            raise ValueError("terminal projection requires matching non-empty rigid/chi paths")
+
+        final_R, final_t = self._rigid_to_rt(rigids_list[-1])
+        holo_R, holo_t = self._rigid_to_rt(rigids_holo)
+        final_R_inv, final_t_inv = rigid_inverse(final_R, final_t)
+        delta_R, delta_t = rigid_compose(final_R_inv, final_t_inv, holo_R, holo_t)
+        delta_xi = se3_log(delta_R, delta_t)
+        delta_chi = wrap_to_pi(chi_holo - chi_list[-1])
+
+        projected_rigids: List[Rigid] = []
+        projected_chi: List[torch.Tensor] = []
+        for rigids_t, chi_t, t_value in zip(rigids_list, chi_list, t_list):
+            weight = self._terminal_projection_weight(float(t_value))
+            if weight <= 0.0:
+                projected_rigids.append(rigids_t)
+                projected_chi.append(chi_t)
+                continue
+            if weight >= 1.0:
+                projected_rigids.append(rigids_holo)
+                projected_chi.append(chi_holo)
+                continue
+
+            R_t, trans_t = self._rigid_to_rt(rigids_t)
+            R_corr, t_corr = se3_exp(delta_xi * weight)
+            R_proj, trans_proj = rigid_compose(R_t, trans_t, R_corr, t_corr)
+            projected_rigids.append(self._rt_to_rigid(R_proj, trans_proj))
+            projected_chi.append(wrap_to_pi(chi_t + weight * delta_chi))
+
+        return projected_rigids, projected_chi, list(t_list)
+
     def integrate_path(self,
                        batch,
                        rigids0: Rigid,
@@ -1330,15 +1999,114 @@ class Stage2Trainer:
         d_rot_pred = out['d_rigid_rot']
         d_trans_pred = out['d_rigid_trans']
 
-        # FM loss
+        boundary_residual_mode = self.config.path_parameterization in {
+            'boundary_residual_v1', 'boundary_residual'
+        }
+
+        # FM loss for free-flow modes. In boundary_residual_v1 the same logged
+        # keys are residual regularizers: the model output is an endpoint-zero
+        # displacement around the analytic apo-holo bridge, not a bridge
+        # velocity target.
         chi_mask = batch.chi_mask.float()
-        fm_chi = ((d_chi_pred - d_chi_ref) ** 2) * loss_w.unsqueeze(-1) * chi_mask
+        if boundary_residual_mode:
+            chi_target = torch.zeros_like(d_chi_pred)
+            rot_target = torch.zeros_like(d_rot_pred)
+            trans_target = torch.zeros_like(d_trans_pred)
+        else:
+            chi_target = d_chi_ref
+            rot_target = d_rot_ref
+            trans_target = d_trans_ref
+
+        fm_chi = ((d_chi_pred - chi_target) ** 2) * loss_w.unsqueeze(-1) * chi_mask
         fm_chi_denom = (chi_mask * loss_w.unsqueeze(-1)).sum().clamp(min=1e-8)
         L_fm_chi = fm_chi.sum() / fm_chi_denom
 
-        fm_rot = ((d_rot_pred - d_rot_ref) ** 2) * loss_w.unsqueeze(-1)
-        fm_trans = ((d_trans_pred - d_trans_ref) ** 2) * loss_w.unsqueeze(-1)
+        fm_rot = ((d_rot_pred - rot_target) ** 2) * loss_w.unsqueeze(-1)
+        fm_trans = ((d_trans_pred - trans_target) ** 2) * loss_w.unsqueeze(-1)
         L_fm_rigid = (fm_rot.sum() + fm_trans.sum()) / (loss_w.sum() + 1e-8)
+
+        L_teacher_residual = chi_ref.new_tensor(0.0)
+        L_teacher_residual_rigid = chi_ref.new_tensor(0.0)
+        L_teacher_residual_chi = chi_ref.new_tensor(0.0)
+        teacher_residual_target_norm = chi_ref.new_tensor(0.0)
+        teacher_residual_pred_norm = chi_ref.new_tensor(0.0)
+        teacher_residual_t_error = chi_ref.new_tensor(0.0)
+        teacher_residual_weight_mean = chi_ref.new_tensor(0.0)
+        teacher_residual_mask_frac = chi_ref.new_tensor(0.0)
+        if boundary_residual_mode and self.config.w_teacher_residual > 0.0:
+            teacher_targets = self._load_teacher_residual_targets(batch, t)
+            if teacher_targets is not None:
+                beta = self._boundary_residual_envelope_tensor(t).view(-1, 1, 1)
+                residual_scale = beta * float(self.config.boundary_residual_scale)
+                pred_rot_residual = d_rot_pred.float() * residual_scale
+                pred_trans_residual = d_trans_pred.float() * residual_scale
+                pred_chi_residual = d_chi_pred.float() * residual_scale
+                target_rot = teacher_targets['rot'].float()
+                target_trans = teacher_targets['trans'].float()
+                target_chi = teacher_targets['chi'].float()
+                teacher_mask = teacher_targets['mask'].float()
+                teacher_weight = teacher_targets['weight'].float()
+                teacher_chi_mask = teacher_targets['chi_mask'].float()
+                rigid_denom = teacher_weight.sum().clamp(min=1.0)
+                if self.config.teacher_residual_loss_type == 'huber':
+                    beta = float(self.config.teacher_residual_huber_delta)
+                    rot_loss = F.smooth_l1_loss(
+                        pred_rot_residual,
+                        target_rot,
+                        reduction='none',
+                        beta=beta,
+                    ).sum(dim=-1)
+                    trans_loss = F.smooth_l1_loss(
+                        pred_trans_residual,
+                        target_trans,
+                        reduction='none',
+                        beta=beta,
+                    ).sum(dim=-1)
+                    chi_delta = wrap_to_pi(pred_chi_residual - target_chi)
+                    chi_loss = F.smooth_l1_loss(
+                        chi_delta,
+                        torch.zeros_like(chi_delta),
+                        reduction='none',
+                        beta=beta,
+                    )
+                else:
+                    rot_loss = ((pred_rot_residual - target_rot) ** 2).sum(dim=-1)
+                    trans_loss = ((pred_trans_residual - target_trans) ** 2).sum(dim=-1)
+                    chi_loss = wrap_to_pi(pred_chi_residual - target_chi) ** 2
+
+                L_teacher_residual_rigid = (
+                    (rot_loss + trans_loss) * teacher_weight
+                ).sum() / rigid_denom
+                teacher_chi_weight = teacher_weight.unsqueeze(-1) * teacher_chi_mask
+                chi_denom = teacher_chi_weight.sum().clamp(min=1.0)
+                L_teacher_residual_chi = (
+                    chi_loss * teacher_chi_weight
+                ).sum() / chi_denom
+                L_teacher_residual = L_teacher_residual_rigid + L_teacher_residual_chi
+
+                target_residual_norm = (
+                    torch.linalg.norm(target_rot, dim=-1)
+                    + torch.linalg.norm(target_trans, dim=-1)
+                    + (target_chi.abs() * teacher_chi_mask).sum(dim=-1)
+                )
+                pred_residual_norm = (
+                    torch.linalg.norm(pred_rot_residual, dim=-1)
+                    + torch.linalg.norm(pred_trans_residual, dim=-1)
+                    + (pred_chi_residual.abs() * teacher_chi_mask).sum(dim=-1)
+                )
+                teacher_residual_target_norm = (
+                    (target_residual_norm * teacher_weight).sum() / rigid_denom
+                ).detach()
+                teacher_residual_pred_norm = (
+                    (pred_residual_norm * teacher_weight).sum() / rigid_denom
+                ).detach()
+                teacher_residual_t_error = teacher_targets['t_error'].mean().detach()
+                active_teacher = teacher_mask > 0.0
+                if active_teacher.any():
+                    teacher_residual_weight_mean = teacher_weight[active_teacher].mean().detach()
+                teacher_residual_mask_frac = (
+                    teacher_mask.sum() / batch.node_mask.float().sum().clamp(min=1.0)
+                ).detach()
 
         # Background stability
         bg_w = (1.0 - w_eff).clamp(min=0.0) ** self.config.bg_beta
@@ -1355,6 +2123,12 @@ class Stage2Trainer:
 
         L_smooth = chi_ref.new_tensor(0.0)
         L_clash = chi_ref.new_tensor(0.0)
+        L_ligand_clearance = chi_ref.new_tensor(0.0)
+        ligand_clearance_active_frac = chi_ref.new_tensor(0.0)
+        ligand_clearance_min_dist = chi_ref.new_tensor(0.0)
+        L_bridge_anchor = chi_ref.new_tensor(0.0)
+        bridge_anchor_mask_frac = chi_ref.new_tensor(0.0)
+        bridge_anchor_residual_norm = chi_ref.new_tensor(0.0)
         L_pep = chi_ref.new_tensor(0.0)
         L_contact = chi_ref.new_tensor(0.0)
         L_stage1v2_guidance = chi_ref.new_tensor(0.0)
@@ -1379,6 +2153,12 @@ class Stage2Trainer:
         contact_scores = []
         contact_score_times = []
         stage1v2_guidance_terms = 0
+        ligand_clearance_terms = 0
+        ligand_clearance_active_terms = []
+        ligand_clearance_min_terms = []
+        bridge_anchor_terms = 0
+        bridge_anchor_mask_terms = []
+        bridge_anchor_residual_terms = []
 
         # Initialize endpoint losses to zero
         L_end = chi_ref.new_tensor(0.0)
@@ -1389,16 +2169,36 @@ class Stage2Trainer:
         L_end_chi_uw = chi_ref.new_tensor(0.0)
 
         if compute_geom:
-            rigids_list, chi_list, t_list = self.integrate_path(
-                batch,
-                rigids_apo,
-                batch.torsion_apo[..., 3:7],
-                stage1_chi=stage1_chi,
-                stage1_rigids=stage1_rigids,
-                stage1_chi_mask=stage1_chi_mask,
-                interaction_prior=combined_prior_features,
-                esm_gate_context=esm_gate_context,
-            )
+            if boundary_residual_mode:
+                rigids_list, chi_list, t_list = self.boundary_residual_path(
+                    batch,
+                    rigids_apo,
+                    rigids_holo,
+                    stage1_chi=stage1_chi,
+                    stage1_rigids=stage1_rigids,
+                    stage1_chi_mask=stage1_chi_mask,
+                    interaction_prior=combined_prior_features,
+                    esm_gate_context=esm_gate_context,
+                )
+            else:
+                rigids_list, chi_list, t_list = self.integrate_path(
+                    batch,
+                    rigids_apo,
+                    batch.torsion_apo[..., 3:7],
+                    stage1_chi=stage1_chi,
+                    stage1_rigids=stage1_rigids,
+                    stage1_chi_mask=stage1_chi_mask,
+                    interaction_prior=combined_prior_features,
+                    esm_gate_context=esm_gate_context,
+                )
+                if self.config.path_parameterization == 'projected_flow':
+                    rigids_list, chi_list, t_list = self.project_terminal_path(
+                        rigids_list,
+                        chi_list,
+                        t_list,
+                        rigids_holo,
+                        batch.torsion_holo[..., 3:7],
+                    )
 
             # Integration is part of the scientific contract. Do not silently
             # downgrade to FM-only if the path state is numerically invalid.
@@ -1464,6 +2264,112 @@ class Stage2Trainer:
                     aatype=batch.aatype,
                     atom_mask=flat_atom_mask,
                 )
+
+                clearance_time_active = (
+                    float(self.config.ligand_clearance_t_min)
+                    <= float(t_val)
+                    <= float(self.config.ligand_clearance_t_max)
+                )
+                anchor_time_active = (
+                    float(self.config.bridge_anchor_t_min)
+                    <= float(t_val)
+                    <= float(self.config.bridge_anchor_t_max)
+                )
+                needs_ligand_distance = (
+                    float(self.config.w_ligand_clearance) > 0.0
+                    and clearance_time_active
+                ) or (
+                    float(self.config.w_bridge_anchor) > 0.0
+                    and anchor_time_active
+                )
+                if needs_ligand_distance:
+                    clearance_mask = self._ligand_clearance_residue_mask(batch)
+                    min_dist = self._differentiable_min_sidechain_ligand_dist(
+                        atom14_pos.float(),
+                        valid_atom,
+                        batch.lig_points.float(),
+                        batch.lig_mask.bool(),
+                        batch.node_mask.bool(),
+                        residue_chunk=64,
+                    )
+                    hard_negative_all = (
+                        min_dist.detach()
+                        < float(self.config.ligand_clearance_hard_negative_dist)
+                    ) & batch.node_mask.bool()
+                    hard_negative = hard_negative_all & clearance_mask
+                    clearance_violation = torch.relu(
+                        min_dist.new_tensor(float(self.config.ligand_clearance_dist))
+                        - min_dist.clamp(max=50.0)
+                    )
+                    clearance_w_all = clearance_mask.float()
+                    clearance_denom_all = clearance_w_all.sum().clamp(min=1.0)
+                    if (
+                        float(self.config.w_ligand_clearance) > 0.0
+                        and clearance_time_active
+                    ):
+                        if self.config.ligand_clearance_loss_mode == 'hard_negative':
+                            clearance_w = hard_negative.float()
+                        else:
+                            clearance_w = clearance_w_all
+                        denom = clearance_w.sum().clamp(min=1.0)
+                        L_ligand_clearance = L_ligand_clearance + (
+                            clearance_violation.pow(2) * clearance_w
+                        ).sum() / denom
+                        ligand_clearance_active_terms.append(
+                            (hard_negative.float() * clearance_w_all).sum()
+                            / clearance_denom_all
+                        )
+                        ligand_clearance_min_terms.append(
+                            (min_dist.clamp(max=50.0) * clearance_w_all).sum()
+                            / clearance_denom_all
+                        )
+                        ligand_clearance_terms += 1
+
+                    if (
+                        float(self.config.w_bridge_anchor) > 0.0
+                        and anchor_time_active
+                    ):
+                        anchor_mask = self._bridge_anchor_residue_mask(
+                            batch,
+                            clearance_mask,
+                            hard_negative_all,
+                        )
+                        anchor_w = anchor_mask.float()
+                        anchor_denom = anchor_w.sum().clamp(min=1.0)
+                        bridge_rigids, bridge_chi = self._interpolate_endpoints(
+                            batch,
+                            rigids_apo,
+                            rigids_holo,
+                            float(t_val),
+                        )
+                        R_bridge, t_bridge = self._rigid_to_rt(bridge_rigids)
+                        R_bridge_inv, t_bridge_inv = rigid_inverse(R_bridge, t_bridge)
+                        R_t_cur, t_t_cur = self._rigid_to_rt(rigids_t)
+                        R_delta_bridge, t_delta_bridge = rigid_compose(
+                            R_bridge_inv,
+                            t_bridge_inv,
+                            R_t_cur,
+                            t_t_cur,
+                        )
+                        xi_bridge = se3_log(R_delta_bridge, t_delta_bridge)
+                        rigid_anchor = (xi_bridge ** 2).sum(dim=-1)
+                        chi_delta_bridge = wrap_to_pi(chi_t - bridge_chi)
+                        chi_anchor = (
+                            (chi_delta_bridge ** 2) * chi_mask
+                        ).sum(dim=-1) / chi_mask.sum(dim=-1).clamp(min=1.0)
+                        anchor_residual = rigid_anchor + chi_anchor
+                        L_bridge_anchor = L_bridge_anchor + (
+                            anchor_residual * anchor_w
+                        ).sum() / anchor_denom
+                        bridge_anchor_mask_terms.append(
+                            anchor_w.sum()
+                            / batch.node_mask.float().sum().clamp(min=1.0)
+                        )
+                        bridge_anchor_residual_terms.append(
+                            (anchor_residual.sqrt() * anchor_w).sum()
+                            / anchor_denom
+                        )
+                        bridge_anchor_terms += 1
 
                 # Peptide geometry
                 L_pep = L_pep + compute_peptide_loss(
@@ -1571,6 +2477,22 @@ class Stage2Trainer:
 
             if stage1v2_guidance_terms > 0:
                 L_stage1v2_guidance = L_stage1v2_guidance / stage1v2_guidance_terms
+            if ligand_clearance_terms > 0:
+                L_ligand_clearance = L_ligand_clearance / ligand_clearance_terms
+                ligand_clearance_active_frac = torch.stack(
+                    ligand_clearance_active_terms
+                ).mean()
+                ligand_clearance_min_dist = torch.stack(
+                    ligand_clearance_min_terms
+                ).mean()
+            if bridge_anchor_terms > 0:
+                L_bridge_anchor = L_bridge_anchor / bridge_anchor_terms
+                bridge_anchor_mask_frac = torch.stack(
+                    bridge_anchor_mask_terms
+                ).mean()
+                bridge_anchor_residual_norm = torch.stack(
+                    bridge_anchor_residual_terms
+                ).mean()
 
             rigids_final = rigids_list[-1]
             chi_final = chi_list[-1]
@@ -1702,9 +2624,12 @@ class Stage2Trainer:
         total_no_repa = (
             self.config.w_fm_chi * L_fm_chi.clamp(max=100.0) +
             self.config.w_fm_rigid * L_fm_rigid.clamp(max=100.0) +
+            self.config.w_teacher_residual * L_teacher_residual.clamp(max=100.0) +
             self.config.w_bg * L_bg.clamp(max=100.0) +
             self.config.w_smooth * L_smooth.clamp(max=100.0) +
             self.config.w_clash * L_clash.clamp(max=100.0) +
+            self.config.w_ligand_clearance * L_ligand_clearance.clamp(max=100.0) +
+            self.config.w_bridge_anchor * L_bridge_anchor.clamp(max=100.0) +
             self.config.w_pep * L_pep.clamp(max=100.0) +
             self.config.w_contact * L_contact.clamp(max=100.0) +
             self.config.w_stage1v2_guidance * L_stage1v2_guidance.clamp(max=100.0) +
@@ -1774,9 +2699,23 @@ class Stage2Trainer:
             'total_no_repa': total_no_repa,
             'fm_chi': L_fm_chi,
             'fm_rigid': L_fm_rigid,
+            'teacher_residual': L_teacher_residual,
+            'teacher_residual_rigid': L_teacher_residual_rigid,
+            'teacher_residual_chi': L_teacher_residual_chi,
+            'teacher_residual_target_norm': teacher_residual_target_norm,
+            'teacher_residual_pred_norm': teacher_residual_pred_norm,
+            'teacher_residual_t_error': teacher_residual_t_error,
+            'teacher_residual_weight_mean': teacher_residual_weight_mean,
+            'teacher_residual_mask_frac': teacher_residual_mask_frac,
             'bg': L_bg,
             'smooth': L_smooth,
             'clash': L_clash,
+            'ligand_clearance': L_ligand_clearance,
+            'ligand_clearance_active_frac': ligand_clearance_active_frac,
+            'ligand_clearance_min_dist': ligand_clearance_min_dist,
+            'bridge_anchor': L_bridge_anchor,
+            'bridge_anchor_mask_frac': bridge_anchor_mask_frac,
+            'bridge_anchor_residual_norm': bridge_anchor_residual_norm,
             'pep': L_pep,
             'contact': L_contact,
             'stage1v2_guidance': L_stage1v2_guidance,
@@ -1863,29 +2802,33 @@ class Stage2Trainer:
         return {k: v.item() if isinstance(v, torch.Tensor) else v for k, v in losses.items()}
 
     def _batch_to_device(self, batch):
-        batch.esm = batch.esm.to(self.device)
-        batch.torsion_apo = batch.torsion_apo.to(self.device)
-        batch.torsion_holo = batch.torsion_holo.to(self.device)
-        batch.bb_mask = batch.bb_mask.to(self.device)
-        batch.chi_mask = batch.chi_mask.to(self.device)
-        batch.node_mask = batch.node_mask.to(self.device)
-        batch.N_apo = batch.N_apo.to(self.device)
-        batch.Ca_apo = batch.Ca_apo.to(self.device)
-        batch.C_apo = batch.C_apo.to(self.device)
-        batch.N_holo = batch.N_holo.to(self.device)
-        batch.Ca_holo = batch.Ca_holo.to(self.device)
-        batch.C_holo = batch.C_holo.to(self.device)
-        batch.lig_points = batch.lig_points.to(self.device)
-        batch.lig_types = batch.lig_types.to(self.device)
-        batch.lig_mask = batch.lig_mask.to(self.device)
-        batch.w_res = batch.w_res.to(self.device)
+        non_blocking = self.device.type == 'cuda'
+        batch.esm = batch.esm.to(self.device, non_blocking=non_blocking)
+        batch.torsion_apo = batch.torsion_apo.to(self.device, non_blocking=non_blocking)
+        batch.torsion_holo = batch.torsion_holo.to(self.device, non_blocking=non_blocking)
+        batch.bb_mask = batch.bb_mask.to(self.device, non_blocking=non_blocking)
+        batch.chi_mask = batch.chi_mask.to(self.device, non_blocking=non_blocking)
+        batch.node_mask = batch.node_mask.to(self.device, non_blocking=non_blocking)
+        batch.N_apo = batch.N_apo.to(self.device, non_blocking=non_blocking)
+        batch.Ca_apo = batch.Ca_apo.to(self.device, non_blocking=non_blocking)
+        batch.C_apo = batch.C_apo.to(self.device, non_blocking=non_blocking)
+        batch.N_holo = batch.N_holo.to(self.device, non_blocking=non_blocking)
+        batch.Ca_holo = batch.Ca_holo.to(self.device, non_blocking=non_blocking)
+        batch.C_holo = batch.C_holo.to(self.device, non_blocking=non_blocking)
+        batch.lig_points = batch.lig_points.to(self.device, non_blocking=non_blocking)
+        batch.lig_types = batch.lig_types.to(self.device, non_blocking=non_blocking)
+        batch.lig_mask = batch.lig_mask.to(self.device, non_blocking=non_blocking)
+        batch.w_res = batch.w_res.to(self.device, non_blocking=non_blocking)
         if batch.stage1v2_posterior_features is not None:
-            batch.stage1v2_posterior_features = batch.stage1v2_posterior_features.to(self.device)
+            batch.stage1v2_posterior_features = batch.stage1v2_posterior_features.to(
+                self.device,
+                non_blocking=non_blocking,
+            )
         if self.config.use_nma and batch.nma_features is None:
             raise ValueError("use_nma=True but batch.nma_features is None")
         if batch.nma_features is not None:
-            batch.nma_features = batch.nma_features.to(self.device)
-        batch.aatype = batch.aatype.to(self.device)
+            batch.nma_features = batch.nma_features.to(self.device, non_blocking=non_blocking)
+        batch.aatype = batch.aatype.to(self.device, non_blocking=non_blocking)
         return batch
 
     def train_epoch(self) -> Dict[str, float]:
@@ -1894,26 +2837,62 @@ class Stage2Trainer:
 
         epoch_losses = {key: 0.0 for key in self._LOSS_KEYS}
 
-        # Set DistributedSampler epoch
-        if self.distributed and hasattr(self.train_loader, 'sampler') and hasattr(self.train_loader.sampler, 'set_epoch'):
-            self.train_loader.sampler.set_epoch(self.current_epoch)
+        # Set epoch for regular DistributedSampler or length-aware batch sampler.
+        if self.distributed:
+            for sampler in (
+                getattr(self.train_loader, 'sampler', None),
+                getattr(self.train_loader, 'batch_sampler', None),
+            ):
+                if hasattr(sampler, 'set_epoch'):
+                    sampler.set_epoch(self.current_epoch)
 
-        pbar = tqdm(self.train_loader, desc=f'Epoch {self.current_epoch:3d}', ncols=120, leave=True, disable=not self.is_main_process)
+        use_tqdm = self.is_main_process and sys.stderr.isatty()
+        pbar = tqdm(
+            self.train_loader,
+            desc=f'Epoch {self.current_epoch:3d}',
+            ncols=120,
+            leave=True,
+            disable=not use_tqdm,
+        )
         n_batches = len(self.train_loader)
+        prev_step_end = time.perf_counter()
         for batch_idx, batch in enumerate(pbar):
+            batch_ready_time = time.perf_counter()
             window_start = (batch_idx // self.grad_accum_steps) * self.grad_accum_steps
             window_end = min(window_start + self.grad_accum_steps, n_batches)
             accum_steps = window_end - window_start
             should_step = (batch_idx + 1 == window_end)
 
             step_losses = self.train_step(batch, accum_steps=accum_steps, should_step=should_step)
+            step_end_time = time.perf_counter()
             for k in epoch_losses:
                 epoch_losses[k] += step_losses[k]
 
-            pbar.set_postfix({
-                'loss': f"{step_losses['total']:.3f}",
-                'fm': f"{step_losses['fm_chi'] + step_losses['fm_rigid']:.3f}",
-            })
+            if use_tqdm:
+                pbar.set_postfix({
+                    'loss': f"{step_losses['total']:.3f}",
+                    'fm': f"{step_losses['fm_chi'] + step_losses['fm_rigid']:.3f}",
+                })
+            elif (
+                self.is_main_process
+                and self.config.progress_log_every > 0
+                and (
+                    batch_idx == 0
+                    or batch_idx + 1 == n_batches
+                    or (batch_idx + 1) % self.config.progress_log_every == 0
+                )
+            ):
+                fm = step_losses['fm_chi'] + step_losses['fm_rigid']
+                data_wait = batch_ready_time - prev_step_end
+                step_time = step_end_time - batch_ready_time
+                print(
+                    f"[Train] epoch={self.current_epoch} "
+                    f"batch={batch_idx + 1}/{n_batches} "
+                    f"loss={step_losses['total']:.4f} fm={fm:.4f} "
+                    f"data_wait={data_wait:.3f}s step={step_time:.3f}s",
+                    flush=True,
+                )
+            prev_step_end = step_end_time
 
         epoch_losses, n_batches = self._all_reduce_loss_sums(epoch_losses, n_batches)
         denom = max(n_batches, 1)
@@ -1982,7 +2961,9 @@ class Stage2Trainer:
             'data_dir',
             'valid_samples_file',
             'val_samples_file',
+            'trust_prechecked_samples',
             'batch_size',
+            'val_batch_size',
             'seed',
             'stage1v2_train_cache_dir',
             'stage1v2_val_cache_dir',
@@ -2016,6 +2997,11 @@ class Stage2Trainer:
             'weight_decay',
             'warmup_steps',
             'grad_accum_steps',
+            'path_parameterization',
+            'boundary_residual_envelope',
+            'boundary_residual_scale',
+            'terminal_projection_schedule',
+            'length_bucket_residue_budget',
             # Loss contract.
             'contact_loss_mode',
             'w_fm_chi',
@@ -2031,8 +3017,16 @@ class Stage2Trainer:
             'w_end',
         )
         mismatches = []
+        backward_defaults = {
+            'path_parameterization': 'flow',
+            'boundary_residual_envelope': 'sin2',
+            'boundary_residual_scale': 1.0,
+            'terminal_projection_schedule': 'smootherstep',
+        }
         for field in strict_fields:
             old = self._config_value(ckpt_config, field)
+            if old is None and field in backward_defaults:
+                old = backward_defaults[field]
             new = getattr(self.config, field, None)
             if old != new:
                 mismatches.append((field, old, new))
