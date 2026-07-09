@@ -1,0 +1,794 @@
+#!/usr/bin/env python3
+"""Evaluate endpoint-exact bridge time-warp headroom for Stage-2 paths.
+
+This evaluator answers a narrow question before training another model:
+
+    Can a monotone progress warp along the apo-holo bridge beat pure_bridge?
+
+It compares pure_bridge with oracle global/group/residue time-warp paths.  It
+can also project a free-flow teacher path onto the bridge and evaluate the
+resulting endpoint-exact progress path.  All evaluated paths remain exact at
+apo/holo because they only sample the analytic bridge at tau(0)=0 and tau(1)=1.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from collections import defaultdict
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Dict, Iterable, List, Optional, Tuple
+
+import torch
+from tqdm import tqdm
+
+project_root = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(project_root))
+flash_ipa_path = project_root / "vendor" / "flash_ipa" / "src"
+if flash_ipa_path.exists():
+    sys.path.insert(0, str(flash_ipa_path))
+
+import scripts.evaluate_stage2_transition_paths as base  # noqa: E402
+from src.stage1.models.fk_openfold import create_openfold_fk  # noqa: E402
+from src.stage2.datasets import create_stage2_dataloader  # noqa: E402
+from src.stage2.models import TorsionFlowNet  # noqa: E402
+from src.stage2.modules import rigid_compose, rigid_inverse, se3_exp, se3_log, wrap_to_pi  # noqa: E402
+from flash_ipa.rigid import Rigid, Rotation  # noqa: E402
+
+
+METHODS = (
+    "pure_bridge",
+    "oracle_global",
+    "oracle_group",
+    "oracle_residue",
+    "freeflow_projected",
+)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--checkpoint", required=True, help="Stage-2 checkpoint used for config and optional free-flow")
+    parser.add_argument("--free_flow_checkpoint", default=None, help="Optional free-flow teacher checkpoint")
+    parser.add_argument("--data_dir", default="processed_data/triplets")
+    parser.add_argument("--split", default="val", choices=["train", "val", "test"])
+    parser.add_argument("--valid_samples_file", default=None)
+    parser.add_argument("--trust_prechecked_samples", action="store_true")
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--max_batches", type=int, default=None)
+    parser.add_argument("--n_path_steps", type=int, default=16)
+    parser.add_argument("--n_tau_grid", type=int, default=33)
+    parser.add_argument("--methods", default="pure_bridge,oracle_global,oracle_group,oracle_residue")
+
+    parser.add_argument("--free_flow_path_parameterization", default="flow",
+                        choices=["flow", "projected_flow", "boundary_residual_v1", "boundary_residual"])
+    parser.add_argument("--n_free_flow_steps", type=int, default=None)
+    parser.add_argument("--integration_chi_clip", type=float, default=None)
+    parser.add_argument("--integration_rot_clip", type=float, default=None)
+    parser.add_argument("--integration_trans_clip", type=float, default=None)
+
+    parser.add_argument("--interaction_prior_ckpt", default=None)
+    parser.add_argument(
+        "--interaction_prior_feature_mode",
+        default=None,
+        choices=["none", "prior", "prior_shuffled", "zero", "oracle_contact"],
+    )
+    parser.add_argument("--interaction_prior_temperature", type=float, default=None)
+    parser.add_argument("--interaction_prior_feature_scale", type=float, default=None)
+    parser.add_argument(
+        "--stage1v2_posterior_feature_mode",
+        default=None,
+        choices=[
+            "none",
+            "zero",
+            "student",
+            "student_shuffled",
+            "oracle_holo_truth",
+            "external_teacher_cached",
+            "oracle_motion",
+            "oracle_motion_residue_shuffled",
+            "oracle_motion_sample_shuffled",
+        ],
+    )
+    parser.add_argument("--stage1v2_posterior_cache_dir", default=None)
+    parser.add_argument("--stage1v2_posterior_feature_names", default=None)
+    parser.add_argument("--stage1v2_posterior_feature_scale", type=float, default=None)
+
+    parser.add_argument("--active_delta", type=float, default=0.75)
+    parser.add_argument("--contact_dist", type=float, default=4.5)
+    parser.add_argument("--path_dist_cap", type=float, default=20.0)
+    parser.add_argument("--ligand_clash_dist", type=float, default=2.2)
+    parser.add_argument("--pocket_threshold", type=float, default=0.3)
+    parser.add_argument("--output", default=None)
+    return parser.parse_args()
+
+
+def parse_methods(raw: str) -> Tuple[str, ...]:
+    normalized = str(raw)
+    for sep in (";", ":", "+"):
+        normalized = normalized.replace(sep, ",")
+    methods = tuple(item.strip() for item in normalized.split(",") if item.strip())
+    unknown = sorted(set(methods) - set(METHODS))
+    if unknown:
+        raise ValueError(f"Unsupported methods: {unknown}; allowed={METHODS}")
+    if not methods:
+        raise ValueError("at least one method is required")
+    return methods
+
+
+def rigid_from_rt(R: torch.Tensor, t: torch.Tensor) -> Rigid:
+    return Rigid(rots=Rotation(rot_mats=R), trans=t)
+
+
+def bridge_state_at_tau(
+    batch,
+    rigids_apo: Rigid,
+    rigids_holo: Rigid,
+    tau: torch.Tensor,
+) -> Tuple[Rigid, torch.Tensor]:
+    tau = tau.clamp(min=0.0, max=1.0).float()
+    gamma = 3.0 * tau * tau - 2.0 * tau * tau * tau
+    chi0 = batch.torsion_apo[..., 3:7]
+    chi1 = batch.torsion_holo[..., 3:7]
+    chi_t = wrap_to_pi(chi0 + gamma.unsqueeze(-1) * wrap_to_pi(chi1 - chi0))
+
+    R0, t0 = base.rigid_to_rt(rigids_apo)
+    R1, t1 = base.rigid_to_rt(rigids_holo)
+    R0_inv, t0_inv = rigid_inverse(R0, t0)
+    R_delta, t_delta = rigid_compose(R0_inv, t0_inv, R1, t1)
+    xi = se3_log(R_delta, t_delta)
+    R_inc, t_inc = se3_exp(xi * gamma.unsqueeze(-1))
+    R_t, trans_t = rigid_compose(R0, t0, R_inc, t_inc)
+    return rigid_from_rt(R_t, trans_t), chi_t
+
+
+def build_tau_grid_path(
+    batch,
+    rigids_apo: Rigid,
+    rigids_holo: Rigid,
+    tau_seq: torch.Tensor,
+) -> Tuple[List[Rigid], List[torch.Tensor], List[float]]:
+    rigids_list: List[Rigid] = []
+    chi_list: List[torch.Tensor] = []
+    t_list: List[float] = []
+    steps = tau_seq.shape[0] - 1
+    for k in range(tau_seq.shape[0]):
+        rigids_t, chi_t = bridge_state_at_tau(batch, rigids_apo, rigids_holo, tau_seq[k])
+        rigids_list.append(rigids_t)
+        chi_list.append(chi_t)
+        t_list.append(k / max(steps, 1))
+    return rigids_list, chi_list, t_list
+
+
+def compute_bridge_distance_grid(
+    fk_module,
+    batch,
+    rigids_apo: Rigid,
+    rigids_holo: Rigid,
+    tau_grid: torch.Tensor,
+) -> Tuple[torch.Tensor, List[Rigid], List[torch.Tensor]]:
+    dists: List[torch.Tensor] = []
+    rigids_grid: List[Rigid] = []
+    chi_grid: List[torch.Tensor] = []
+    for tau_value in tau_grid:
+        tau = batch.w_res.new_full(batch.w_res.shape, float(tau_value))
+        rigids_t, chi_t = bridge_state_at_tau(batch, rigids_apo, rigids_holo, tau)
+        atom14 = base.torsions_to_atom14(
+            fk_module,
+            batch.torsion_apo[..., :3],
+            chi_t,
+            rigids_t,
+            batch.aatype,
+        )
+        d_t = base.min_sc_ligand_dist(
+            atom14["atom14_pos"].float(),
+            atom14["atom14_mask"].bool(),
+            batch.lig_points.float(),
+            batch.lig_mask.bool(),
+            batch.node_mask.bool(),
+        )
+        dists.append(d_t)
+        rigids_grid.append(rigids_t)
+        chi_grid.append(chi_t)
+    return torch.stack(dists, dim=0), rigids_grid, chi_grid
+
+
+def monotone_dp(cost: torch.Tensor) -> torch.Tensor:
+    """Find monotone grid indices minimizing cost.
+
+    Args:
+        cost: [T, G, ...] cost tensor. Caller should set impossible states to
+            a large value; endpoints are usually forced to grid 0 and G-1.
+
+    Returns:
+        Long tensor [T, ...] with nondecreasing grid indices.
+    """
+    if cost.ndim < 2:
+        raise ValueError("cost must have shape [T, G, ...]")
+    T, G = int(cost.shape[0]), int(cost.shape[1])
+    if T < 2 or G < 2:
+        raise ValueError(f"monotone_dp requires T>=2 and G>=2, got T={T}, G={G}")
+
+    dp = cost[0]
+    backptrs: List[torch.Tensor] = []
+    grid = torch.arange(G, device=cost.device, dtype=torch.long)
+    for t_idx in range(1, T):
+        prefix_val, prefix_arg = torch.cummin(dp, dim=0)
+        dp = cost[t_idx] + prefix_val
+        backptrs.append(prefix_arg)
+
+    last_idx = dp.argmin(dim=0)
+    path = [last_idx]
+    for backptr in reversed(backptrs):
+        gather_idx = path[-1].unsqueeze(0)
+        prev_idx = torch.gather(backptr, dim=0, index=gather_idx).squeeze(0)
+        path.append(prev_idx)
+    path.reverse()
+    out = torch.stack(path, dim=0)
+    if out.shape[0] != T:
+        raise RuntimeError("failed to reconstruct monotone path")
+    return out.long()
+
+
+def force_endpoint_costs(cost: torch.Tensor) -> torch.Tensor:
+    cost = cost.clone()
+    large = cost.new_tensor(1.0e8)
+    cost[0, 1:] = large
+    cost[-1, :-1] = large
+    return cost
+
+
+def identity_tau_seq(batch, n_steps: int) -> torch.Tensor:
+    t = torch.linspace(0.0, 1.0, int(n_steps) + 1, device=batch.w_res.device)
+    return t[:, None, None].expand(-1, batch.w_res.shape[0], batch.w_res.shape[1]).clone()
+
+
+def nearest_grid_indices(tau_seq: torch.Tensor, tau_grid: torch.Tensor) -> torch.Tensor:
+    diff = (tau_seq.unsqueeze(1) - tau_grid.view(1, -1, 1, 1)).abs()
+    return diff.argmin(dim=1).long()
+
+
+def path_cost_against_distance_schedule(
+    d_bridge_grid: torch.Tensor,
+    d_apo: torch.Tensor,
+    d_holo: torch.Tensor,
+    n_steps: int,
+    cap: float,
+) -> torch.Tensor:
+    t_values = torch.linspace(0.0, 1.0, int(n_steps) + 1, device=d_apo.device)
+    target = d_apo.unsqueeze(0) + t_values[:, None, None] * (d_holo - d_apo).unsqueeze(0)
+    cost = (
+        d_bridge_grid.unsqueeze(0).clamp(max=float(cap))
+        - target[:, None].clamp(max=float(cap))
+    ).abs()
+    return cost
+
+
+def masked_mean_cost(cost: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Reduce [T,G,B,N] cost to [T,G,B] using a residue mask [B,N]."""
+    mask_f = mask.float()
+    denom = mask_f.sum(dim=-1).clamp(min=1.0)
+    return (cost * mask_f[None, None]).sum(dim=-1) / denom[None, None]
+
+
+def build_oracle_global_tau(cost: torch.Tensor, mask: torch.Tensor, tau_grid: torch.Tensor) -> torch.Tensor:
+    group_cost = masked_mean_cost(cost, mask)
+    idx = monotone_dp(force_endpoint_costs(group_cost))
+    tau = tau_grid[idx]
+    return tau[:, :, None].expand(-1, -1, mask.shape[1]).clone()
+
+
+def build_group_masks(
+    finite: torch.Tensor,
+    d_apo: torch.Tensor,
+    d_holo: torch.Tensor,
+    active_delta: float,
+    contact_dist: float,
+) -> List[Tuple[str, torch.Tensor]]:
+    delta = d_holo - d_apo
+    active = finite & (delta.abs() >= float(active_delta))
+    formed = active & (d_apo > float(contact_dist)) & (d_holo <= float(contact_dist))
+    released = active & (d_apo <= float(contact_dist)) & (d_holo > float(contact_dist))
+    stable_contact = finite & (d_apo <= float(contact_dist)) & (d_holo <= float(contact_dist))
+    stable_noncontact = finite & (d_apo > float(contact_dist)) & (d_holo > float(contact_dist))
+    used = formed | released | stable_contact | stable_noncontact
+    other = finite & ~used
+    return [
+        ("formed_contact", formed),
+        ("released_contact", released),
+        ("stable_contact", stable_contact),
+        ("stable_noncontact", stable_noncontact),
+        ("other_pocket", other),
+    ]
+
+
+def build_oracle_group_tau(
+    cost: torch.Tensor,
+    finite: torch.Tensor,
+    group_masks: List[Tuple[str, torch.Tensor]],
+    tau_grid: torch.Tensor,
+    n_steps: int,
+) -> Tuple[torch.Tensor, Dict[str, int]]:
+    tau = identity_tau_seq(SimpleNamespace(w_res=finite.float()), n_steps)
+    counts: Dict[str, int] = {}
+    for name, mask in group_masks:
+        counts[name] = int(mask.sum().item())
+        if not mask.any():
+            continue
+        group_tau = build_oracle_global_tau(cost, mask, tau_grid)
+        tau = torch.where(mask[None], group_tau, tau)
+    tau = torch.where(finite[None], tau, identity_tau_seq(SimpleNamespace(w_res=finite.float()), n_steps))
+    return tau, counts
+
+
+def build_oracle_residue_tau(
+    cost: torch.Tensor,
+    finite: torch.Tensor,
+    tau_grid: torch.Tensor,
+    n_steps: int,
+) -> torch.Tensor:
+    idx = monotone_dp(force_endpoint_costs(cost))
+    tau = tau_grid[idx]
+    identity = identity_tau_seq(SimpleNamespace(w_res=finite.float()), n_steps)
+    return torch.where(finite[None], tau, identity)
+
+
+def state_projection_cost_to_grid(
+    grid_rigids: List[Rigid],
+    grid_chi: List[torch.Tensor],
+    teacher_rigids: List[Rigid],
+    teacher_chi: List[torch.Tensor],
+    chi_mask: torch.Tensor,
+) -> torch.Tensor:
+    rows: List[torch.Tensor] = []
+    for teach_rigid, teach_chi in zip(teacher_rigids, teacher_chi):
+        per_grid: List[torch.Tensor] = []
+        for grid_rigid, grid_chi_t in zip(grid_rigids, grid_chi):
+            total_gap, _, _, _ = base.state_step_motion(
+                grid_rigid,
+                grid_chi_t,
+                teach_rigid,
+                teach_chi,
+                chi_mask,
+            )
+            per_grid.append(total_gap)
+        rows.append(torch.stack(per_grid, dim=0))
+    return torch.stack(rows, dim=0)
+
+
+def load_model_for_checkpoint(args, ckpt_path: str, device: torch.device, split: str):
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    config = ckpt.get("config", SimpleNamespace())
+    args.config = config
+    model_config, interaction_settings, stage1v2_settings = base.build_model_config_for_checkpoint(
+        args, config, split
+    )
+    model = TorsionFlowNet(model_config).to(device)
+    model.load_state_dict(ckpt["model_state_dict"], strict=True)
+    model.eval()
+    model._bindrae_config = config
+    return ckpt, config, model, interaction_settings, stage1v2_settings
+
+
+def build_free_flow_projected_tau(
+    args,
+    model,
+    fk_module,
+    batch,
+    rigids_apo: Rigid,
+    rigids_holo: Rigid,
+    grid_rigids: List[Rigid],
+    grid_chi: List[torch.Tensor],
+    n_steps: int,
+    tau_grid: torch.Tensor,
+    interaction_settings: Dict[str, object],
+    stage1v2_settings: Dict[str, object],
+    integration_clips: Dict[str, float],
+    finite: torch.Tensor,
+) -> torch.Tensor:
+    original_mode = getattr(args, "path_parameterization", "checkpoint")
+    args.path_parameterization = args.free_flow_path_parameterization
+    try:
+        interaction_prior_feature = base.compute_interaction_prior_feature(
+            args, args.config, batch, fk_module, rigids_apo, rigids_holo
+        )
+        prior_features = base.combined_prior_features(
+            args,
+            args.config,
+            batch,
+            interaction_prior_feature,
+            stage1v2_settings,
+            interaction_settings,
+        )
+        gate_context = base.esm_gate_context(args.config, batch, stage1v2_settings)
+        teacher_rigids, teacher_chi, _, _ = base.construct_path(
+            args,
+            args.config,
+            model,
+            batch,
+            rigids_apo,
+            rigids_holo,
+            n_steps,
+            prior_features,
+            gate_context,
+            integration_clips,
+        )
+    finally:
+        args.path_parameterization = original_mode
+
+    proj_cost = state_projection_cost_to_grid(
+        grid_rigids,
+        grid_chi,
+        teacher_rigids,
+        teacher_chi,
+        batch.chi_mask,
+    )
+    idx = monotone_dp(force_endpoint_costs(proj_cost))
+    tau = tau_grid[idx]
+    identity = identity_tau_seq(batch, n_steps)
+    return torch.where(finite[None], tau, identity)
+
+
+def class_masks(args, batch, d_apo: torch.Tensor, d_holo: torch.Tensor) -> Dict[str, torch.Tensor]:
+    delta = d_holo - d_apo
+    node = batch.node_mask.bool()
+    pocket = node & (batch.w_res > float(args.pocket_threshold))
+    finite = pocket & torch.isfinite(d_apo) & torch.isfinite(d_holo) & (d_apo < 49.0) & (d_holo < 49.0)
+    active = finite & (delta.abs() >= float(args.active_delta))
+    formed = active & (d_apo > float(args.contact_dist)) & (d_holo <= float(args.contact_dist))
+    released = active & (d_apo <= float(args.contact_dist)) & (d_holo > float(args.contact_dist))
+    stable_contact = finite & (d_apo <= float(args.contact_dist)) & (d_holo <= float(args.contact_dist))
+    stable_noncontact = finite & (d_apo > float(args.contact_dist)) & (d_holo > float(args.contact_dist))
+    return {
+        "all_pocket": finite,
+        "active": active,
+        "approach": active & (delta < 0),
+        "release": active & (delta > 0),
+        "formed_contact": formed,
+        "released_contact": released,
+        "stable_contact": stable_contact,
+        "stable_noncontact": stable_noncontact,
+    }
+
+
+def evaluate_path(
+    args,
+    fk_module,
+    batch,
+    rigids_apo: Rigid,
+    rigids_holo: Rigid,
+    path: Tuple[List[Rigid], List[torch.Tensor], List[float]],
+    bridge_path: Tuple[List[Rigid], List[torch.Tensor], List[float]],
+    d_apo: torch.Tensor,
+    d_holo: torch.Tensor,
+) -> Tuple[Dict[str, base.RunningStats], Dict[str, int]]:
+    rigids_list, chi_list, t_list = path
+    bridge_rigids, bridge_chi, bridge_t = bridge_path
+    path_dists: List[torch.Tensor] = []
+    for rigids_t, chi_t in zip(rigids_list, chi_list):
+        atom14_t = base.torsions_to_atom14(
+            fk_module, batch.torsion_apo[..., :3], chi_t, rigids_t, batch.aatype
+        )
+        path_dists.append(
+            base.min_sc_ligand_dist(
+                atom14_t["atom14_pos"].float(),
+                atom14_t["atom14_mask"].bool(),
+                batch.lig_points.float(),
+                batch.lig_mask.bool(),
+                batch.node_mask.bool(),
+            )
+        )
+
+    d_final = path_dists[-1]
+    delta_target = d_holo - d_apo
+    delta_actual = d_final - d_apo
+    classes = class_masks(args, batch, d_apo, d_holo)
+    cap = float(args.path_dist_cap)
+    endpoint_abs = (d_final.clamp(max=cap) - d_holo.clamp(max=cap)).abs()
+    improvement = (d_apo - d_holo).abs() - (d_final - d_holo).abs()
+
+    path_mae = d_final.new_zeros(d_final.shape)
+    for d_t, t_val in zip(path_dists, t_list):
+        target_t = d_apo + float(t_val) * delta_target
+        path_mae = path_mae + (d_t.clamp(max=cap) - target_t.clamp(max=cap)).abs()
+    path_mae = path_mae / max(len(path_dists), 1)
+
+    path_dist_stack = torch.stack(path_dists, dim=0)
+    path_min_ligand_dist = path_dist_stack.min(dim=0).values
+    clash_severity = torch.relu(
+        path_min_ligand_dist.new_tensor(float(args.ligand_clash_dist)) - path_min_ligand_dist
+    )
+    clash_proxy = (clash_severity > 0).float()
+
+    chi_holo = batch.torsion_holo[..., 3:7]
+    gap_total = []
+    step_total = []
+    step_chi = []
+    step_trans = []
+    for rigids_t, chi_t in zip(rigids_list, chi_list):
+        total_gap, _, _, _ = base.state_gap_to_holo(
+            rigids_t, chi_t, rigids_holo, chi_holo, batch.chi_mask
+        )
+        gap_total.append(total_gap)
+    for idx in range(1, len(rigids_list)):
+        total_step, trans_step, _, chi_step = base.state_step_motion(
+            rigids_list[idx - 1],
+            chi_list[idx - 1],
+            rigids_list[idx],
+            chi_list[idx],
+            batch.chi_mask,
+        )
+        step_total.append(total_step)
+        step_trans.append(trans_step)
+        step_chi.append(chi_step)
+
+    if step_total:
+        step_total_stack = torch.stack(step_total, dim=0)
+        path_length_total = step_total_stack.sum(dim=0)
+        path_action_total = (step_total_stack ** 2).sum(dim=0)
+        velocity_spike = base.velocity_spike_ratio(step_total)
+        late_fraction_10 = base.late_fraction(step_total, t_list, 0.9)
+    else:
+        path_length_total = d_final.new_zeros(d_final.shape)
+        path_action_total = d_final.new_zeros(d_final.shape)
+        velocity_spike = d_final.new_zeros(d_final.shape)
+        late_fraction_10 = d_final.new_zeros(d_final.shape)
+
+    bridge_dev = []
+    for rigids_t, chi_t, rigids_b, chi_b, t_val in zip(
+        rigids_list, chi_list, bridge_rigids, bridge_chi, bridge_t
+    ):
+        if not (1e-6 < float(t_val) < 1.0 - 1e-6):
+            continue
+        total_dev, _, _, _ = base.state_step_motion(
+            rigids_b, chi_b, rigids_t, chi_t, batch.chi_mask
+        )
+        bridge_dev.append(total_dev)
+    if bridge_dev:
+        bridge_dev_mean = torch.stack(bridge_dev, dim=0).mean(dim=0)
+        bridge_dev_max = torch.stack(bridge_dev, dim=0).max(dim=0).values
+    else:
+        bridge_dev_mean = d_final.new_zeros(d_final.shape)
+        bridge_dev_max = d_final.new_zeros(d_final.shape)
+
+    progress_auc = base.progress_auc_from_gaps(gap_total)
+    stats = defaultdict(base.RunningStats)
+    counts: Dict[str, int] = {}
+    for name, mask in classes.items():
+        counts[name] = int(mask.sum().item())
+        stats[f"{name}/endpoint_abs_dist"].add(endpoint_abs, mask)
+        stats[f"{name}/path_mae_dist"].add(path_mae, mask)
+        stats[f"{name}/improvement_to_holo"].add(improvement, mask)
+        base.add_direction(stats, f"{name}/direction_acc", delta_actual, delta_target, mask)
+        stats[f"{name}/path_min_ligand_dist"].add(path_min_ligand_dist, mask)
+        stats[f"{name}/ligand_clash_proxy"].add(clash_proxy, mask)
+        stats[f"{name}/ligand_clash_severity"].add(clash_severity, mask)
+        stats[f"{name}/path_length_total"].add(path_length_total, mask)
+        stats[f"{name}/path_action_total"].add(path_action_total, mask)
+        stats[f"{name}/velocity_spike_ratio"].add(velocity_spike, mask)
+        stats[f"{name}/late_motion_fraction_10"].add(late_fraction_10, mask)
+        stats[f"{name}/bridge_dev_total_mean"].add(bridge_dev_mean, mask)
+        stats[f"{name}/bridge_dev_total_max"].add(bridge_dev_max, mask)
+        stats[f"{name}/progress_auc_total"].add(progress_auc, mask)
+    return stats, counts
+
+
+def merge_stats(total_stats, batch_stats):
+    for key, stat in batch_stats.items():
+        total_stats[key].sum += stat.sum
+        total_stats[key].count += stat.count
+
+
+def summarize(stats: Dict[str, base.RunningStats]) -> Dict[str, Optional[float]]:
+    return {key: stat.mean for key, stat in sorted(stats.items())}
+
+
+def metrics_delta(metrics: Dict[str, Optional[float]], reference: Dict[str, Optional[float]]) -> Dict[str, float]:
+    out = {}
+    for key, value in metrics.items():
+        ref = reference.get(key)
+        if value is None or ref is None:
+            continue
+        out[key] = float(value) - float(ref)
+    return out
+
+
+def main() -> None:
+    args = parse_args()
+    methods = parse_methods(args.methods)
+    if "freeflow_projected" in methods and not (args.free_flow_checkpoint or args.checkpoint):
+        raise ValueError("freeflow_projected requires --checkpoint or --free_flow_checkpoint")
+    if int(args.n_path_steps) <= 0:
+        raise ValueError("--n_path_steps must be > 0")
+    if int(args.n_tau_grid) < 3:
+        raise ValueError("--n_tau_grid must be >= 3")
+
+    device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
+    ckpt, config, model, interaction_settings, stage1v2_settings = load_model_for_checkpoint(
+        args, args.checkpoint, device, args.split
+    )
+    del ckpt
+    model.eval()
+    integration_clips = base.resolve_integration_clips(args, config)
+
+    free_model = model
+    free_config = config
+    free_interaction_settings = interaction_settings
+    free_stage1v2_settings = stage1v2_settings
+    if "freeflow_projected" in methods and args.free_flow_checkpoint:
+        _, free_config, free_model, free_interaction_settings, free_stage1v2_settings = load_model_for_checkpoint(
+            args, args.free_flow_checkpoint, device, args.split
+        )
+        args.config = free_config
+        integration_clips = base.resolve_integration_clips(args, free_config)
+
+    # Restore the primary config for dataloader construction.
+    args.config = config
+    fk_module = create_openfold_fk().to(device)
+    fk_module.eval()
+    loader = create_stage2_dataloader(
+        args.data_dir,
+        split=args.split,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        require_nma=bool(getattr(config, "use_nma", False)),
+        valid_samples_file=args.valid_samples_file,
+        trust_prechecked_samples=args.trust_prechecked_samples,
+        stage1v2_posterior_cache_dir=stage1v2_settings["cache_dir"],
+        stage1v2_posterior_feature_mode=stage1v2_settings["mode"],
+        stage1v2_posterior_feature_names=stage1v2_settings["names_raw"],
+        esm_num_layers=int(getattr(config, "esm_num_layers", 1)),
+    )
+
+    tau_grid = torch.linspace(0.0, 1.0, int(args.n_tau_grid), device=device)
+    method_stats = {method: defaultdict(base.RunningStats) for method in methods}
+    method_counts = {method: defaultdict(int) for method in methods}
+    group_counts_total = defaultdict(int)
+    total_batches = 0
+    total_samples = 0
+
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(tqdm(loader, desc="Bridge time-warp", ncols=120)):
+            if args.max_batches is not None and batch_idx >= int(args.max_batches):
+                break
+            batch = base.batch_to_device(batch, device)
+            rigids_apo = base.build_rigids_from_backbone(batch.N_apo, batch.Ca_apo, batch.C_apo, batch.node_mask)
+            rigids_holo = base.build_rigids_from_backbone(batch.N_holo, batch.Ca_holo, batch.C_holo, batch.node_mask)
+            n_steps = int(args.n_path_steps)
+            bridge_path = base.pure_bridge_path(batch, rigids_apo, rigids_holo, n_steps)
+
+            atom14_apo = base.torsions_to_atom14(
+                fk_module, batch.torsion_apo[..., :3], batch.torsion_apo[..., 3:7], rigids_apo, batch.aatype
+            )
+            atom14_holo = base.torsions_to_atom14(
+                fk_module, batch.torsion_holo[..., :3], batch.torsion_holo[..., 3:7], rigids_holo, batch.aatype
+            )
+            d_apo = base.min_sc_ligand_dist(
+                atom14_apo["atom14_pos"].float(),
+                atom14_apo["atom14_mask"].bool(),
+                batch.lig_points.float(),
+                batch.lig_mask.bool(),
+                batch.node_mask.bool(),
+            )
+            d_holo = base.min_sc_ligand_dist(
+                atom14_holo["atom14_pos"].float(),
+                atom14_holo["atom14_mask"].bool(),
+                batch.lig_points.float(),
+                batch.lig_mask.bool(),
+                batch.node_mask.bool(),
+            )
+            class_map = class_masks(args, batch, d_apo, d_holo)
+            finite = class_map["all_pocket"]
+            d_bridge_grid, grid_rigids, grid_chi = compute_bridge_distance_grid(
+                fk_module, batch, rigids_apo, rigids_holo, tau_grid
+            )
+            cost = path_cost_against_distance_schedule(
+                d_bridge_grid, d_apo, d_holo, n_steps, float(args.path_dist_cap)
+            )
+
+            paths: Dict[str, Tuple[List[Rigid], List[torch.Tensor], List[float]]] = {}
+            if "pure_bridge" in methods:
+                paths["pure_bridge"] = bridge_path
+            if "oracle_global" in methods:
+                tau = build_oracle_global_tau(cost, finite, tau_grid)
+                paths["oracle_global"] = build_tau_grid_path(batch, rigids_apo, rigids_holo, tau)
+            if "oracle_group" in methods:
+                group_masks = build_group_masks(
+                    finite, d_apo, d_holo, float(args.active_delta), float(args.contact_dist)
+                )
+                tau, group_counts = build_oracle_group_tau(cost, finite, group_masks, tau_grid, n_steps)
+                for name, count in group_counts.items():
+                    group_counts_total[name] += int(count)
+                paths["oracle_group"] = build_tau_grid_path(batch, rigids_apo, rigids_holo, tau)
+            if "oracle_residue" in methods:
+                tau = build_oracle_residue_tau(cost, finite, tau_grid, n_steps)
+                paths["oracle_residue"] = build_tau_grid_path(batch, rigids_apo, rigids_holo, tau)
+            if "freeflow_projected" in methods:
+                args.config = free_config
+                n_free_steps = int(args.n_free_flow_steps or n_steps)
+                if n_free_steps != n_steps:
+                    raise ValueError("freeflow_projected currently requires n_free_flow_steps == n_path_steps")
+                tau = build_free_flow_projected_tau(
+                    args,
+                    free_model,
+                    fk_module,
+                    batch,
+                    rigids_apo,
+                    rigids_holo,
+                    grid_rigids,
+                    grid_chi,
+                    n_steps,
+                    tau_grid,
+                    free_interaction_settings,
+                    free_stage1v2_settings,
+                    integration_clips,
+                    finite,
+                )
+                args.config = config
+                paths["freeflow_projected"] = build_tau_grid_path(batch, rigids_apo, rigids_holo, tau)
+
+            for method, path in paths.items():
+                stats, counts = evaluate_path(
+                    args,
+                    fk_module,
+                    batch,
+                    rigids_apo,
+                    rigids_holo,
+                    path,
+                    bridge_path,
+                    d_apo,
+                    d_holo,
+                )
+                merge_stats(method_stats[method], stats)
+                for key, value in counts.items():
+                    method_counts[method][key] += int(value)
+
+            total_batches += 1
+            total_samples += int(batch.esm.shape[0])
+
+    summaries = {}
+    pure_metrics = summarize(method_stats["pure_bridge"]) if "pure_bridge" in method_stats else {}
+    for method in methods:
+        metrics = summarize(method_stats[method])
+        summaries[method] = {
+            "metrics": metrics,
+            "delta_vs_pure_bridge": metrics_delta(metrics, pure_metrics) if pure_metrics else {},
+            "counts": dict(method_counts[method]),
+        }
+
+    output = {
+        "checkpoint": args.checkpoint,
+        "free_flow_checkpoint": args.free_flow_checkpoint or args.checkpoint,
+        "data_dir": args.data_dir,
+        "split": args.split,
+        "valid_samples_file": args.valid_samples_file,
+        "methods": list(methods),
+        "settings": {
+            "n_path_steps": int(args.n_path_steps),
+            "n_tau_grid": int(args.n_tau_grid),
+            "active_delta": float(args.active_delta),
+            "contact_dist": float(args.contact_dist),
+            "path_dist_cap": float(args.path_dist_cap),
+            "ligand_clash_dist": float(args.ligand_clash_dist),
+            "pocket_threshold": float(args.pocket_threshold),
+        },
+        "batches": total_batches,
+        "samples": total_samples,
+        "group_counts": dict(group_counts_total),
+        "results": summaries,
+    }
+    if args.output:
+        out_path = Path(args.output)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(output, indent=2, sort_keys=True))
+        print(f"Saved: {out_path}")
+    else:
+        print(json.dumps(output, indent=2, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()
