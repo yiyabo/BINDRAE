@@ -367,7 +367,7 @@ def load_model_for_checkpoint(args, ckpt_path: str, device: torch.device, split:
         args, config, split
     )
     model = TorsionFlowNet(model_config).to(device)
-    model.load_state_dict(ckpt["model_state_dict"], strict=True)
+    base.load_model_state_allow_timewarp_head(model, ckpt["model_state_dict"])
     model.eval()
     model._bindrae_config = config
     return ckpt, config, model, interaction_settings, stage1v2_settings

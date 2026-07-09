@@ -39,6 +39,9 @@ PATH_PARAMETERIZATION="${PATH_PARAMETERIZATION:-checkpoint}"
 BOUNDARY_RESIDUAL_ENVELOPE="${BOUNDARY_RESIDUAL_ENVELOPE:-}"
 BOUNDARY_RESIDUAL_SCALE="${BOUNDARY_RESIDUAL_SCALE:-}"
 TERMINAL_PROJECTION_SCHEDULE="${TERMINAL_PROJECTION_SCHEDULE:-}"
+TIME_WARP_LOGIT_SCALE="${TIME_WARP_LOGIT_SCALE:-}"
+TIME_WARP_RATE_EPS="${TIME_WARP_RATE_EPS:-}"
+TIME_WARP_RATE_CLIP="${TIME_WARP_RATE_CLIP:-}"
 INTERACTION_PRIOR_FEATURE_MODE="${INTERACTION_PRIOR_FEATURE_MODE:-}"
 INTERACTION_PRIOR_CKPT="${INTERACTION_PRIOR_CKPT:-}"
 INTERACTION_PRIOR_TEMPERATURE="${INTERACTION_PRIOR_TEMPERATURE:-}"
@@ -71,9 +74,9 @@ case "$TRUST_PRECHECKED_SAMPLES" in
     ;;
 esac
 case "$PATH_PARAMETERIZATION" in
-  checkpoint|flow|projected_flow|boundary_residual_v1|boundary_residual|pure_bridge) ;;
+  checkpoint|flow|projected_flow|boundary_residual_v1|boundary_residual|pure_bridge|bridge_timewarp_v1) ;;
   *)
-    echo "ERROR: PATH_PARAMETERIZATION must be checkpoint, flow, projected_flow, boundary_residual_v1, boundary_residual, or pure_bridge"
+    echo "ERROR: PATH_PARAMETERIZATION must be checkpoint, flow, projected_flow, boundary_residual_v1, boundary_residual, pure_bridge, or bridge_timewarp_v1"
     exit 1
     ;;
 esac
@@ -95,6 +98,19 @@ if [[ -n "$TERMINAL_PROJECTION_SCHEDULE" ]]; then
       ;;
   esac
 fi
+if [[ -n "$TIME_WARP_LOGIT_SCALE" || -n "$TIME_WARP_RATE_EPS" || -n "$TIME_WARP_RATE_CLIP" ]]; then
+  python - <<PY
+logit_scale = float("${TIME_WARP_LOGIT_SCALE:-1.0}")
+rate_eps = float("${TIME_WARP_RATE_EPS:-1e-3}")
+rate_clip = float("${TIME_WARP_RATE_CLIP:-10.0}")
+if logit_scale <= 0.0:
+    raise SystemExit("ERROR: TIME_WARP_LOGIT_SCALE must be > 0")
+if rate_eps <= 0.0:
+    raise SystemExit("ERROR: TIME_WARP_RATE_EPS must be > 0")
+if rate_clip < 0.0:
+    raise SystemExit("ERROR: TIME_WARP_RATE_CLIP must be >= 0")
+PY
+fi
 
 echo "=============================================="
 echo "BINDRAE Stage-2 transition evaluator"
@@ -110,6 +126,9 @@ echo "Path mode:         $PATH_PARAMETERIZATION"
 echo "Boundary envelope: ${BOUNDARY_RESIDUAL_ENVELOPE:-checkpoint_default}"
 echo "Boundary scale:    ${BOUNDARY_RESIDUAL_SCALE:-checkpoint_default}"
 echo "Projection sched:  ${TERMINAL_PROJECTION_SCHEDULE:-checkpoint_default}"
+echo "Timewarp logit:    ${TIME_WARP_LOGIT_SCALE:-checkpoint_default}"
+echo "Timewarp eps:      ${TIME_WARP_RATE_EPS:-checkpoint_default}"
+echo "Timewarp clip:     ${TIME_WARP_RATE_CLIP:-checkpoint_default}"
 echo "Feature mode:      ${INTERACTION_PRIOR_FEATURE_MODE:-checkpoint_default}"
 echo "Interaction prior: ${INTERACTION_PRIOR_CKPT:-checkpoint_default}"
 echo "Prior temperature: ${INTERACTION_PRIOR_TEMPERATURE:-checkpoint_default}"
@@ -151,6 +170,15 @@ if [[ -n "$BOUNDARY_RESIDUAL_SCALE" ]]; then
 fi
 if [[ -n "$TERMINAL_PROJECTION_SCHEDULE" ]]; then
   ARGS+=(--terminal_projection_schedule "$TERMINAL_PROJECTION_SCHEDULE")
+fi
+if [[ -n "$TIME_WARP_LOGIT_SCALE" ]]; then
+  ARGS+=(--time_warp_logit_scale "$TIME_WARP_LOGIT_SCALE")
+fi
+if [[ -n "$TIME_WARP_RATE_EPS" ]]; then
+  ARGS+=(--time_warp_rate_eps "$TIME_WARP_RATE_EPS")
+fi
+if [[ -n "$TIME_WARP_RATE_CLIP" ]]; then
+  ARGS+=(--time_warp_rate_clip "$TIME_WARP_RATE_CLIP")
 fi
 if [[ -n "$INTERACTION_PRIOR_FEATURE_MODE" ]]; then
   ARGS+=(--interaction_prior_feature_mode "$INTERACTION_PRIOR_FEATURE_MODE")

@@ -18,6 +18,7 @@ from types import SimpleNamespace
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 
 project_root = Path(__file__).resolve().parent.parent
@@ -61,6 +62,7 @@ def parse_args() -> argparse.Namespace:
             "boundary_residual_v1",
             "boundary_residual",
             "pure_bridge",
+            "bridge_timewarp_v1",
         ],
         help="Path construction to evaluate; checkpoint uses checkpoint config",
     )
@@ -82,6 +84,9 @@ def parse_args() -> argparse.Namespace:
         choices=["smoothstep", "smootherstep", "late_smoother", "quadratic"],
         help="override checkpoint correction schedule for projected_flow",
     )
+    parser.add_argument("--time_warp_logit_scale", type=float, default=None)
+    parser.add_argument("--time_warp_rate_eps", type=float, default=None)
+    parser.add_argument("--time_warp_rate_clip", type=float, default=None)
     parser.add_argument("--n_integration_steps", type=int, default=None)
     parser.add_argument("--integration_chi_clip", type=float, default=None)
     parser.add_argument("--integration_rot_clip", type=float, default=None)
@@ -316,6 +321,19 @@ def build_model_config_for_checkpoint(args, config, split: str) -> Tuple[Torsion
     return model_config, interaction_settings, stage1v2_settings
 
 
+def load_model_state_allow_timewarp_head(model: TorsionFlowNet, state_dict: Dict[str, torch.Tensor]) -> None:
+    result = model.load_state_dict(state_dict, strict=False)
+    disallowed_missing = [
+        key for key in result.missing_keys
+        if not key.startswith("time_warp_head.")
+    ]
+    if disallowed_missing or result.unexpected_keys:
+        raise RuntimeError(
+            "Incompatible Stage-2 checkpoint. "
+            f"missing={disallowed_missing}, unexpected={list(result.unexpected_keys)}"
+        )
+
+
 def resolve_integration_clips(args, config) -> Dict[str, float]:
     return {
         "chi": (
@@ -353,6 +371,7 @@ def resolve_path_parameterization(args, config) -> str:
         "boundary_residual_v1",
         "boundary_residual",
         "pure_bridge",
+        "bridge_timewarp_v1",
     }
     if mode not in allowed:
         raise ValueError(f"Unsupported path_parameterization={mode}")
@@ -421,6 +440,30 @@ def interpolate_endpoints(
 ) -> Tuple[Rigid, torch.Tensor]:
     t_scalar = float(t_value)
     gamma = 3.0 * t_scalar * t_scalar - 2.0 * t_scalar * t_scalar * t_scalar
+    chi0 = batch.torsion_apo[..., 3:7]
+    chi1 = batch.torsion_holo[..., 3:7]
+    chi_t = wrap_to_pi(chi0 + gamma * wrap_to_pi(chi1 - chi0))
+
+    R0, t0 = rigid_to_rt(rigids_apo)
+    R1, t1 = rigid_to_rt(rigids_holo)
+    R0_inv, t0_inv = rigid_inverse(R0, t0)
+    R_delta, t_delta = rigid_compose(R0_inv, t0_inv, R1, t1)
+    xi = se3_log(R_delta, t_delta)
+    R_inc, t_inc = se3_exp(xi * gamma)
+    R_t, trans_t = rigid_compose(R0, t0, R_inc, t_inc)
+    return rt_to_rigid(R_t, trans_t), chi_t
+
+
+def interpolate_endpoints_tensor(
+    batch,
+    rigids_apo: Rigid,
+    rigids_holo: Rigid,
+    tau: torch.Tensor,
+) -> Tuple[Rigid, torch.Tensor]:
+    if tau.ndim != 2:
+        raise ValueError(f"tau must have shape [B, N], got {tuple(tau.shape)}")
+    tau = tau.float().clamp(0.0, 1.0)
+    gamma = (3.0 * tau * tau - 2.0 * tau * tau * tau).unsqueeze(-1)
     chi0 = batch.torsion_apo[..., 3:7]
     chi1 = batch.torsion_holo[..., 3:7]
     chi_t = wrap_to_pi(chi0 + gamma * wrap_to_pi(chi1 - chi0))
@@ -618,6 +661,81 @@ def pure_bridge_path(
     return rigids_list, chi_list, t_list
 
 
+def bridge_timewarp_path(
+    model,
+    batch,
+    rigids_apo: Rigid,
+    rigids_holo: Rigid,
+    n_steps: int,
+    interaction_prior: Optional[torch.Tensor],
+    esm_gate_context: Optional[torch.Tensor],
+    logit_scale: float,
+    rate_eps: float,
+    rate_clip: float,
+) -> Tuple[List[Rigid], List[torch.Tensor], List[float]]:
+    n_steps = int(n_steps)
+    if n_steps <= 0:
+        raise ValueError("n_steps must be > 0")
+    bsz, n_res = batch.node_mask.shape
+    device = batch.node_mask.device
+    node_mask = batch.node_mask.bool()
+    node_mask_f = node_mask.float()
+    rates: List[torch.Tensor] = []
+
+    for k in range(n_steps):
+        t_mid = (k + 0.5) / n_steps
+        mid_rigids, mid_chi = interpolate_endpoints(batch, rigids_apo, rigids_holo, t_mid)
+        t_tensor = torch.full((bsz,), t_mid, device=device)
+        out = model(
+            chi=mid_chi,
+            rigids=mid_rigids,
+            esm=batch.esm,
+            lig_points=batch.lig_points,
+            lig_types=batch.lig_types,
+            lig_mask=batch.lig_mask,
+            w_res=batch.w_res,
+            t=t_tensor,
+            node_mask=batch.node_mask,
+            nma_features=batch.nma_features,
+            interaction_prior=interaction_prior,
+            esm_gate_context=esm_gate_context,
+        )
+        logits = out["time_warp_logits"].float().squeeze(-1) * node_mask_f
+        rate = F.softplus(logits * float(logit_scale)) + float(rate_eps)
+        if float(rate_clip) > 0.0:
+            rate = rate.clamp(max=float(rate_clip))
+        rate = torch.where(node_mask, rate, torch.ones_like(rate))
+        rates.append(rate)
+
+    rate_stack = torch.stack(rates, dim=0)
+    cumulative = torch.cumsum(rate_stack, dim=0)
+    total_rate = cumulative[-1].clamp(min=float(rate_eps))
+    tau_values: List[torch.Tensor] = [
+        torch.zeros((bsz, n_res), dtype=torch.float32, device=device)
+    ]
+    for k in range(n_steps):
+        tau_values.append((cumulative[k] / total_rate).clamp(0.0, 1.0))
+
+    rigids_list: List[Rigid] = [rigids_apo]
+    chi_list: List[torch.Tensor] = [batch.torsion_apo[..., 3:7]]
+    t_list: List[float] = [0.0]
+    for k in range(1, n_steps):
+        base_t = k / n_steps
+        tau = torch.where(
+            node_mask,
+            tau_values[k],
+            torch.full_like(tau_values[k], base_t),
+        )
+        rigids_t, chi_t = interpolate_endpoints_tensor(batch, rigids_apo, rigids_holo, tau)
+        rigids_list.append(rigids_t)
+        chi_list.append(chi_t)
+        t_list.append(base_t)
+    rigids_list.append(rigids_holo)
+    chi_list.append(batch.torsion_holo[..., 3:7])
+    t_list.append(1.0)
+    return rigids_list, chi_list, t_list
+
+
 def project_terminal_path(
     rigids_list: List[Rigid],
     chi_list: List[torch.Tensor],
@@ -678,6 +796,37 @@ def construct_path(
     correction: Dict[str, torch.Tensor] = {}
     if path_mode == "pure_bridge":
         return (*pure_bridge_path(batch, rigids_apo, rigids_holo, n_steps), correction)
+    if path_mode == "bridge_timewarp_v1":
+        logit_scale = (
+            float(args.time_warp_logit_scale)
+            if args.time_warp_logit_scale is not None
+            else float(getattr(config, "time_warp_logit_scale", 1.0))
+        )
+        rate_eps = (
+            float(args.time_warp_rate_eps)
+            if args.time_warp_rate_eps is not None
+            else float(getattr(config, "time_warp_rate_eps", 1e-3))
+        )
+        rate_clip = (
+            float(args.time_warp_rate_clip)
+            if args.time_warp_rate_clip is not None
+            else float(getattr(config, "time_warp_rate_clip", 10.0))
+        )
+        return (
+            *bridge_timewarp_path(
+                model,
+                batch,
+                rigids_apo,
+                rigids_holo,
+                n_steps=n_steps,
+                interaction_prior=interaction_prior,
+                esm_gate_context=esm_gate_context,
+                logit_scale=logit_scale,
+                rate_eps=rate_eps,
+                rate_clip=rate_clip,
+            ),
+            correction,
+        )
     if path_mode in {"boundary_residual_v1", "boundary_residual"}:
         envelope = args.boundary_residual_envelope or getattr(config, "boundary_residual_envelope", "sin2")
         residual_scale = (
@@ -1186,7 +1335,7 @@ def main() -> None:
     )
     integration_clips = resolve_integration_clips(args, config)
     model = TorsionFlowNet(model_config).to(device)
-    model.load_state_dict(ckpt["model_state_dict"], strict=True)
+    load_model_state_allow_timewarp_head(model, ckpt["model_state_dict"])
     model.eval()
     fk_module = create_openfold_fk().to(device)
     fk_module.eval()
@@ -1258,6 +1407,21 @@ def main() -> None:
             args.terminal_projection_schedule
             if args.terminal_projection_schedule is not None
             else getattr(config, "terminal_projection_schedule", None)
+        ),
+        "time_warp_logit_scale": (
+            args.time_warp_logit_scale
+            if args.time_warp_logit_scale is not None
+            else getattr(config, "time_warp_logit_scale", None)
+        ),
+        "time_warp_rate_eps": (
+            args.time_warp_rate_eps
+            if args.time_warp_rate_eps is not None
+            else getattr(config, "time_warp_rate_eps", None)
+        ),
+        "time_warp_rate_clip": (
+            args.time_warp_rate_clip
+            if args.time_warp_rate_clip is not None
+            else getattr(config, "time_warp_rate_clip", None)
         ),
         "n_integration_steps": n_steps,
         "integration_clips": integration_clips,

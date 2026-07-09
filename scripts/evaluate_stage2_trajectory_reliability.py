@@ -35,6 +35,7 @@ from evaluate_stage2_transition_paths import (  # noqa: E402
     combined_prior_features,
     compute_interaction_prior_feature,
     integrate_path,
+    load_model_state_allow_timewarp_head,
     min_sc_ligand_dist,
     rigid_to_rt,
     resolve_integration_clips,
@@ -676,7 +677,7 @@ def main() -> None:
     )
     integration_clips = resolve_integration_clips(args, config)
     model = TorsionFlowNet(model_config).to(device)
-    model.load_state_dict(ckpt["model_state_dict"], strict=True)
+    load_model_state_allow_timewarp_head(model, ckpt["model_state_dict"])
     model.eval()
     fk_module = create_openfold_fk().to(device)
     fk_module.eval()

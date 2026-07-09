@@ -106,10 +106,13 @@ class TrainingConfig:
 
     # Bridge / FM
     alpha: float = 1.5
-    path_parameterization: str = "flow"  # flow | boundary_residual_v1 | boundary_residual | projected_flow
+    path_parameterization: str = "flow"  # flow | boundary_residual_v1 | boundary_residual | projected_flow | bridge_timewarp_v1
     boundary_residual_envelope: str = "sin2"  # sin2 | poly
     boundary_residual_scale: float = 1.0
     terminal_projection_schedule: str = "smootherstep"  # smoothstep | smootherstep | late_smoother | quadratic
+    time_warp_logit_scale: float = 1.0
+    time_warp_rate_eps: float = 1e-3
+    time_warp_rate_clip: float = 10.0
     init_from_checkpoint: Optional[str] = None
 
     # Boundary-residual teacher distillation. The cache stores free-flow

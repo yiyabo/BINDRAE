@@ -79,6 +79,11 @@ class Stage2Trainer:
         'bridge_anchor',
         'bridge_anchor_mask_frac',
         'bridge_anchor_residual_norm',
+        'time_warp_tau_abs_mean',
+        'time_warp_tau_abs_max',
+        'time_warp_rate_mean',
+        'time_warp_rate_max',
+        'time_warp_logit_abs_mean',
         'pep',
         'contact',
         'stage1v2_guidance',
@@ -361,10 +366,20 @@ class Stage2Trainer:
         if config.contact_loss_mode not in allowed_contact_loss_modes:
             raise ValueError(f"Unsupported contact_loss_mode={config.contact_loss_mode}")
         allowed_path_parameterizations = {
-            'flow', 'boundary_residual_v1', 'boundary_residual', 'projected_flow'
+            'flow',
+            'boundary_residual_v1',
+            'boundary_residual',
+            'projected_flow',
+            'bridge_timewarp_v1',
         }
         if config.path_parameterization not in allowed_path_parameterizations:
             raise ValueError(f"Unsupported path_parameterization={config.path_parameterization}")
+        if config.time_warp_logit_scale <= 0.0:
+            raise ValueError("time_warp_logit_scale must be > 0")
+        if config.time_warp_rate_eps <= 0.0:
+            raise ValueError("time_warp_rate_eps must be > 0")
+        if config.time_warp_rate_clip < 0.0:
+            raise ValueError("time_warp_rate_clip must be >= 0")
         allowed_boundary_envelopes = {'sin2', 'poly'}
         if config.boundary_residual_envelope not in allowed_boundary_envelopes:
             raise ValueError(f"Unsupported boundary_residual_envelope={config.boundary_residual_envelope}")
@@ -1517,6 +1532,159 @@ class Stage2Trainer:
         R_t, trans_t = rigid_compose(R0, t0, R_inc, t_inc)
         return self._rt_to_rigid(R_t, trans_t), chi_t
 
+    def _interpolate_endpoints_tensor(
+        self,
+        batch,
+        rigids_apo: Rigid,
+        rigids_holo: Rigid,
+        tau: torch.Tensor,
+    ) -> Tuple[Rigid, torch.Tensor]:
+        """Interpolate apo->holo with per-residue tau while preserving endpoints."""
+        if tau.ndim != 2:
+            raise ValueError(f"tau must have shape [B, N], got {tuple(tau.shape)}")
+        tau = tau.float().clamp(0.0, 1.0)
+        gamma = (3.0 * tau * tau - 2.0 * tau * tau * tau).unsqueeze(-1)
+
+        chi0 = batch.torsion_apo[..., 3:7]
+        chi1 = batch.torsion_holo[..., 3:7]
+        chi_t = wrap_to_pi(chi0 + gamma * wrap_to_pi(chi1 - chi0))
+
+        R0, t0 = self._rigid_to_rt(rigids_apo)
+        R1, t1 = self._rigid_to_rt(rigids_holo)
+        R0_inv, t0_inv = rigid_inverse(R0, t0)
+        R_delta, t_delta = rigid_compose(R0_inv, t0_inv, R1, t1)
+        xi = se3_log(R_delta, t_delta)
+        R_inc, t_inc = se3_exp(xi * gamma)
+        R_t, trans_t = rigid_compose(R0, t0, R_inc, t_inc)
+        return self._rt_to_rigid(R_t, trans_t), chi_t
+
+    def bridge_timewarp_path(
+        self,
+        batch,
+        rigids_apo: Rigid,
+        rigids_holo: Rigid,
+        stage1_chi=None,
+        stage1_rigids=None,
+        stage1_chi_mask=None,
+        interaction_prior=None,
+        esm_gate_context=None,
+    ) -> Tuple[List[Rigid], List[torch.Tensor], List[float]]:
+        """Endpoint-exact bridge with learned monotone per-residue progress."""
+        n_steps = int(self.config.n_integration_steps)
+        if n_steps <= 0:
+            raise ValueError("n_integration_steps must be > 0")
+
+        bsz, n_res = batch.node_mask.shape
+        device = self.device
+        node_mask = batch.node_mask.bool()
+        node_mask_f = node_mask.float()
+        rates: List[torch.Tensor] = []
+        logits_list: List[torch.Tensor] = []
+
+        for k in range(n_steps):
+            t_mid = (k + 0.5) / n_steps
+            mid_rigids, mid_chi = self._interpolate_endpoints(
+                batch,
+                rigids_apo,
+                rigids_holo,
+                t_mid,
+            )
+            t_tensor = torch.full((bsz,), t_mid, device=device)
+            out = self._model_forward(
+                chi=mid_chi,
+                rigids=mid_rigids,
+                esm=batch.esm,
+                lig_points=batch.lig_points,
+                lig_types=batch.lig_types,
+                lig_mask=batch.lig_mask,
+                w_res=batch.w_res,
+                t=t_tensor,
+                node_mask=batch.node_mask,
+                nma_features=batch.nma_features,
+                stage1_chi=stage1_chi,
+                stage1_rigids=stage1_rigids,
+                stage1_chi_mask=stage1_chi_mask,
+                interaction_prior=interaction_prior,
+                esm_gate_context=esm_gate_context,
+                current_step=self.global_step,
+            )
+            logits = out["time_warp_logits"].squeeze(-1).float()
+            logits = logits * node_mask_f
+            scaled_logits = logits * float(self.config.time_warp_logit_scale)
+            rate = F.softplus(scaled_logits) + float(self.config.time_warp_rate_eps)
+            if float(self.config.time_warp_rate_clip) > 0.0:
+                rate = rate.clamp(max=float(self.config.time_warp_rate_clip))
+            rate = torch.where(node_mask, rate, torch.ones_like(rate))
+            rates.append(rate)
+            logits_list.append(logits)
+
+        rate_stack = torch.stack(rates, dim=0)
+        cumulative = torch.cumsum(rate_stack, dim=0)
+        total_rate = cumulative[-1].clamp(min=float(self.config.time_warp_rate_eps))
+
+        tau_values: List[torch.Tensor] = [
+            torch.zeros((bsz, n_res), dtype=torch.float32, device=device)
+        ]
+        for k in range(n_steps):
+            tau_values.append((cumulative[k] / total_rate).clamp(0.0, 1.0))
+
+        rigids_list: List[Rigid] = [rigids_apo]
+        chi_list: List[torch.Tensor] = [batch.torsion_apo[..., 3:7]]
+        t_list: List[float] = [0.0]
+        for k in range(1, n_steps):
+            base_t = k / n_steps
+            tau = torch.where(
+                node_mask,
+                tau_values[k],
+                torch.full_like(tau_values[k], base_t),
+            )
+            rigids_t, chi_t = self._interpolate_endpoints_tensor(
+                batch,
+                rigids_apo,
+                rigids_holo,
+                tau,
+            )
+            rigids_list.append(rigids_t)
+            chi_list.append(chi_t)
+            t_list.append(base_t)
+        rigids_list.append(rigids_holo)
+        chi_list.append(batch.torsion_holo[..., 3:7])
+        t_list.append(1.0)
+
+        tau_stack = torch.stack(tau_values, dim=0)
+        base_grid = torch.linspace(
+            0.0,
+            1.0,
+            steps=n_steps + 1,
+            device=device,
+            dtype=tau_stack.dtype,
+        ).view(n_steps + 1, 1, 1)
+        valid_tau = node_mask.unsqueeze(0).expand_as(tau_stack)
+        tau_abs = (tau_stack - base_grid).abs()
+        valid_count = valid_tau.float().sum().clamp(min=1.0)
+        logits_stack = torch.stack(logits_list, dim=0)
+        valid_rate = node_mask.unsqueeze(0).expand_as(rate_stack)
+        valid_rate_count = valid_rate.float().sum().clamp(min=1.0)
+        self._last_timewarp_stats = {
+            "time_warp_tau_abs_mean": (
+                tau_abs[valid_tau].sum() / valid_count
+            ).detach(),
+            "time_warp_tau_abs_max": (
+                tau_abs.masked_fill(~valid_tau, 0.0).max()
+            ).detach(),
+            "time_warp_rate_mean": (
+                rate_stack[valid_rate].sum() / valid_rate_count
+            ).detach(),
+            "time_warp_rate_max": (
+                rate_stack.masked_fill(~valid_rate, 0.0).max()
+            ).detach(),
+            "time_warp_logit_abs_mean": (
+                logits_stack.abs()[valid_rate].sum() / valid_rate_count
+            ).detach(),
+        }
+
+        return rigids_list, chi_list, t_list
+
     def _boundary_residual_envelope(self, t_value: float) -> float:
         t_scalar = min(max(float(t_value), 0.0), 1.0)
         if t_scalar <= 0.0 or t_scalar >= 1.0:
@@ -2002,13 +2170,15 @@ class Stage2Trainer:
         boundary_residual_mode = self.config.path_parameterization in {
             'boundary_residual_v1', 'boundary_residual'
         }
+        timewarp_mode = self.config.path_parameterization == 'bridge_timewarp_v1'
+        bridge_only_mode = boundary_residual_mode or timewarp_mode
 
         # FM loss for free-flow modes. In boundary_residual_v1 the same logged
         # keys are residual regularizers: the model output is an endpoint-zero
         # displacement around the analytic apo-holo bridge, not a bridge
         # velocity target.
         chi_mask = batch.chi_mask.float()
-        if boundary_residual_mode:
+        if bridge_only_mode:
             chi_target = torch.zeros_like(d_chi_pred)
             rot_target = torch.zeros_like(d_rot_pred)
             trans_target = torch.zeros_like(d_trans_pred)
@@ -2129,6 +2299,11 @@ class Stage2Trainer:
         L_bridge_anchor = chi_ref.new_tensor(0.0)
         bridge_anchor_mask_frac = chi_ref.new_tensor(0.0)
         bridge_anchor_residual_norm = chi_ref.new_tensor(0.0)
+        time_warp_tau_abs_mean = chi_ref.new_tensor(0.0)
+        time_warp_tau_abs_max = chi_ref.new_tensor(0.0)
+        time_warp_rate_mean = chi_ref.new_tensor(0.0)
+        time_warp_rate_max = chi_ref.new_tensor(0.0)
+        time_warp_logit_abs_mean = chi_ref.new_tensor(0.0)
         L_pep = chi_ref.new_tensor(0.0)
         L_contact = chi_ref.new_tensor(0.0)
         L_stage1v2_guidance = chi_ref.new_tensor(0.0)
@@ -2179,6 +2354,39 @@ class Stage2Trainer:
                     stage1_chi_mask=stage1_chi_mask,
                     interaction_prior=combined_prior_features,
                     esm_gate_context=esm_gate_context,
+                )
+            elif timewarp_mode:
+                self._last_timewarp_stats = {}
+                rigids_list, chi_list, t_list = self.bridge_timewarp_path(
+                    batch,
+                    rigids_apo,
+                    rigids_holo,
+                    stage1_chi=stage1_chi,
+                    stage1_rigids=stage1_rigids,
+                    stage1_chi_mask=stage1_chi_mask,
+                    interaction_prior=combined_prior_features,
+                    esm_gate_context=esm_gate_context,
+                )
+                stats = getattr(self, "_last_timewarp_stats", {})
+                time_warp_tau_abs_mean = stats.get(
+                    "time_warp_tau_abs_mean",
+                    time_warp_tau_abs_mean,
+                )
+                time_warp_tau_abs_max = stats.get(
+                    "time_warp_tau_abs_max",
+                    time_warp_tau_abs_max,
+                )
+                time_warp_rate_mean = stats.get(
+                    "time_warp_rate_mean",
+                    time_warp_rate_mean,
+                )
+                time_warp_rate_max = stats.get(
+                    "time_warp_rate_max",
+                    time_warp_rate_max,
+                )
+                time_warp_logit_abs_mean = stats.get(
+                    "time_warp_logit_abs_mean",
+                    time_warp_logit_abs_mean,
                 )
             else:
                 rigids_list, chi_list, t_list = self.integrate_path(
@@ -2716,6 +2924,11 @@ class Stage2Trainer:
             'bridge_anchor': L_bridge_anchor,
             'bridge_anchor_mask_frac': bridge_anchor_mask_frac,
             'bridge_anchor_residual_norm': bridge_anchor_residual_norm,
+            'time_warp_tau_abs_mean': time_warp_tau_abs_mean,
+            'time_warp_tau_abs_max': time_warp_tau_abs_max,
+            'time_warp_rate_mean': time_warp_rate_mean,
+            'time_warp_rate_max': time_warp_rate_max,
+            'time_warp_logit_abs_mean': time_warp_logit_abs_mean,
             'pep': L_pep,
             'contact': L_contact,
             'stage1v2_guidance': L_stage1v2_guidance,
@@ -3001,6 +3214,9 @@ class Stage2Trainer:
             'boundary_residual_envelope',
             'boundary_residual_scale',
             'terminal_projection_schedule',
+            'time_warp_logit_scale',
+            'time_warp_rate_eps',
+            'time_warp_rate_clip',
             'length_bucket_residue_budget',
             # Loss contract.
             'contact_loss_mode',
@@ -3022,6 +3238,9 @@ class Stage2Trainer:
             'boundary_residual_envelope': 'sin2',
             'boundary_residual_scale': 1.0,
             'terminal_projection_schedule': 'smootherstep',
+            'time_warp_logit_scale': 1.0,
+            'time_warp_rate_eps': 1e-3,
+            'time_warp_rate_clip': 10.0,
         }
         for field in strict_fields:
             old = self._config_value(ckpt_config, field)

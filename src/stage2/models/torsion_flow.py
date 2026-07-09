@@ -196,6 +196,13 @@ class TorsionFlowNet(nn.Module):
             nn.SiLU(),
             nn.Linear(self.config.head_hidden, 6),
         )
+        self.time_warp_head = nn.Sequential(
+            nn.Linear(rigid_in_dim, self.config.head_hidden),
+            nn.SiLU(),
+            nn.Linear(self.config.head_hidden, 1),
+        )
+        nn.init.zeros_(self.time_warp_head[-1].weight)
+        nn.init.zeros_(self.time_warp_head[-1].bias)
 
     def forward(self,
                 chi: torch.Tensor,           # [B, N, 4]
@@ -345,6 +352,7 @@ class TorsionFlowNet(nn.Module):
         rigid_vel = self.rigid_head(rigid_input)
         d_rot = rigid_vel[..., :3] * gate  # gate: [B, N, 1] broadcasts to [B, N, 3]
         d_trans = rigid_vel[..., 3:] * gate
+        time_warp_logits = self.time_warp_head(rigid_input)
 
         # mask padded residues
         if node_mask is not None:
@@ -353,12 +361,14 @@ class TorsionFlowNet(nn.Module):
             d_rot = d_rot * mask
             d_trans = d_trans * mask
             gate = gate * mask
+            time_warp_logits = time_warp_logits * mask
 
         out = {
-            "d_chi": d_chi + ipa_update_dependency,
+            "d_chi": d_chi + ipa_update_dependency + time_warp_logits.sum() * 0.0,
             "d_rigid_rot": d_rot,
             "d_rigid_trans": d_trans,
             "gate": gate,
+            "time_warp_logits": time_warp_logits,
         }
         if self.repa_student_proj is not None:
             repa_student = self.repa_student_proj(s_geo)

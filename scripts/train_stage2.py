@@ -65,7 +65,13 @@ def parse_args():
     parser.add_argument('--val_t', type=float, default=0.5,
                         help='Validation t value; set negative for random validation t')
     parser.add_argument('--path_parameterization', type=str, default='flow',
-                        choices=['flow', 'boundary_residual_v1', 'boundary_residual', 'projected_flow'],
+                        choices=[
+                            'flow',
+                            'boundary_residual_v1',
+                            'boundary_residual',
+                            'projected_flow',
+                            'bridge_timewarp_v1',
+                        ],
                         help='Path construction used by geometry losses/evaluation')
     parser.add_argument('--boundary_residual_envelope', type=str, default='sin2',
                         choices=['sin2', 'poly'],
@@ -75,6 +81,12 @@ def parse_args():
     parser.add_argument('--terminal_projection_schedule', type=str, default='smootherstep',
                         choices=['smoothstep', 'smootherstep', 'late_smoother', 'quadratic'],
                         help='Correction schedule for projected_flow terminal projection')
+    parser.add_argument('--time_warp_logit_scale', type=float, default=1.0,
+                        help='Scale applied to bridge_timewarp_v1 logits before softplus rates')
+    parser.add_argument('--time_warp_rate_eps', type=float, default=1e-3,
+                        help='Minimum positive interval rate for bridge_timewarp_v1')
+    parser.add_argument('--time_warp_rate_clip', type=float, default=10.0,
+                        help='Maximum interval rate for bridge_timewarp_v1; <=0 disables clipping')
     parser.add_argument('--init_from_checkpoint', type=str, default=None,
                         help='Warm-start model weights only; does not restore optimizer, scheduler, or epoch')
     parser.add_argument('--teacher_residual_cache_dir', type=str, default=None,
@@ -356,6 +368,9 @@ def main():
         boundary_residual_envelope=args.boundary_residual_envelope,
         boundary_residual_scale=args.boundary_residual_scale,
         terminal_projection_schedule=args.terminal_projection_schedule,
+        time_warp_logit_scale=args.time_warp_logit_scale,
+        time_warp_rate_eps=args.time_warp_rate_eps,
+        time_warp_rate_clip=args.time_warp_rate_clip,
         init_from_checkpoint=args.init_from_checkpoint,
         teacher_residual_cache_dir=args.teacher_residual_cache_dir,
         w_teacher_residual=args.w_teacher_residual,
@@ -533,6 +548,9 @@ def main():
     print(f"  - boundary_residual_envelope: {config.boundary_residual_envelope}")
     print(f"  - boundary_residual_scale: {config.boundary_residual_scale}")
     print(f"  - terminal_projection_schedule: {config.terminal_projection_schedule}")
+    print(f"  - time_warp_logit_scale: {config.time_warp_logit_scale}")
+    print(f"  - time_warp_rate_eps: {config.time_warp_rate_eps}")
+    print(f"  - time_warp_rate_clip: {config.time_warp_rate_clip}")
     print(f"  - init_from_checkpoint: {config.init_from_checkpoint or 'OFF'}")
     print(f"  - teacher_residual_cache_dir: {config.teacher_residual_cache_dir or 'OFF'}")
     print(f"  - w_teacher_residual: {config.w_teacher_residual}")

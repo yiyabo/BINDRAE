@@ -70,6 +70,9 @@ PATH_PARAMETERIZATION="${PATH_PARAMETERIZATION:-boundary_residual_v1}"
 BOUNDARY_RESIDUAL_ENVELOPE="${BOUNDARY_RESIDUAL_ENVELOPE:-sin2}"
 BOUNDARY_RESIDUAL_SCALE="${BOUNDARY_RESIDUAL_SCALE:-1.0}"
 TERMINAL_PROJECTION_SCHEDULE="${TERMINAL_PROJECTION_SCHEDULE:-smootherstep}"
+TIME_WARP_LOGIT_SCALE="${TIME_WARP_LOGIT_SCALE:-1.0}"
+TIME_WARP_RATE_EPS="${TIME_WARP_RATE_EPS:-1e-3}"
+TIME_WARP_RATE_CLIP="${TIME_WARP_RATE_CLIP:-10.0}"
 INIT_FROM_CHECKPOINT="${INIT_FROM_CHECKPOINT:-}"
 TEACHER_RESIDUAL_CACHE_DIR="${TEACHER_RESIDUAL_CACHE_DIR:-}"
 W_TEACHER_RESIDUAL="${W_TEACHER_RESIDUAL:-0.0}"
@@ -158,15 +161,15 @@ case "$ESM_FUSION_MODE" in
     ;;
 esac
 case "$PATH_PARAMETERIZATION" in
-  flow|boundary_residual_v1|boundary_residual|projected_flow) ;;
+  flow|boundary_residual_v1|boundary_residual|projected_flow|bridge_timewarp_v1) ;;
   *)
-    echo "ERROR: PATH_PARAMETERIZATION must be flow, boundary_residual_v1, boundary_residual, or projected_flow"
+    echo "ERROR: PATH_PARAMETERIZATION must be flow, boundary_residual_v1, boundary_residual, projected_flow, or bridge_timewarp_v1"
     exit 1
     ;;
 esac
 if [[ -z "$W_FM_CHI" ]]; then
   case "$PATH_PARAMETERIZATION" in
-    boundary_residual_v1|boundary_residual)
+    boundary_residual_v1|boundary_residual|bridge_timewarp_v1)
       W_FM_CHI="0.1"
       ;;
     *)
@@ -176,7 +179,7 @@ if [[ -z "$W_FM_CHI" ]]; then
 fi
 if [[ -z "$W_FM_RIGID" ]]; then
   case "$PATH_PARAMETERIZATION" in
-    boundary_residual_v1|boundary_residual)
+    boundary_residual_v1|boundary_residual|bridge_timewarp_v1)
       W_FM_RIGID="0.1"
       ;;
     *)
@@ -246,6 +249,17 @@ case "$TERMINAL_PROJECTION_SCHEDULE" in
     exit 1
     ;;
 esac
+python - <<PY
+logit_scale = float("$TIME_WARP_LOGIT_SCALE")
+rate_eps = float("$TIME_WARP_RATE_EPS")
+rate_clip = float("$TIME_WARP_RATE_CLIP")
+if logit_scale <= 0.0:
+    raise SystemExit("ERROR: TIME_WARP_LOGIT_SCALE must be > 0")
+if rate_eps <= 0.0:
+    raise SystemExit("ERROR: TIME_WARP_RATE_EPS must be > 0")
+if rate_clip < 0.0:
+    raise SystemExit("ERROR: TIME_WARP_RATE_CLIP must be >= 0")
+PY
 case "$LIGAND_CLEARANCE_MASK_MODE" in
   pocket|node|motion_active|pocket_or_motion_active) ;;
   *)
@@ -778,6 +792,9 @@ echo "path param:      $PATH_PARAMETERIZATION"
 echo "boundary env:    $BOUNDARY_RESIDUAL_ENVELOPE"
 echo "boundary scale:  $BOUNDARY_RESIDUAL_SCALE"
 echo "projection sched:$TERMINAL_PROJECTION_SCHEDULE"
+echo "timewarp logit:  $TIME_WARP_LOGIT_SCALE"
+echo "timewarp eps:    $TIME_WARP_RATE_EPS"
+echo "timewarp clip:   $TIME_WARP_RATE_CLIP"
 echo "init ckpt:       ${INIT_FROM_CHECKPOINT:-OFF}"
 echo "teacher cache:   ${TEACHER_RESIDUAL_CACHE_DIR:-OFF}"
 echo "w_teacher_resid: $W_TEACHER_RESIDUAL"
@@ -851,6 +868,9 @@ python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA {torch.versio
   --boundary_residual_envelope "$BOUNDARY_RESIDUAL_ENVELOPE" \
   --boundary_residual_scale "$BOUNDARY_RESIDUAL_SCALE" \
   --terminal_projection_schedule "$TERMINAL_PROJECTION_SCHEDULE" \
+  --time_warp_logit_scale "$TIME_WARP_LOGIT_SCALE" \
+  --time_warp_rate_eps "$TIME_WARP_RATE_EPS" \
+  --time_warp_rate_clip "$TIME_WARP_RATE_CLIP" \
   "${TEACHER_RESIDUAL_ARGS[@]}" \
   --val_split "$VAL_SPLIT" \
   --no_stage1_prior \
