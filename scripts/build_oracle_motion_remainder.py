@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import signal
 import sys
@@ -177,6 +178,21 @@ def load_cache_records(cache_dir: Path, fast: bool = False) -> List[Dict]:
 
 
 def write_manifest(path: Path, records: List[Dict], args: argparse.Namespace, source_dirs: List[Path]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_root = path.parent.resolve()
+    portable_records = []
+    for record in records:
+        portable_record = dict(record)
+        raw_path = portable_record.get("path")
+        if raw_path:
+            resolved_path = Path(raw_path).resolve()
+            portable_record["path"] = str(resolved_path)
+            portable_record["relative_path"] = os.path.relpath(
+                resolved_path,
+                start=manifest_root,
+            )
+        portable_records.append(portable_record)
+
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "source": "holo_truth",
@@ -185,12 +201,11 @@ def write_manifest(path: Path, records: List[Dict], args: argparse.Namespace, so
         "args": vars(args),
         "feature_names": list(FEATURE_NAMES),
         "feature_dim": len(FEATURE_NAMES),
-        "num_samples": len(records),
-        "counts": merge_counts(records),
+        "num_samples": len(portable_records),
+        "counts": merge_counts(portable_records),
         "source_cache_dirs": [str(p.resolve()) for p in source_dirs],
-        "records": records,
+        "records": portable_records,
     }
-    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
 
 
@@ -229,8 +244,21 @@ def main() -> None:
     rejects_out = Path(args.rejects_out)
 
     candidate_ids = read_ids(candidate_list)
-    partial_records = load_cache_records(partial_cache_dir, fast=args.fast_manifest)
-    completed: Set[str] = {str(record["sample_id"]) for record in partial_records}
+    source_dirs = [partial_cache_dir, *(Path(raw) for raw in args.extra_cache_dir)]
+    records_by_source = [
+        load_cache_records(cache_dir, fast=args.fast_manifest)
+        for cache_dir in source_dirs
+    ]
+    partial_records = records_by_source[0]
+    all_records: List[Dict] = []
+    completed: Set[str] = set()
+    for source_records in records_by_source:
+        for record in source_records:
+            sample_id = str(record.get("sample_id", ""))
+            if not sample_id or sample_id in completed:
+                continue
+            completed.add(sample_id)
+            all_records.append(record)
 
     if args.partial_manifest_out:
         write_manifest(Path(args.partial_manifest_out), partial_records, args, [partial_cache_dir])
@@ -255,18 +283,6 @@ def main() -> None:
     rejects_out.write_text("\n".join(f"{sample_id}\t{reason}" for sample_id, reason in rejects) + ("\n" if rejects else ""))
 
     if args.merged_manifest_out:
-        all_records = list(partial_records)
-        source_dirs = [partial_cache_dir]
-        seen = set(completed)
-        for raw_dir in args.extra_cache_dir:
-            cache_dir = Path(raw_dir)
-            source_dirs.append(cache_dir)
-            for record in load_cache_records(cache_dir, fast=args.fast_manifest):
-                sample_id = str(record.get("sample_id"))
-                if not sample_id or sample_id in seen:
-                    continue
-                seen.add(sample_id)
-                all_records.append(record)
         write_manifest(Path(args.merged_manifest_out), all_records, args, source_dirs)
 
     print(
