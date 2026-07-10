@@ -42,6 +42,8 @@ from ..modules import (
     compute_contact_score,
     compute_peptide_loss,
     compute_w_eff,
+    endpoint_zero_envelope,
+    project_product_tangent_normal,
 )
 from src.stage1.models import Stage1Model, Stage1ModelConfig
 from src.stage1.models.fk_openfold import create_openfold_fk, reorder_torsions_to_openfold
@@ -84,6 +86,14 @@ class Stage2Trainer:
         'time_warp_rate_mean',
         'time_warp_rate_max',
         'time_warp_logit_abs_mean',
+        'phase_residual_magnitude',
+        'phase_residual_temporal_smooth',
+        'phase_residual_neighbor_smooth',
+        'phase_residual_active_frac',
+        'phase_residual_norm_mean',
+        'phase_residual_norm_max',
+        'phase_residual_raw_parallel_cos',
+        'phase_residual_projected_parallel_cos',
         'pep',
         'contact',
         'stage1v2_guidance',
@@ -371,6 +381,7 @@ class Stage2Trainer:
             'boundary_residual',
             'projected_flow',
             'bridge_timewarp_v1',
+            'phase_orthogonal_residual_v1',
         }
         if config.path_parameterization not in allowed_path_parameterizations:
             raise ValueError(f"Unsupported path_parameterization={config.path_parameterization}")
@@ -380,6 +391,39 @@ class Stage2Trainer:
             raise ValueError("time_warp_rate_eps must be > 0")
         if config.time_warp_rate_clip < 0.0:
             raise ValueError("time_warp_rate_clip must be >= 0")
+        if config.phase_residual_tau_mode not in {'learned', 'identity'}:
+            raise ValueError(
+                f"Unsupported phase_residual_tau_mode={config.phase_residual_tau_mode}"
+            )
+        if config.phase_residual_envelope not in {'poly', 'sin2'}:
+            raise ValueError(
+                f"Unsupported phase_residual_envelope={config.phase_residual_envelope}"
+            )
+        for name in (
+            'phase_residual_scale',
+            'phase_residual_rotation_metric_scale',
+            'phase_residual_translation_metric_scale',
+            'phase_residual_chi_metric_scale',
+        ):
+            if float(getattr(config, name)) <= 0.0:
+                raise ValueError(f"{name} must be > 0")
+        if float(config.phase_residual_min_tangent_norm) < 0.0:
+            raise ValueError("phase_residual_min_tangent_norm must be >= 0")
+        for name in (
+            'w_phase_residual_magnitude',
+            'w_phase_residual_temporal_smooth',
+            'w_phase_residual_neighbor_smooth',
+        ):
+            if float(getattr(config, name)) < 0.0:
+                raise ValueError(f"{name} must be >= 0")
+        if (
+            config.path_parameterization == 'phase_orthogonal_residual_v1'
+            and config.geom_loss_every_n_steps != 1
+        ):
+            raise ValueError(
+                "phase_orthogonal_residual_v1 requires geom_loss_every_n_steps=1; "
+                "phase and residual heads are trained through path geometry"
+            )
         allowed_boundary_envelopes = {'sin2', 'poly'}
         if config.boundary_residual_envelope not in allowed_boundary_envelopes:
             raise ValueError(f"Unsupported boundary_residual_envelope={config.boundary_residual_envelope}")
@@ -428,6 +472,13 @@ class Stage2Trainer:
             )
         if config.n_integration_steps <= 0:
             raise ValueError(f"n_integration_steps must be > 0, got {config.n_integration_steps}")
+        if (
+            config.path_parameterization == 'phase_orthogonal_residual_v1'
+            and config.n_integration_steps < 2
+        ):
+            raise ValueError(
+                "phase_orthogonal_residual_v1 requires n_integration_steps >= 2"
+            )
         if config.n_geom_steps <= 0:
             raise ValueError(f"n_geom_steps must be > 0, got {config.n_geom_steps}")
         if config.geom_loss_every_n_steps <= 0:
@@ -548,6 +599,9 @@ class Stage2Trainer:
             repa_enabled=config.repa_enabled,
             repa_dim=config.repa_dim,
             repa_target_dim=self.repa_target_dim,
+            phase_residual_enabled=(
+                config.path_parameterization == 'phase_orthogonal_residual_v1'
+            ),
         )
         self.model = TorsionFlowNet(model_config).to(self.device)
         resume_target_exists = bool(config.resume_from) or (
@@ -1558,6 +1612,17 @@ class Stage2Trainer:
         R_t, trans_t = rigid_compose(R0, t0, R_inc, t_inc)
         return self._rt_to_rigid(R_t, trans_t), chi_t
 
+    @staticmethod
+    def _interpolate_backbone_torsions(batch, t_value: float) -> torch.Tensor:
+        """Decode-only bridge for backbone torsions required by OpenFoldFK."""
+        t_scalar = min(max(float(t_value), 0.0), 1.0)
+        gamma = 3.0 * t_scalar * t_scalar - 2.0 * t_scalar * t_scalar * t_scalar
+        torsion_apo = batch.torsion_apo[..., :3]
+        torsion_holo = batch.torsion_holo[..., :3]
+        return wrap_to_pi(
+            torsion_apo + gamma * wrap_to_pi(torsion_holo - torsion_apo)
+        )
+
     def bridge_timewarp_path(
         self,
         batch,
@@ -1684,6 +1749,398 @@ class Stage2Trainer:
         }
 
         return rigids_list, chi_list, t_list
+
+    def _phase_residual_tau_values(
+        self,
+        batch,
+        rigids_apo: Rigid,
+        rigids_holo: Rigid,
+        stage1_chi=None,
+        stage1_rigids=None,
+        stage1_chi_mask=None,
+        interaction_prior=None,
+        esm_gate_context=None,
+    ) -> List[torch.Tensor]:
+        """Build monotone per-residue phase values for the new path family."""
+        n_steps = int(self.config.n_integration_steps)
+        bsz, n_res = batch.node_mask.shape
+        node_mask = batch.node_mask.bool()
+        node_mask_f = node_mask.float()
+
+        if self.config.phase_residual_tau_mode == 'identity':
+            tau_values = [
+                torch.full(
+                    (bsz, n_res),
+                    k / n_steps,
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                for k in range(n_steps + 1)
+            ]
+            zero = batch.w_res.new_tensor(0.0)
+            self._last_timewarp_stats = {
+                "time_warp_tau_abs_mean": zero,
+                "time_warp_tau_abs_max": zero,
+                "time_warp_rate_mean": batch.w_res.new_tensor(1.0),
+                "time_warp_rate_max": batch.w_res.new_tensor(1.0),
+                "time_warp_logit_abs_mean": zero,
+            }
+            return tau_values
+
+        rates: List[torch.Tensor] = []
+        logits_list: List[torch.Tensor] = []
+        for k in range(n_steps):
+            t_mid = (k + 0.5) / n_steps
+            mid_rigids, mid_chi = self._interpolate_endpoints(
+                batch,
+                rigids_apo,
+                rigids_holo,
+                t_mid,
+            )
+            out = self._model_forward(
+                chi=mid_chi,
+                rigids=mid_rigids,
+                esm=batch.esm,
+                lig_points=batch.lig_points,
+                lig_types=batch.lig_types,
+                lig_mask=batch.lig_mask,
+                w_res=batch.w_res,
+                t=torch.full((bsz,), t_mid, device=self.device),
+                node_mask=batch.node_mask,
+                nma_features=batch.nma_features,
+                stage1_chi=stage1_chi,
+                stage1_rigids=stage1_rigids,
+                stage1_chi_mask=stage1_chi_mask,
+                interaction_prior=interaction_prior,
+                esm_gate_context=esm_gate_context,
+                current_step=self.global_step,
+            )
+            logits = out['time_warp_logits'].squeeze(-1).float() * node_mask_f
+            scaled_logits = logits * float(self.config.time_warp_logit_scale)
+            rate = F.softplus(scaled_logits) + float(self.config.time_warp_rate_eps)
+            if float(self.config.time_warp_rate_clip) > 0.0:
+                rate = rate.clamp(max=float(self.config.time_warp_rate_clip))
+            rate = torch.where(node_mask, rate, torch.ones_like(rate))
+            rates.append(rate)
+            logits_list.append(logits)
+
+        rate_stack = torch.stack(rates, dim=0)
+        cumulative = torch.cumsum(rate_stack, dim=0)
+        total_rate = cumulative[-1].clamp(min=float(self.config.time_warp_rate_eps))
+        tau_values = [
+            torch.zeros((bsz, n_res), dtype=torch.float32, device=self.device)
+        ]
+        tau_values.extend(
+            (cumulative[k] / total_rate).clamp(0.0, 1.0)
+            for k in range(n_steps)
+        )
+
+        tau_stack = torch.stack(tau_values, dim=0)
+        base_grid = torch.linspace(
+            0.0,
+            1.0,
+            steps=n_steps + 1,
+            device=self.device,
+            dtype=tau_stack.dtype,
+        ).view(n_steps + 1, 1, 1)
+        valid_tau = node_mask.unsqueeze(0).expand_as(tau_stack)
+        valid_rate = node_mask.unsqueeze(0).expand_as(rate_stack)
+        valid_tau_count = valid_tau.float().sum().clamp(min=1.0)
+        valid_rate_count = valid_rate.float().sum().clamp(min=1.0)
+        tau_abs = (tau_stack - base_grid).abs()
+        logits_stack = torch.stack(logits_list, dim=0)
+        self._last_timewarp_stats = {
+            "time_warp_tau_abs_mean": (
+                tau_abs[valid_tau].sum() / valid_tau_count
+            ).detach(),
+            "time_warp_tau_abs_max": (
+                tau_abs.masked_fill(~valid_tau, 0.0).max()
+            ).detach(),
+            "time_warp_rate_mean": (
+                rate_stack[valid_rate].sum() / valid_rate_count
+            ).detach(),
+            "time_warp_rate_max": (
+                rate_stack.masked_fill(~valid_rate, 0.0).max()
+            ).detach(),
+            "time_warp_logit_abs_mean": (
+                logits_stack.abs()[valid_rate].sum() / valid_rate_count
+            ).detach(),
+        }
+        return tau_values
+
+    def phase_orthogonal_residual_path(
+        self,
+        batch,
+        rigids_apo: Rigid,
+        rigids_holo: Rigid,
+        stage1_chi=None,
+        stage1_rigids=None,
+        stage1_chi_mask=None,
+        interaction_prior=None,
+        esm_gate_context=None,
+    ) -> Tuple[List[Rigid], List[torch.Tensor], List[float]]:
+        """Endpoint-exact phase bridge plus a normal-space spatial residual."""
+        n_steps = int(self.config.n_integration_steps)
+        bsz = batch.node_mask.shape[0]
+        node_mask = batch.node_mask.bool()
+        tau_values = self._phase_residual_tau_values(
+            batch,
+            rigids_apo,
+            rigids_holo,
+            stage1_chi=stage1_chi,
+            stage1_rigids=stage1_rigids,
+            stage1_chi_mask=stage1_chi_mask,
+            interaction_prior=interaction_prior,
+            esm_gate_context=esm_gate_context,
+        )
+
+        R0, trans0 = self._rigid_to_rt(rigids_apo)
+        R1, trans1 = self._rigid_to_rt(rigids_holo)
+        R0_inv, trans0_inv = rigid_inverse(R0, trans0)
+        R_delta, trans_delta = rigid_compose(R0_inv, trans0_inv, R1, trans1)
+        bridge_tangent_rigid = se3_log(R_delta, trans_delta)
+        bridge_tangent_chi = wrap_to_pi(
+            batch.torsion_holo[..., 3:7] - batch.torsion_apo[..., 3:7]
+        )
+
+        rigids_list: List[Rigid] = [rigids_apo]
+        chi_list: List[torch.Tensor] = [batch.torsion_apo[..., 3:7]]
+        t_list: List[float] = [0.0]
+        records: List[Dict[str, torch.Tensor]] = []
+
+        for k in range(1, n_steps):
+            t_value = k / n_steps
+            tau = torch.where(
+                node_mask,
+                tau_values[k],
+                torch.full_like(tau_values[k], t_value),
+            )
+            bridge_rigids, bridge_chi = self._interpolate_endpoints_tensor(
+                batch,
+                rigids_apo,
+                rigids_holo,
+                tau,
+            )
+            out = self._model_forward(
+                chi=bridge_chi,
+                rigids=bridge_rigids,
+                esm=batch.esm,
+                lig_points=batch.lig_points,
+                lig_types=batch.lig_types,
+                lig_mask=batch.lig_mask,
+                w_res=batch.w_res,
+                t=torch.full((bsz,), t_value, device=self.device),
+                node_mask=batch.node_mask,
+                nma_features=batch.nma_features,
+                stage1_chi=stage1_chi,
+                stage1_rigids=stage1_rigids,
+                stage1_chi_mask=stage1_chi_mask,
+                interaction_prior=interaction_prior,
+                esm_gate_context=esm_gate_context,
+                current_step=self.global_step,
+            )
+            residual_rigid = torch.cat(
+                [out['residual_rigid_rot'], out['residual_rigid_trans']],
+                dim=-1,
+            )
+            projection = project_product_tangent_normal(
+                residual_rigid,
+                out['residual_chi'],
+                bridge_tangent_rigid,
+                bridge_tangent_chi,
+                node_mask=batch.node_mask,
+                chi_mask=batch.chi_mask,
+                rotation_scale=self.config.phase_residual_rotation_metric_scale,
+                translation_scale=self.config.phase_residual_translation_metric_scale,
+                chi_scale=self.config.phase_residual_chi_metric_scale,
+                min_tangent_norm=self.config.phase_residual_min_tangent_norm,
+            )
+            projected_rigid = projection['projected_rigid']
+            projected_chi = projection['projected_chi']
+            envelope = endpoint_zero_envelope(
+                torch.full((bsz,), t_value, device=self.device),
+                kind=self.config.phase_residual_envelope,
+            ).view(bsz, 1, 1)
+            residual_weight = envelope * float(self.config.phase_residual_scale)
+
+            R_bridge, trans_bridge = self._rigid_to_rt(bridge_rigids)
+            R_residual, trans_residual = se3_exp(projected_rigid * residual_weight)
+            R_path, trans_path = rigid_compose(
+                R_bridge,
+                trans_bridge,
+                R_residual,
+                trans_residual,
+            )
+            rigids_list.append(self._rt_to_rigid(R_path, trans_path))
+            chi_list.append(wrap_to_pi(bridge_chi + projected_chi * residual_weight))
+            t_list.append(t_value)
+            records.append(
+                {
+                    **projection,
+                    'chi_mask': batch.chi_mask.bool(),
+                    'time': projected_rigid.new_tensor(t_value),
+                    'envelope': envelope.squeeze(-1).squeeze(-1),
+                }
+            )
+
+        rigids_list.append(rigids_holo)
+        chi_list.append(batch.torsion_holo[..., 3:7])
+        t_list.append(1.0)
+        self._last_phase_residual_records = records
+
+        if records:
+            active = torch.stack([record['active_mask'] for record in records], dim=0)
+            active_f = active.float()
+            active_count = active_f.sum().clamp(min=1.0)
+
+            def active_mean(name: str) -> torch.Tensor:
+                values = torch.stack([record[name] for record in records], dim=0)
+                return (values * active_f).sum() / active_count
+
+            projected_norm = torch.stack(
+                [record['projected_residual_metric_norm'] for record in records],
+                dim=0,
+            )
+            self._last_phase_residual_stats = {
+                'phase_residual_active_frac': (
+                    active_f.sum()
+                    / (
+                        batch.node_mask.float().sum().clamp(min=1.0)
+                        * len(records)
+                    )
+                ).detach(),
+                'phase_residual_norm_mean': active_mean(
+                    'projected_residual_metric_norm'
+                ).detach(),
+                'phase_residual_norm_max': projected_norm.masked_fill(
+                    ~active,
+                    0.0,
+                ).max().detach(),
+                'phase_residual_raw_parallel_cos': active_mean(
+                    'raw_parallel_cos_abs'
+                ).detach(),
+                'phase_residual_projected_parallel_cos': active_mean(
+                    'projected_parallel_cos_abs'
+                ).detach(),
+            }
+        else:
+            zero = batch.w_res.new_tensor(0.0)
+            self._last_phase_residual_stats = {
+                'phase_residual_active_frac': zero,
+                'phase_residual_norm_mean': zero,
+                'phase_residual_norm_max': zero,
+                'phase_residual_raw_parallel_cos': zero,
+                'phase_residual_projected_parallel_cos': zero,
+            }
+
+        return rigids_list, chi_list, t_list
+
+    def _phase_residual_regularization(
+        self,
+        batch,
+    ) -> Dict[str, torch.Tensor]:
+        records = getattr(self, '_last_phase_residual_records', [])
+        zero = batch.w_res.new_tensor(0.0)
+        if not records:
+            return {
+                'magnitude': zero,
+                'temporal_smooth': zero,
+                'neighbor_smooth': zero,
+                'background': zero,
+            }
+
+        rot_scale = float(self.config.phase_residual_rotation_metric_scale)
+        trans_scale = float(self.config.phase_residual_translation_metric_scale)
+        chi_scale = float(self.config.phase_residual_chi_metric_scale)
+
+        def metric_coordinates(record):
+            rigid = record['projected_rigid']
+            chi = record['projected_chi']
+            return torch.cat(
+                [
+                    rigid[..., :3] / rot_scale,
+                    rigid[..., 3:] / trans_scale,
+                    chi / chi_scale,
+                ],
+                dim=-1,
+            )
+
+        magnitude = zero
+        background = zero
+        bg_w = (1.0 - batch.w_res).clamp(min=0.0) ** self.config.bg_beta
+        for record in records:
+            coordinates = metric_coordinates(record)
+            norm_sq = coordinates.square().sum(dim=-1)
+            active_f = record['active_mask'].float()
+            magnitude = magnitude + (
+                norm_sq * active_f
+            ).sum() / active_f.sum().clamp(min=1.0)
+            background_weight = active_f * bg_w
+            background = background + (
+                norm_sq * background_weight
+            ).sum() / background_weight.sum().clamp(min=1.0)
+        magnitude = magnitude / len(records)
+        background = background / len(records)
+
+        temporal = zero
+        temporal_terms = 0
+        for previous, current in zip(records[:-1], records[1:]):
+            diff = metric_coordinates(current) - metric_coordinates(previous)
+            mask = current['active_mask'] & previous['active_mask']
+            mask_f = mask.float()
+            temporal = temporal + (
+                diff.square().sum(dim=-1) * mask_f
+            ).sum() / mask_f.sum().clamp(min=1.0)
+            temporal_terms += 1
+        if temporal_terms:
+            temporal = temporal / temporal_terms
+
+        neighbor = zero
+        neighbor_terms = 0
+        for record in records:
+            rigid = record['projected_rigid']
+            chi = record['projected_chi']
+            if rigid.shape[1] < 2:
+                continue
+            pair_mask = (
+                record['active_mask'][:, :-1]
+                & record['active_mask'][:, 1:]
+                & batch.node_mask[:, :-1].bool()
+                & batch.node_mask[:, 1:].bool()
+            )
+            pair_f = pair_mask.float()
+            rigid_diff = torch.cat(
+                [
+                    (rigid[:, 1:, :3] - rigid[:, :-1, :3]) / rot_scale,
+                    (rigid[:, 1:, 3:] - rigid[:, :-1, 3:]) / trans_scale,
+                ],
+                dim=-1,
+            )
+            rigid_term = (
+                rigid_diff.square().sum(dim=-1) * pair_f
+            ).sum() / pair_f.sum().clamp(min=1.0)
+
+            chi_pair_mask = (
+                record['chi_mask'][:, 1:]
+                & record['chi_mask'][:, :-1]
+                & pair_mask.unsqueeze(-1)
+            )
+            chi_pair_f = chi_pair_mask.float()
+            chi_diff = (chi[:, 1:] - chi[:, :-1]) / chi_scale
+            chi_term = (
+                chi_diff.square() * chi_pair_f
+            ).sum() / chi_pair_f.sum().clamp(min=1.0)
+            neighbor = neighbor + rigid_term + chi_term
+            neighbor_terms += 1
+        if neighbor_terms:
+            neighbor = neighbor / neighbor_terms
+
+        return {
+            'magnitude': magnitude,
+            'temporal_smooth': temporal,
+            'neighbor_smooth': neighbor,
+            'background': background,
+        }
 
     def _boundary_residual_envelope(self, t_value: float) -> float:
         t_scalar = min(max(float(t_value), 0.0), 1.0)
@@ -2171,14 +2628,29 @@ class Stage2Trainer:
             'boundary_residual_v1', 'boundary_residual'
         }
         timewarp_mode = self.config.path_parameterization == 'bridge_timewarp_v1'
-        bridge_only_mode = boundary_residual_mode or timewarp_mode
+        phase_residual_mode = (
+            self.config.path_parameterization == 'phase_orthogonal_residual_v1'
+        )
+        bridge_only_mode = boundary_residual_mode or timewarp_mode or phase_residual_mode
 
         # FM loss for free-flow modes. In boundary_residual_v1 the same logged
         # keys are residual regularizers: the model output is an endpoint-zero
         # displacement around the analytic apo-holo bridge, not a bridge
         # velocity target.
         chi_mask = batch.chi_mask.float()
-        if bridge_only_mode:
+        if phase_residual_mode:
+            # The new heads are optimized through the constructed path. A
+            # zero-target FM term would collapse the spatial residual before
+            # clash/contact geometry can make it useful.
+            phase_graph_dependency = (
+                out['residual_chi'].sum()
+                + out['residual_rigid_rot'].sum()
+                + out['residual_rigid_trans'].sum()
+                + out['residual_gate'].sum()
+            ) * 0.0
+            L_fm_chi = phase_graph_dependency
+            L_fm_rigid = phase_graph_dependency
+        elif bridge_only_mode:
             chi_target = torch.zeros_like(d_chi_pred)
             rot_target = torch.zeros_like(d_rot_pred)
             trans_target = torch.zeros_like(d_trans_pred)
@@ -2187,13 +2659,14 @@ class Stage2Trainer:
             rot_target = d_rot_ref
             trans_target = d_trans_ref
 
-        fm_chi = ((d_chi_pred - chi_target) ** 2) * loss_w.unsqueeze(-1) * chi_mask
-        fm_chi_denom = (chi_mask * loss_w.unsqueeze(-1)).sum().clamp(min=1e-8)
-        L_fm_chi = fm_chi.sum() / fm_chi_denom
+        if not phase_residual_mode:
+            fm_chi = ((d_chi_pred - chi_target) ** 2) * loss_w.unsqueeze(-1) * chi_mask
+            fm_chi_denom = (chi_mask * loss_w.unsqueeze(-1)).sum().clamp(min=1e-8)
+            L_fm_chi = fm_chi.sum() / fm_chi_denom
 
-        fm_rot = ((d_rot_pred - rot_target) ** 2) * loss_w.unsqueeze(-1)
-        fm_trans = ((d_trans_pred - trans_target) ** 2) * loss_w.unsqueeze(-1)
-        L_fm_rigid = (fm_rot.sum() + fm_trans.sum()) / (loss_w.sum() + 1e-8)
+            fm_rot = ((d_rot_pred - rot_target) ** 2) * loss_w.unsqueeze(-1)
+            fm_trans = ((d_trans_pred - trans_target) ** 2) * loss_w.unsqueeze(-1)
+            L_fm_rigid = (fm_rot.sum() + fm_trans.sum()) / (loss_w.sum() + 1e-8)
 
         L_teacher_residual = chi_ref.new_tensor(0.0)
         L_teacher_residual_rigid = chi_ref.new_tensor(0.0)
@@ -2280,11 +2753,14 @@ class Stage2Trainer:
 
         # Background stability
         bg_w = (1.0 - w_eff).clamp(min=0.0) ** self.config.bg_beta
-        L_bg = (
-            (bg_w * (d_rot_pred ** 2).sum(dim=-1)).sum() +
-            (bg_w * (d_trans_pred ** 2).sum(dim=-1)).sum() +
-            (bg_w.unsqueeze(-1) * (d_chi_pred ** 2) * chi_mask).sum()
-        ) / (bg_w.sum() + 1e-8)
+        if phase_residual_mode:
+            L_bg = phase_graph_dependency
+        else:
+            L_bg = (
+                (bg_w * (d_rot_pred ** 2).sum(dim=-1)).sum() +
+                (bg_w * (d_trans_pred ** 2).sum(dim=-1)).sum() +
+                (bg_w.unsqueeze(-1) * (d_chi_pred ** 2) * chi_mask).sum()
+            ) / (bg_w.sum() + 1e-8)
 
         # Integrate path for geometry (only every N steps for performance)
         compute_geom = force_geom or (
@@ -2304,6 +2780,14 @@ class Stage2Trainer:
         time_warp_rate_mean = chi_ref.new_tensor(0.0)
         time_warp_rate_max = chi_ref.new_tensor(0.0)
         time_warp_logit_abs_mean = chi_ref.new_tensor(0.0)
+        L_phase_residual_magnitude = chi_ref.new_tensor(0.0)
+        L_phase_residual_temporal_smooth = chi_ref.new_tensor(0.0)
+        L_phase_residual_neighbor_smooth = chi_ref.new_tensor(0.0)
+        phase_residual_active_frac = chi_ref.new_tensor(0.0)
+        phase_residual_norm_mean = chi_ref.new_tensor(0.0)
+        phase_residual_norm_max = chi_ref.new_tensor(0.0)
+        phase_residual_raw_parallel_cos = chi_ref.new_tensor(0.0)
+        phase_residual_projected_parallel_cos = chi_ref.new_tensor(0.0)
         L_pep = chi_ref.new_tensor(0.0)
         L_contact = chi_ref.new_tensor(0.0)
         L_stage1v2_guidance = chi_ref.new_tensor(0.0)
@@ -2344,7 +2828,64 @@ class Stage2Trainer:
         L_end_chi_uw = chi_ref.new_tensor(0.0)
 
         if compute_geom:
-            if boundary_residual_mode:
+            if phase_residual_mode:
+                self._last_timewarp_stats = {}
+                self._last_phase_residual_records = []
+                self._last_phase_residual_stats = {}
+                rigids_list, chi_list, t_list = self.phase_orthogonal_residual_path(
+                    batch,
+                    rigids_apo,
+                    rigids_holo,
+                    stage1_chi=stage1_chi,
+                    stage1_rigids=stage1_rigids,
+                    stage1_chi_mask=stage1_chi_mask,
+                    interaction_prior=combined_prior_features,
+                    esm_gate_context=esm_gate_context,
+                )
+                timewarp_stats = getattr(self, '_last_timewarp_stats', {})
+                time_warp_tau_abs_mean = timewarp_stats.get(
+                    'time_warp_tau_abs_mean', time_warp_tau_abs_mean
+                )
+                time_warp_tau_abs_max = timewarp_stats.get(
+                    'time_warp_tau_abs_max', time_warp_tau_abs_max
+                )
+                time_warp_rate_mean = timewarp_stats.get(
+                    'time_warp_rate_mean', time_warp_rate_mean
+                )
+                time_warp_rate_max = timewarp_stats.get(
+                    'time_warp_rate_max', time_warp_rate_max
+                )
+                time_warp_logit_abs_mean = timewarp_stats.get(
+                    'time_warp_logit_abs_mean', time_warp_logit_abs_mean
+                )
+                phase_stats = getattr(self, '_last_phase_residual_stats', {})
+                phase_residual_active_frac = phase_stats.get(
+                    'phase_residual_active_frac', phase_residual_active_frac
+                )
+                phase_residual_norm_mean = phase_stats.get(
+                    'phase_residual_norm_mean', phase_residual_norm_mean
+                )
+                phase_residual_norm_max = phase_stats.get(
+                    'phase_residual_norm_max', phase_residual_norm_max
+                )
+                phase_residual_raw_parallel_cos = phase_stats.get(
+                    'phase_residual_raw_parallel_cos',
+                    phase_residual_raw_parallel_cos,
+                )
+                phase_residual_projected_parallel_cos = phase_stats.get(
+                    'phase_residual_projected_parallel_cos',
+                    phase_residual_projected_parallel_cos,
+                )
+                residual_regularization = self._phase_residual_regularization(batch)
+                L_phase_residual_magnitude = residual_regularization['magnitude']
+                L_phase_residual_temporal_smooth = residual_regularization[
+                    'temporal_smooth'
+                ]
+                L_phase_residual_neighbor_smooth = residual_regularization[
+                    'neighbor_smooth'
+                ]
+                L_bg = residual_regularization['background']
+            elif boundary_residual_mode:
                 rigids_list, chi_list, t_list = self.boundary_residual_path(
                     batch,
                     rigids_apo,
@@ -2427,9 +2968,10 @@ class Stage2Trainer:
             prev_R, prev_t = None, None
             prev_chi = None
 
-            phi_psi_omega = batch.torsion_apo[..., :3]
-            phi_psi_omega_sincos = torch.stack(
-                [torch.sin(phi_psi_omega), torch.cos(phi_psi_omega)], dim=-1
+            phi_psi_omega_apo = batch.torsion_apo[..., :3]
+            phi_psi_omega_apo_sincos = torch.stack(
+                [torch.sin(phi_psi_omega_apo), torch.cos(phi_psi_omega_apo)],
+                dim=-1,
             )
             for idx in geom_indices:
                 rigids_t = rigids_list[idx]
@@ -2437,9 +2979,14 @@ class Stage2Trainer:
                 t_val = t_list[idx]
 
                 # FK decode
+                phi_psi_omega_t = self._interpolate_backbone_torsions(batch, t_val)
+                phi_psi_omega_t_sincos = torch.stack(
+                    [torch.sin(phi_psi_omega_t), torch.cos(phi_psi_omega_t)],
+                    dim=-1,
+                )
                 chi_sincos = torch.stack([torch.sin(chi_t), torch.cos(chi_t)], dim=-1)
                 torsions_sincos = reorder_torsions_to_openfold(
-                    torch.cat([phi_psi_omega_sincos, chi_sincos], dim=2)
+                    torch.cat([phi_psi_omega_t_sincos, chi_sincos], dim=2)
                 )
                 atom14 = self.fk_module(torsions_sincos, rigids_t, batch.aatype)
 
@@ -2722,7 +3269,7 @@ class Stage2Trainer:
             # FAPE endpoint
             chi_sincos = torch.stack([torch.sin(chi_final), torch.cos(chi_final)], dim=-1)
             torsions_final_sincos = reorder_torsions_to_openfold(
-                torch.cat([phi_psi_omega_sincos, chi_sincos], dim=2)
+                torch.cat([phi_psi_omega_holo_sincos, chi_sincos], dim=2)
             )
             atom14_final = self.fk_module(torsions_final_sincos, rigids_final, batch.aatype)
             final_valid_atom = (
@@ -2753,7 +3300,7 @@ class Stage2Trainer:
                 atom14_apo = self.fk_module(
                     reorder_torsions_to_openfold(
                         torch.cat([
-                            phi_psi_omega_sincos,
+                            phi_psi_omega_apo_sincos,
                             torch.stack(
                                 [
                                     torch.sin(batch.torsion_apo[..., 3:7]),
@@ -2834,6 +3381,9 @@ class Stage2Trainer:
             self.config.w_fm_rigid * L_fm_rigid.clamp(max=100.0) +
             self.config.w_teacher_residual * L_teacher_residual.clamp(max=100.0) +
             self.config.w_bg * L_bg.clamp(max=100.0) +
+            self.config.w_phase_residual_magnitude * L_phase_residual_magnitude.clamp(max=100.0) +
+            self.config.w_phase_residual_temporal_smooth * L_phase_residual_temporal_smooth.clamp(max=100.0) +
+            self.config.w_phase_residual_neighbor_smooth * L_phase_residual_neighbor_smooth.clamp(max=100.0) +
             self.config.w_smooth * L_smooth.clamp(max=100.0) +
             self.config.w_clash * L_clash.clamp(max=100.0) +
             self.config.w_ligand_clearance * L_ligand_clearance.clamp(max=100.0) +
@@ -2929,6 +3479,14 @@ class Stage2Trainer:
             'time_warp_rate_mean': time_warp_rate_mean,
             'time_warp_rate_max': time_warp_rate_max,
             'time_warp_logit_abs_mean': time_warp_logit_abs_mean,
+            'phase_residual_magnitude': L_phase_residual_magnitude,
+            'phase_residual_temporal_smooth': L_phase_residual_temporal_smooth,
+            'phase_residual_neighbor_smooth': L_phase_residual_neighbor_smooth,
+            'phase_residual_active_frac': phase_residual_active_frac,
+            'phase_residual_norm_mean': phase_residual_norm_mean,
+            'phase_residual_norm_max': phase_residual_norm_max,
+            'phase_residual_raw_parallel_cos': phase_residual_raw_parallel_cos,
+            'phase_residual_projected_parallel_cos': phase_residual_projected_parallel_cos,
             'pep': L_pep,
             'contact': L_contact,
             'stage1v2_guidance': L_stage1v2_guidance,
@@ -3217,12 +3775,22 @@ class Stage2Trainer:
             'time_warp_logit_scale',
             'time_warp_rate_eps',
             'time_warp_rate_clip',
+            'phase_residual_tau_mode',
+            'phase_residual_envelope',
+            'phase_residual_scale',
+            'phase_residual_rotation_metric_scale',
+            'phase_residual_translation_metric_scale',
+            'phase_residual_chi_metric_scale',
+            'phase_residual_min_tangent_norm',
             'length_bucket_residue_budget',
             # Loss contract.
             'contact_loss_mode',
             'w_fm_chi',
             'w_fm_rigid',
             'w_bg',
+            'w_phase_residual_magnitude',
+            'w_phase_residual_temporal_smooth',
+            'w_phase_residual_neighbor_smooth',
             'w_smooth',
             'w_clash',
             'w_pep',
@@ -3241,6 +3809,16 @@ class Stage2Trainer:
             'time_warp_logit_scale': 1.0,
             'time_warp_rate_eps': 1e-3,
             'time_warp_rate_clip': 10.0,
+            'phase_residual_tau_mode': 'learned',
+            'phase_residual_envelope': 'poly',
+            'phase_residual_scale': 1.0,
+            'phase_residual_rotation_metric_scale': 1.0,
+            'phase_residual_translation_metric_scale': 1.0,
+            'phase_residual_chi_metric_scale': 1.0,
+            'phase_residual_min_tangent_norm': 1e-3,
+            'w_phase_residual_magnitude': 0.01,
+            'w_phase_residual_temporal_smooth': 0.01,
+            'w_phase_residual_neighbor_smooth': 0.01,
         }
         for field in strict_fields:
             old = self._config_value(ckpt_config, field)
@@ -3378,6 +3956,10 @@ class Stage2Trainer:
 
                     last_path = Path(self.config.save_dir) / 'last_checkpoint.pt'
                     self.save_checkpoint(str(last_path), verbose=False)
+                    ckpt_every = int(getattr(self.config, 'checkpoint_every_n_epochs', 0) or 0)
+                    if ckpt_every > 0 and ((epoch + 1) % ckpt_every == 0):
+                        epoch_path = Path(self.config.save_dir) / f'epoch_{epoch:04d}.pt'
+                        self.save_checkpoint(str(epoch_path), verbose=False)
 
                 if self.distributed:
                     stop_tensor = torch.tensor(

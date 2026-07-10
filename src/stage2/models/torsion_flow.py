@@ -79,6 +79,7 @@ class TorsionFlowNetConfig:
 
     # Heads
     head_hidden: int = 256
+    phase_residual_enabled: bool = False
 
     # Dropout
     dropout: float = 0.1
@@ -204,6 +205,29 @@ class TorsionFlowNet(nn.Module):
         nn.init.zeros_(self.time_warp_head[-1].weight)
         nn.init.zeros_(self.time_warp_head[-1].bias)
 
+        self.residual_gate_mlp = None
+        self.residual_chi_head = None
+        self.residual_rigid_head = None
+        if self.config.phase_residual_enabled:
+            self.residual_gate_mlp = nn.Sequential(
+                nn.Linear(gate_in_dim, self.config.head_hidden),
+                nn.SiLU(),
+                nn.Linear(self.config.head_hidden, 1),
+            )
+            self.residual_chi_head = nn.Sequential(
+                nn.Linear(chi_in_dim, self.config.head_hidden),
+                nn.SiLU(),
+                nn.Linear(self.config.head_hidden, 4),
+            )
+            self.residual_rigid_head = nn.Sequential(
+                nn.Linear(rigid_in_dim, self.config.head_hidden),
+                nn.SiLU(),
+                nn.Linear(self.config.head_hidden, 6),
+            )
+            for head in (self.residual_chi_head, self.residual_rigid_head):
+                nn.init.zeros_(head[-1].weight)
+                nn.init.zeros_(head[-1].bias)
+
     def forward(self,
                 chi: torch.Tensor,           # [B, N, 4]
                 rigids: Rigid,              # Rigid[B, N]
@@ -224,7 +248,7 @@ class TorsionFlowNet(nn.Module):
                  return_repa: bool = False) -> Dict[str, torch.Tensor]:
         """
         Returns:
-            dict with d_chi, d_rigid_rot, d_rigid_trans, gate
+            Vector-field outputs plus optional dedicated phase-residual heads.
         """
         B, N, _ = chi.shape
 
@@ -370,6 +394,34 @@ class TorsionFlowNet(nn.Module):
             "gate": gate,
             "time_warp_logits": time_warp_logits,
         }
+        if self.config.phase_residual_enabled:
+            residual_gate = torch.sigmoid(self.residual_gate_mlp(gate_input))
+            residual_chi = self.residual_chi_head(chi_input) * residual_gate
+            residual_rigid = self.residual_rigid_head(rigid_input) * residual_gate
+            if node_mask is not None:
+                residual_gate = residual_gate * mask
+                residual_chi = residual_chi * mask
+                residual_rigid = residual_rigid * mask
+
+            # The legacy velocity heads remain part of the DDP graph in the new
+            # parameterization, but cannot alter the spatial residual.
+            legacy_dependency = (
+                d_chi.sum()
+                + d_rot.sum()
+                + d_trans.sum()
+                + gate.sum()
+                + time_warp_logits.sum()
+            ) * 0.0 + ipa_update_dependency
+            residual_chi = residual_chi + legacy_dependency
+            out["d_chi"] = out["d_chi"] + (
+                residual_chi.sum() + residual_rigid.sum() + residual_gate.sum()
+            ) * 0.0
+            out.update(
+                residual_chi=residual_chi,
+                residual_rigid_rot=residual_rigid[..., :3],
+                residual_rigid_trans=residual_rigid[..., 3:],
+                residual_gate=residual_gate,
+            )
         if self.repa_student_proj is not None:
             repa_student = self.repa_student_proj(s_geo)
             if return_repa:

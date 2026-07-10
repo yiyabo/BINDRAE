@@ -34,7 +34,15 @@ from src.stage1.models.interaction_prior import (  # noqa: E402
 )
 from src.stage2.datasets import create_stage2_dataloader  # noqa: E402
 from src.stage2.models import TorsionFlowNet, TorsionFlowNetConfig  # noqa: E402
-from src.stage2.modules import rigid_compose, rigid_inverse, se3_exp, se3_log, wrap_to_pi  # noqa: E402
+from src.stage2.modules import (  # noqa: E402
+    endpoint_zero_envelope,
+    project_product_tangent_normal,
+    rigid_compose,
+    rigid_inverse,
+    se3_exp,
+    se3_log,
+    wrap_to_pi,
+)
 from flash_ipa.rigid import Rigid, Rotation  # noqa: E402
 
 
@@ -63,6 +71,7 @@ def parse_args() -> argparse.Namespace:
             "boundary_residual",
             "pure_bridge",
             "bridge_timewarp_v1",
+            "phase_orthogonal_residual_v1",
         ],
         help="Path construction to evaluate; checkpoint uses checkpoint config",
     )
@@ -87,6 +96,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--time_warp_logit_scale", type=float, default=None)
     parser.add_argument("--time_warp_rate_eps", type=float, default=None)
     parser.add_argument("--time_warp_rate_clip", type=float, default=None)
+    parser.add_argument(
+        "--phase_residual_tau_mode",
+        default=None,
+        choices=["learned", "identity"],
+    )
+    parser.add_argument(
+        "--phase_residual_envelope",
+        default=None,
+        choices=["poly", "sin2"],
+    )
+    parser.add_argument("--phase_residual_scale", type=float, default=None)
+    parser.add_argument("--phase_residual_rotation_metric_scale", type=float, default=None)
+    parser.add_argument("--phase_residual_translation_metric_scale", type=float, default=None)
+    parser.add_argument("--phase_residual_chi_metric_scale", type=float, default=None)
+    parser.add_argument("--phase_residual_min_tangent_norm", type=float, default=None)
     parser.add_argument("--n_integration_steps", type=int, default=None)
     parser.add_argument("--integration_chi_clip", type=float, default=None)
     parser.add_argument("--integration_rot_clip", type=float, default=None)
@@ -317,6 +341,10 @@ def build_model_config_for_checkpoint(args, config, split: str) -> Tuple[Torsion
         repa_enabled=bool(getattr(config, "repa_enabled", False)),
         repa_dim=int(getattr(config, "repa_dim", 128)),
         repa_target_dim=int(stage1v2_settings["dim"]),
+        phase_residual_enabled=(
+            str(getattr(config, "path_parameterization", "flow"))
+            == "phase_orthogonal_residual_v1"
+        ),
     )
     return model_config, interaction_settings, stage1v2_settings
 
@@ -372,6 +400,7 @@ def resolve_path_parameterization(args, config) -> str:
         "boundary_residual",
         "pure_bridge",
         "bridge_timewarp_v1",
+        "phase_orthogonal_residual_v1",
     }
     if mode not in allowed:
         raise ValueError(f"Unsupported path_parameterization={mode}")
@@ -430,6 +459,17 @@ def torsions_to_atom14(fk_module, phi_psi_omega, chi, rigids, aatype):
     chi_sincos = torch.stack([torch.sin(chi), torch.cos(chi)], dim=-1)
     torsions_sincos = reorder_torsions_to_openfold(torch.cat([bb_sincos, chi_sincos], dim=2))
     return fk_module(torsions_sincos, rigids, aatype)
+
+
+def interpolate_backbone_torsions(batch, t_value: float) -> torch.Tensor:
+    """Decode-only backbone-torsion bridge matching the endpoint frame bridge."""
+    t_scalar = min(max(float(t_value), 0.0), 1.0)
+    gamma = 3.0 * t_scalar * t_scalar - 2.0 * t_scalar * t_scalar * t_scalar
+    torsion_apo = batch.torsion_apo[..., :3]
+    torsion_holo = batch.torsion_holo[..., :3]
+    return wrap_to_pi(
+        torsion_apo + gamma * wrap_to_pi(torsion_holo - torsion_apo)
+    )
 
 
 def interpolate_endpoints(
@@ -736,6 +776,169 @@ def bridge_timewarp_path(
     return rigids_list, chi_list, t_list
 
 
+def phase_orthogonal_residual_path(
+    model,
+    batch,
+    rigids_apo: Rigid,
+    rigids_holo: Rigid,
+    n_steps: int,
+    interaction_prior: Optional[torch.Tensor],
+    esm_gate_context: Optional[torch.Tensor],
+    *,
+    tau_mode: str,
+    logit_scale: float,
+    rate_eps: float,
+    rate_clip: float,
+    envelope_kind: str,
+    residual_scale: float,
+    rotation_metric_scale: float,
+    translation_metric_scale: float,
+    chi_metric_scale: float,
+    min_tangent_norm: float,
+) -> Tuple[List[Rigid], List[torch.Tensor], List[float]]:
+    """Evaluate the endpoint-exact phase plus normal-residual path family."""
+    n_steps = int(n_steps)
+    if n_steps < 2:
+        raise ValueError("phase_orthogonal_residual_v1 requires n_steps >= 2")
+    bsz, n_res = batch.node_mask.shape
+    device = batch.node_mask.device
+    node_mask = batch.node_mask.bool()
+    node_mask_f = node_mask.float()
+
+    if tau_mode == "identity":
+        tau_values = [
+            torch.full(
+                (bsz, n_res),
+                k / n_steps,
+                dtype=torch.float32,
+                device=device,
+            )
+            for k in range(n_steps + 1)
+        ]
+    elif tau_mode == "learned":
+        rates: List[torch.Tensor] = []
+        for k in range(n_steps):
+            t_mid = (k + 0.5) / n_steps
+            mid_rigids, mid_chi = interpolate_endpoints(
+                batch,
+                rigids_apo,
+                rigids_holo,
+                t_mid,
+            )
+            out = model(
+                chi=mid_chi,
+                rigids=mid_rigids,
+                esm=batch.esm,
+                lig_points=batch.lig_points,
+                lig_types=batch.lig_types,
+                lig_mask=batch.lig_mask,
+                w_res=batch.w_res,
+                t=torch.full((bsz,), t_mid, device=device),
+                node_mask=batch.node_mask,
+                nma_features=batch.nma_features,
+                interaction_prior=interaction_prior,
+                esm_gate_context=esm_gate_context,
+            )
+            logits = out["time_warp_logits"].float().squeeze(-1) * node_mask_f
+            rate = F.softplus(logits * float(logit_scale)) + float(rate_eps)
+            if float(rate_clip) > 0.0:
+                rate = rate.clamp(max=float(rate_clip))
+            rates.append(torch.where(node_mask, rate, torch.ones_like(rate)))
+        rate_stack = torch.stack(rates, dim=0)
+        cumulative = torch.cumsum(rate_stack, dim=0)
+        total_rate = cumulative[-1].clamp(min=float(rate_eps))
+        tau_values = [
+            torch.zeros((bsz, n_res), dtype=torch.float32, device=device)
+        ]
+        tau_values.extend(
+            (cumulative[k] / total_rate).clamp(0.0, 1.0)
+            for k in range(n_steps)
+        )
+    else:
+        raise ValueError(f"Unsupported phase residual tau_mode={tau_mode}")
+
+    R0, trans0 = rigid_to_rt(rigids_apo)
+    R1, trans1 = rigid_to_rt(rigids_holo)
+    R0_inv, trans0_inv = rigid_inverse(R0, trans0)
+    R_delta, trans_delta = rigid_compose(R0_inv, trans0_inv, R1, trans1)
+    bridge_tangent_rigid = se3_log(R_delta, trans_delta)
+    bridge_tangent_chi = wrap_to_pi(
+        batch.torsion_holo[..., 3:7] - batch.torsion_apo[..., 3:7]
+    )
+
+    rigids_list: List[Rigid] = [rigids_apo]
+    chi_list: List[torch.Tensor] = [batch.torsion_apo[..., 3:7]]
+    t_list: List[float] = [0.0]
+    for k in range(1, n_steps):
+        t_value = k / n_steps
+        tau = torch.where(
+            node_mask,
+            tau_values[k],
+            torch.full_like(tau_values[k], t_value),
+        )
+        bridge_rigids, bridge_chi = interpolate_endpoints_tensor(
+            batch,
+            rigids_apo,
+            rigids_holo,
+            tau,
+        )
+        out = model(
+            chi=bridge_chi,
+            rigids=bridge_rigids,
+            esm=batch.esm,
+            lig_points=batch.lig_points,
+            lig_types=batch.lig_types,
+            lig_mask=batch.lig_mask,
+            w_res=batch.w_res,
+            t=torch.full((bsz,), t_value, device=device),
+            node_mask=batch.node_mask,
+            nma_features=batch.nma_features,
+            interaction_prior=interaction_prior,
+            esm_gate_context=esm_gate_context,
+        )
+        residual_rigid = torch.cat(
+            [out["residual_rigid_rot"], out["residual_rigid_trans"]],
+            dim=-1,
+        )
+        projection = project_product_tangent_normal(
+            residual_rigid,
+            out["residual_chi"],
+            bridge_tangent_rigid,
+            bridge_tangent_chi,
+            node_mask=batch.node_mask,
+            chi_mask=batch.chi_mask,
+            rotation_scale=rotation_metric_scale,
+            translation_scale=translation_metric_scale,
+            chi_scale=chi_metric_scale,
+            min_tangent_norm=min_tangent_norm,
+        )
+        envelope = endpoint_zero_envelope(
+            torch.full((bsz,), t_value, device=device),
+            kind=envelope_kind,
+        ).view(bsz, 1, 1)
+        weight = envelope * float(residual_scale)
+        R_bridge, trans_bridge = rigid_to_rt(bridge_rigids)
+        R_residual, trans_residual = se3_exp(
+            projection["projected_rigid"] * weight
+        )
+        R_path, trans_path = rigid_compose(
+            R_bridge,
+            trans_bridge,
+            R_residual,
+            trans_residual,
+        )
+        rigids_list.append(rt_to_rigid(R_path, trans_path))
+        chi_list.append(
+            wrap_to_pi(bridge_chi + projection["projected_chi"] * weight)
+        )
+        t_list.append(t_value)
+
+    rigids_list.append(rigids_holo)
+    chi_list.append(batch.torsion_holo[..., 3:7])
+    t_list.append(1.0)
+    return rigids_list, chi_list, t_list
+
+
 def project_terminal_path(
     rigids_list: List[Rigid],
     chi_list: List[torch.Tensor],
@@ -824,6 +1027,41 @@ def construct_path(
                 logit_scale=logit_scale,
                 rate_eps=rate_eps,
                 rate_clip=rate_clip,
+            ),
+            correction,
+        )
+    if path_mode == "phase_orthogonal_residual_v1":
+        def resolve_value(arg_name: str, default):
+            value = getattr(args, arg_name)
+            return value if value is not None else getattr(config, arg_name, default)
+
+        return (
+            *phase_orthogonal_residual_path(
+                model,
+                batch,
+                rigids_apo,
+                rigids_holo,
+                n_steps=n_steps,
+                interaction_prior=interaction_prior,
+                esm_gate_context=esm_gate_context,
+                tau_mode=str(resolve_value("phase_residual_tau_mode", "learned")),
+                logit_scale=float(resolve_value("time_warp_logit_scale", 1.0)),
+                rate_eps=float(resolve_value("time_warp_rate_eps", 1e-3)),
+                rate_clip=float(resolve_value("time_warp_rate_clip", 10.0)),
+                envelope_kind=str(resolve_value("phase_residual_envelope", "poly")),
+                residual_scale=float(resolve_value("phase_residual_scale", 1.0)),
+                rotation_metric_scale=float(
+                    resolve_value("phase_residual_rotation_metric_scale", 1.0)
+                ),
+                translation_metric_scale=float(
+                    resolve_value("phase_residual_translation_metric_scale", 1.0)
+                ),
+                chi_metric_scale=float(
+                    resolve_value("phase_residual_chi_metric_scale", 1.0)
+                ),
+                min_tangent_norm=float(
+                    resolve_value("phase_residual_min_tangent_norm", 1e-3)
+                ),
             ),
             correction,
         )
@@ -1107,8 +1345,14 @@ def evaluate_batch(
         batch.node_mask.bool(),
     )
     path_dists = []
-    for rigids_t, chi_t in zip(rigids_list, chi_list):
-        atom14_t = torsions_to_atom14(fk_module, batch.torsion_apo[..., :3], chi_t, rigids_t, batch.aatype)
+    for rigids_t, chi_t, t_value in zip(rigids_list, chi_list, t_list):
+        atom14_t = torsions_to_atom14(
+            fk_module,
+            interpolate_backbone_torsions(batch, t_value),
+            chi_t,
+            rigids_t,
+            batch.aatype,
+        )
         path_dists.append(
             min_sc_ligand_dist(
                 atom14_t["atom14_pos"].float(),
@@ -1422,6 +1666,41 @@ def main() -> None:
             args.time_warp_rate_clip
             if args.time_warp_rate_clip is not None
             else getattr(config, "time_warp_rate_clip", None)
+        ),
+        "phase_residual_tau_mode": (
+            args.phase_residual_tau_mode
+            if args.phase_residual_tau_mode is not None
+            else getattr(config, "phase_residual_tau_mode", None)
+        ),
+        "phase_residual_envelope": (
+            args.phase_residual_envelope
+            if args.phase_residual_envelope is not None
+            else getattr(config, "phase_residual_envelope", None)
+        ),
+        "phase_residual_scale": (
+            args.phase_residual_scale
+            if args.phase_residual_scale is not None
+            else getattr(config, "phase_residual_scale", None)
+        ),
+        "phase_residual_rotation_metric_scale": (
+            args.phase_residual_rotation_metric_scale
+            if args.phase_residual_rotation_metric_scale is not None
+            else getattr(config, "phase_residual_rotation_metric_scale", None)
+        ),
+        "phase_residual_translation_metric_scale": (
+            args.phase_residual_translation_metric_scale
+            if args.phase_residual_translation_metric_scale is not None
+            else getattr(config, "phase_residual_translation_metric_scale", None)
+        ),
+        "phase_residual_chi_metric_scale": (
+            args.phase_residual_chi_metric_scale
+            if args.phase_residual_chi_metric_scale is not None
+            else getattr(config, "phase_residual_chi_metric_scale", None)
+        ),
+        "phase_residual_min_tangent_norm": (
+            args.phase_residual_min_tangent_norm
+            if args.phase_residual_min_tangent_norm is not None
+            else getattr(config, "phase_residual_min_tangent_norm", None)
         ),
         "n_integration_steps": n_steps,
         "integration_clips": integration_clips,

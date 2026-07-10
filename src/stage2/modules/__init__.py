@@ -17,6 +17,7 @@ from .geometry import (
     compute_contact_score,
     compute_w_eff,
 )
+from .phase_residual import endpoint_zero_envelope, project_product_tangent_normal
 
 __all__ = [
     "so3_log",
@@ -30,4 +31,6 @@ __all__ = [
     "compute_peptide_loss",
     "compute_contact_score",
     "compute_w_eff",
+    "endpoint_zero_envelope",
+    "project_product_tangent_normal",
 ]

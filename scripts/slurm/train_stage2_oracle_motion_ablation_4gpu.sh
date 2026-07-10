@@ -61,6 +61,7 @@ LENGTH_BUCKET_DROP_LAST="${LENGTH_BUCKET_DROP_LAST:-1}"
 LENGTH_BUCKET_LENGTHS_FILE="${LENGTH_BUCKET_LENGTHS_FILE:-}"
 LENGTH_BUCKET_RESIDUE_BUDGET="${LENGTH_BUCKET_RESIDUE_BUDGET:-}"
 PROGRESS_LOG_EVERY="${PROGRESS_LOG_EVERY:-100}"
+CHECKPOINT_EVERY_N_EPOCHS="${CHECKPOINT_EVERY_N_EPOCHS:-0}"
 LR="${LR:-2e-5}"
 VAL_T="${VAL_T:-0.5}"
 VAL_SPLIT="${VAL_SPLIT:-val}"
@@ -73,6 +74,13 @@ TERMINAL_PROJECTION_SCHEDULE="${TERMINAL_PROJECTION_SCHEDULE:-smootherstep}"
 TIME_WARP_LOGIT_SCALE="${TIME_WARP_LOGIT_SCALE:-1.0}"
 TIME_WARP_RATE_EPS="${TIME_WARP_RATE_EPS:-1e-3}"
 TIME_WARP_RATE_CLIP="${TIME_WARP_RATE_CLIP:-10.0}"
+PHASE_RESIDUAL_TAU_MODE="${PHASE_RESIDUAL_TAU_MODE:-learned}"
+PHASE_RESIDUAL_ENVELOPE="${PHASE_RESIDUAL_ENVELOPE:-poly}"
+PHASE_RESIDUAL_SCALE="${PHASE_RESIDUAL_SCALE:-1.0}"
+PHASE_RESIDUAL_ROTATION_METRIC_SCALE="${PHASE_RESIDUAL_ROTATION_METRIC_SCALE:-1.0}"
+PHASE_RESIDUAL_TRANSLATION_METRIC_SCALE="${PHASE_RESIDUAL_TRANSLATION_METRIC_SCALE:-1.0}"
+PHASE_RESIDUAL_CHI_METRIC_SCALE="${PHASE_RESIDUAL_CHI_METRIC_SCALE:-1.0}"
+PHASE_RESIDUAL_MIN_TANGENT_NORM="${PHASE_RESIDUAL_MIN_TANGENT_NORM:-1e-3}"
 INIT_FROM_CHECKPOINT="${INIT_FROM_CHECKPOINT:-}"
 TEACHER_RESIDUAL_CACHE_DIR="${TEACHER_RESIDUAL_CACHE_DIR:-}"
 W_TEACHER_RESIDUAL="${W_TEACHER_RESIDUAL:-0.0}"
@@ -108,6 +116,9 @@ N_GEOM_STEPS="${N_GEOM_STEPS:-4}"
 W_FM_CHI="${W_FM_CHI:-}"
 W_FM_RIGID="${W_FM_RIGID:-}"
 W_BG="${W_BG:-0.1}"
+W_PHASE_RESIDUAL_MAGNITUDE="${W_PHASE_RESIDUAL_MAGNITUDE:-0.01}"
+W_PHASE_RESIDUAL_TEMPORAL_SMOOTH="${W_PHASE_RESIDUAL_TEMPORAL_SMOOTH:-0.01}"
+W_PHASE_RESIDUAL_NEIGHBOR_SMOOTH="${W_PHASE_RESIDUAL_NEIGHBOR_SMOOTH:-0.01}"
 W_SMOOTH="${W_SMOOTH:-0.05}"
 W_CLASH="${W_CLASH:-0.1}"
 W_LIGAND_CLEARANCE="${W_LIGAND_CLEARANCE:-0.0}"
@@ -161,15 +172,15 @@ case "$ESM_FUSION_MODE" in
     ;;
 esac
 case "$PATH_PARAMETERIZATION" in
-  flow|boundary_residual_v1|boundary_residual|projected_flow|bridge_timewarp_v1) ;;
+  flow|boundary_residual_v1|boundary_residual|projected_flow|bridge_timewarp_v1|phase_orthogonal_residual_v1) ;;
   *)
-    echo "ERROR: PATH_PARAMETERIZATION must be flow, boundary_residual_v1, boundary_residual, projected_flow, or bridge_timewarp_v1"
+    echo "ERROR: unsupported PATH_PARAMETERIZATION=$PATH_PARAMETERIZATION"
     exit 1
     ;;
 esac
 if [[ -z "$W_FM_CHI" ]]; then
   case "$PATH_PARAMETERIZATION" in
-    boundary_residual_v1|boundary_residual|bridge_timewarp_v1)
+    boundary_residual_v1|boundary_residual|bridge_timewarp_v1|phase_orthogonal_residual_v1)
       W_FM_CHI="0.1"
       ;;
     *)
@@ -179,7 +190,7 @@ if [[ -z "$W_FM_CHI" ]]; then
 fi
 if [[ -z "$W_FM_RIGID" ]]; then
   case "$PATH_PARAMETERIZATION" in
-    boundary_residual_v1|boundary_residual|bridge_timewarp_v1)
+    boundary_residual_v1|boundary_residual|bridge_timewarp_v1|phase_orthogonal_residual_v1)
       W_FM_RIGID="0.1"
       ;;
     *)
@@ -260,6 +271,44 @@ if rate_eps <= 0.0:
 if rate_clip < 0.0:
     raise SystemExit("ERROR: TIME_WARP_RATE_CLIP must be >= 0")
 PY
+case "$PHASE_RESIDUAL_TAU_MODE" in
+  learned|identity) ;;
+  *)
+    echo "ERROR: PHASE_RESIDUAL_TAU_MODE must be learned or identity"
+    exit 1
+    ;;
+esac
+case "$PHASE_RESIDUAL_ENVELOPE" in
+  poly|sin2) ;;
+  *)
+    echo "ERROR: PHASE_RESIDUAL_ENVELOPE must be poly or sin2"
+    exit 1
+    ;;
+esac
+python - <<PY
+positive = {
+    "PHASE_RESIDUAL_SCALE": float("$PHASE_RESIDUAL_SCALE"),
+    "PHASE_RESIDUAL_ROTATION_METRIC_SCALE": float("$PHASE_RESIDUAL_ROTATION_METRIC_SCALE"),
+    "PHASE_RESIDUAL_TRANSLATION_METRIC_SCALE": float("$PHASE_RESIDUAL_TRANSLATION_METRIC_SCALE"),
+    "PHASE_RESIDUAL_CHI_METRIC_SCALE": float("$PHASE_RESIDUAL_CHI_METRIC_SCALE"),
+}
+for name, value in positive.items():
+    if value <= 0.0:
+        raise SystemExit(f"ERROR: {name} must be > 0")
+if float("$PHASE_RESIDUAL_MIN_TANGENT_NORM") < 0.0:
+    raise SystemExit("ERROR: PHASE_RESIDUAL_MIN_TANGENT_NORM must be >= 0")
+for name, value in {
+    "W_PHASE_RESIDUAL_MAGNITUDE": float("$W_PHASE_RESIDUAL_MAGNITUDE"),
+    "W_PHASE_RESIDUAL_TEMPORAL_SMOOTH": float("$W_PHASE_RESIDUAL_TEMPORAL_SMOOTH"),
+    "W_PHASE_RESIDUAL_NEIGHBOR_SMOOTH": float("$W_PHASE_RESIDUAL_NEIGHBOR_SMOOTH"),
+}.items():
+    if value < 0.0:
+        raise SystemExit(f"ERROR: {name} must be >= 0")
+PY
+if [[ "$PATH_PARAMETERIZATION" == "phase_orthogonal_residual_v1" && "$GEOM_EVERY" != "1" ]]; then
+  echo "ERROR: phase_orthogonal_residual_v1 requires GEOM_EVERY=1"
+  exit 1
+fi
 case "$LIGAND_CLEARANCE_MASK_MODE" in
   pocket|node|motion_active|pocket_or_motion_active) ;;
   *)
@@ -467,16 +516,17 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import torch
 
-from src.stage2.datasets.dataset_stage2 import (
-    _align_array,
-    _align_len,
+from src.data.residue_identity import load_residue_keys, residue_identity_hash
+from src.stage2.datasets.backbone import (
     _coords_valid_mask,
-    _esm_features_from_data,
     _load_backbone_npz,
+    _load_torsion_residue_keys,
+    _load_torsions,
     _sequence_to_aatype,
     align_by_residue_ids,
     extract_backbone_coords,
 )
+from src.stage2.datasets.esm_cache import _esm_features_from_data
 
 DATA_DIR = Path("processed_data/triplets")
 STRICT_CACHE_NPZ_PRECHECK = "$STRICT_CACHE_NPZ_PRECHECK" == "1"
@@ -514,15 +564,21 @@ def expected_stage2_meta(sample_id):
     esm_features = _esm_features_from_data(esm_data, esm_path, ESM_NUM_LAYERS)
     n_res = int(esm_features.shape[0])
 
-    torsion_path = DATA_DIR / "samples" / sample_id / "torsion_apo.npz"
-    if not torsion_path.exists():
-        raise FileNotFoundError(torsion_path)
-    with np.load(torsion_path, allow_pickle=False) as data:
-        if "aatype" in data:
-            aatype = _align_array(np.asarray(data["aatype"]).astype(np.int64), n_res)
-        else:
-            sequence_str = str(esm_data.get("sequence_str", ""))
-            aatype = _sequence_to_aatype(sequence_str, n_res)
+    torsion_apo_path = DATA_DIR / "samples" / sample_id / "torsion_apo.npz"
+    torsion_holo_path = DATA_DIR / "samples" / sample_id / "torsion_holo.npz"
+    apo_torsion_keys = _load_torsion_residue_keys(torsion_apo_path)
+    target_residue_keys = load_residue_keys(esm_data) or apo_torsion_keys
+    if len(target_residue_keys) != n_res:
+        raise ValueError(
+            f"canonical residue count {len(target_residue_keys)} != ESM length {n_res}"
+        )
+    torsion_apo = _load_torsions(torsion_apo_path, target_residue_keys)
+    torsion_holo = _load_torsions(torsion_holo_path, target_residue_keys)
+    if torsion_apo["aatype"] is not None:
+        aatype = torsion_apo["aatype"].astype(np.int64)
+    else:
+        sequence_str = str(esm_data.get("sequence_str", ""))
+        aatype = _sequence_to_aatype(sequence_str, n_res)
 
     apo_backbone = sample_dir / "apo_backbone.npz"
     holo_backbone = sample_dir / "holo_backbone.npz"
@@ -530,25 +586,28 @@ def expected_stage2_meta(sample_id):
     holo_pdb = sample_dir / "holo.pdb"
     if apo_backbone.exists():
         N_apo, Ca_apo, C_apo, apo_res_ids = _load_backbone_npz(apo_backbone)
+        if apo_res_ids is None:
+            N_apo, Ca_apo, C_apo, _, apo_res_ids = extract_backbone_coords(apo_pdb)
     else:
         N_apo, Ca_apo, C_apo, _, apo_res_ids = extract_backbone_coords(apo_pdb)
     if holo_backbone.exists():
         N_holo, Ca_holo, C_holo, holo_res_ids = _load_backbone_npz(holo_backbone)
+        if holo_res_ids is None:
+            N_holo, Ca_holo, C_holo, _, holo_res_ids = extract_backbone_coords(holo_pdb)
     else:
         N_holo, Ca_holo, C_holo, _, holo_res_ids = extract_backbone_coords(holo_pdb)
-    if apo_res_ids is not None and holo_res_ids is not None:
-        _, _, node_mask = align_by_residue_ids(
-            (N_apo, Ca_apo, C_apo), apo_res_ids,
-            (N_holo, Ca_holo, C_holo), holo_res_ids,
-            n_res,
-        )
-    else:
-        N_apo, Ca_apo, C_apo = _align_len(N_apo, Ca_apo, C_apo, n_res)
-        N_holo, Ca_holo, C_holo = _align_len(N_holo, Ca_holo, C_holo, n_res)
-        node_mask = _coords_valid_mask(N_apo, Ca_apo, C_apo) & _coords_valid_mask(N_holo, Ca_holo, C_holo)
+    apo_aligned, holo_aligned, node_mask = align_by_residue_ids(
+        (N_apo, Ca_apo, C_apo), apo_res_ids,
+        (N_holo, Ca_holo, C_holo), holo_res_ids,
+        target_residue_keys,
+    )
+    node_mask &= _coords_valid_mask(*apo_aligned)
+    node_mask &= _coords_valid_mask(*holo_aligned)
+    node_mask &= torsion_apo["residue_present"] & torsion_holo["residue_present"]
+    residue_hash = residue_identity_hash(target_residue_keys)
 
-    EXPECTED_META_CACHE[sample_id] = (n_res, aatype, node_mask)
-    return n_res, aatype, node_mask
+    EXPECTED_META_CACHE[sample_id] = (n_res, aatype, node_mask, residue_hash)
+    return n_res, aatype, node_mask, residue_hash
 
 
 def record_matches_stage2(record, manifest_path):
@@ -557,7 +616,7 @@ def record_matches_stage2(record, manifest_path):
     if not cache_path.exists():
         return False, "missing_cache"
     try:
-        n_res, expected_aatype, expected_node_mask = expected_stage2_meta(sample_id)
+        n_res, expected_aatype, expected_node_mask, expected_residue_hash = expected_stage2_meta(sample_id)
         if "n_residues" not in record:
             return False, "manifest_missing_n_residues"
         if int(record["n_residues"]) != n_res:
@@ -574,6 +633,10 @@ def record_matches_stage2(record, manifest_path):
                 return False, "n_residues_mismatch"
             if "oracle_motion_features" in data and int(data["oracle_motion_features"].shape[0]) != n_res:
                 return False, "feature_length_mismatch"
+            if "residue_identity_hash" not in data:
+                return False, "missing_residue_identity_hash"
+            if str(np.asarray(data["residue_identity_hash"]).item()) != expected_residue_hash:
+                return False, "residue_identity_hash_mismatch"
             if AATYPE_PRECHECK:
                 if "aatype" not in data:
                     return False, "missing_aatype"
@@ -787,6 +850,7 @@ echo "bucket drop_last:$LENGTH_BUCKET_DROP_LAST"
 echo "bucket lengths:  ${LENGTH_BUCKET_LENGTHS_FILE:-OFF}"
 echo "bucket res budget:${LENGTH_BUCKET_RESIDUE_BUDGET:-OFF}"
 echo "progress every:  $PROGRESS_LOG_EVERY"
+echo "ckpt every ep:   $CHECKPOINT_EVERY_N_EPOCHS"
 echo "lr:              $LR"
 echo "path param:      $PATH_PARAMETERIZATION"
 echo "boundary env:    $BOUNDARY_RESIDUAL_ENVELOPE"
@@ -795,6 +859,11 @@ echo "projection sched:$TERMINAL_PROJECTION_SCHEDULE"
 echo "timewarp logit:  $TIME_WARP_LOGIT_SCALE"
 echo "timewarp eps:    $TIME_WARP_RATE_EPS"
 echo "timewarp clip:   $TIME_WARP_RATE_CLIP"
+echo "phase tau mode:  $PHASE_RESIDUAL_TAU_MODE"
+echo "phase envelope:  $PHASE_RESIDUAL_ENVELOPE"
+echo "phase scale:     $PHASE_RESIDUAL_SCALE"
+echo "phase metric:    rot=$PHASE_RESIDUAL_ROTATION_METRIC_SCALE trans=$PHASE_RESIDUAL_TRANSLATION_METRIC_SCALE chi=$PHASE_RESIDUAL_CHI_METRIC_SCALE"
+echo "phase min norm:  $PHASE_RESIDUAL_MIN_TANGENT_NORM"
 echo "init ckpt:       ${INIT_FROM_CHECKPOINT:-OFF}"
 echo "teacher cache:   ${TEACHER_RESIDUAL_CACHE_DIR:-OFF}"
 echo "w_teacher_resid: $W_TEACHER_RESIDUAL"
@@ -807,6 +876,9 @@ echo "teacher missing: $TEACHER_RESIDUAL_MISSING_POLICY"
 echo "w_fm_chi:        $W_FM_CHI"
 echo "w_fm_rigid:      $W_FM_RIGID"
 echo "w_bg:            $W_BG"
+echo "w_phase_mag:     $W_PHASE_RESIDUAL_MAGNITUDE"
+echo "w_phase_time:    $W_PHASE_RESIDUAL_TEMPORAL_SMOOTH"
+echo "w_phase_neighbor:$W_PHASE_RESIDUAL_NEIGHBOR_SMOOTH"
 echo "w_smooth:        $W_SMOOTH"
 echo "w_clash:         $W_CLASH"
 echo "w_lig_clear:     $W_LIGAND_CLEARANCE"
@@ -857,6 +929,7 @@ python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA {torch.versio
   --num_workers "$NUM_WORKERS" \
   --prefetch_factor "$PREFETCH_FACTOR" \
   --progress_log_every "$PROGRESS_LOG_EVERY" \
+  --checkpoint_every_n_epochs "$CHECKPOINT_EVERY_N_EPOCHS" \
   --max_epochs "$MAX_EPOCHS" \
   --lr "$LR" \
   --grad_clip 0.3 \
@@ -871,6 +944,13 @@ python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA {torch.versio
   --time_warp_logit_scale "$TIME_WARP_LOGIT_SCALE" \
   --time_warp_rate_eps "$TIME_WARP_RATE_EPS" \
   --time_warp_rate_clip "$TIME_WARP_RATE_CLIP" \
+  --phase_residual_tau_mode "$PHASE_RESIDUAL_TAU_MODE" \
+  --phase_residual_envelope "$PHASE_RESIDUAL_ENVELOPE" \
+  --phase_residual_scale "$PHASE_RESIDUAL_SCALE" \
+  --phase_residual_rotation_metric_scale "$PHASE_RESIDUAL_ROTATION_METRIC_SCALE" \
+  --phase_residual_translation_metric_scale "$PHASE_RESIDUAL_TRANSLATION_METRIC_SCALE" \
+  --phase_residual_chi_metric_scale "$PHASE_RESIDUAL_CHI_METRIC_SCALE" \
+  --phase_residual_min_tangent_norm "$PHASE_RESIDUAL_MIN_TANGENT_NORM" \
   "${TEACHER_RESIDUAL_ARGS[@]}" \
   --val_split "$VAL_SPLIT" \
   --no_stage1_prior \
@@ -889,6 +969,9 @@ python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA {torch.versio
   --w_fm_chi "$W_FM_CHI" \
   --w_fm_rigid "$W_FM_RIGID" \
   --w_bg "$W_BG" \
+  --w_phase_residual_magnitude "$W_PHASE_RESIDUAL_MAGNITUDE" \
+  --w_phase_residual_temporal_smooth "$W_PHASE_RESIDUAL_TEMPORAL_SMOOTH" \
+  --w_phase_residual_neighbor_smooth "$W_PHASE_RESIDUAL_NEIGHBOR_SMOOTH" \
   --w_smooth "$W_SMOOTH" \
   --w_clash "$W_CLASH" \
   --w_ligand_clearance "$W_LIGAND_CLEARANCE" \

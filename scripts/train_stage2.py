@@ -71,6 +71,7 @@ def parse_args():
                             'boundary_residual',
                             'projected_flow',
                             'bridge_timewarp_v1',
+                            'phase_orthogonal_residual_v1',
                         ],
                         help='Path construction used by geometry losses/evaluation')
     parser.add_argument('--boundary_residual_envelope', type=str, default='sin2',
@@ -87,6 +88,22 @@ def parse_args():
                         help='Minimum positive interval rate for bridge_timewarp_v1')
     parser.add_argument('--time_warp_rate_clip', type=float, default=10.0,
                         help='Maximum interval rate for bridge_timewarp_v1; <=0 disables clipping')
+    parser.add_argument('--phase_residual_tau_mode', type=str, default='learned',
+                        choices=['learned', 'identity'],
+                        help='Use learned residue phase or synchronous identity phase')
+    parser.add_argument('--phase_residual_envelope', type=str, default='poly',
+                        choices=['poly', 'sin2'],
+                        help='Endpoint-zero envelope for phase residuals')
+    parser.add_argument('--phase_residual_scale', type=float, default=1.0,
+                        help='Global scale applied after tangent-normal projection')
+    parser.add_argument('--phase_residual_rotation_metric_scale', type=float, default=1.0,
+                        help='Characteristic rotation scale in radians for the product metric')
+    parser.add_argument('--phase_residual_translation_metric_scale', type=float, default=1.0,
+                        help='Characteristic translation scale in Angstrom for the product metric')
+    parser.add_argument('--phase_residual_chi_metric_scale', type=float, default=1.0,
+                        help='Characteristic chi scale in radians for the product metric')
+    parser.add_argument('--phase_residual_min_tangent_norm', type=float, default=1e-3,
+                        help='Disable spatial residuals below this endpoint-motion norm')
     parser.add_argument('--init_from_checkpoint', type=str, default=None,
                         help='Warm-start model weights only; does not restore optimizer, scheduler, or epoch')
     parser.add_argument('--teacher_residual_cache_dir', type=str, default=None,
@@ -241,6 +258,12 @@ def parse_args():
                         help='CFM rigid velocity loss weight')
     parser.add_argument('--w_bg', type=float, default=0.1,
                         help='Background stability loss weight')
+    parser.add_argument('--w_phase_residual_magnitude', type=float, default=0.01,
+                        help='Capacity penalty on projected spatial residual magnitude')
+    parser.add_argument('--w_phase_residual_temporal_smooth', type=float, default=0.01,
+                        help='Temporal smoothness penalty on projected spatial residuals')
+    parser.add_argument('--w_phase_residual_neighbor_smooth', type=float, default=0.01,
+                        help='Adjacent-residue smoothness penalty on projected spatial residuals')
     parser.add_argument('--w_smooth', type=float, default=0.05,
                         help='Path smoothness loss weight')
     parser.add_argument('--w_clash', type=float, default=0.1,
@@ -293,6 +316,8 @@ def parse_args():
                         help='Checkpoint保存目录')
     parser.add_argument('--log_dir', type=str, default='logs/stage2',
                         help='日志目录')
+    parser.add_argument('--checkpoint_every_n_epochs', type=int, default=0,
+                        help='Save epoch_XXXX.pt every N epochs after validation; <=0 disables')
     parser.add_argument('--resume_from', type=str, default=None,
                         help='Explicit Stage-2 checkpoint path to resume from')
     parser.add_argument('--no_auto_resume', action='store_true',
@@ -371,6 +396,13 @@ def main():
         time_warp_logit_scale=args.time_warp_logit_scale,
         time_warp_rate_eps=args.time_warp_rate_eps,
         time_warp_rate_clip=args.time_warp_rate_clip,
+        phase_residual_tau_mode=args.phase_residual_tau_mode,
+        phase_residual_envelope=args.phase_residual_envelope,
+        phase_residual_scale=args.phase_residual_scale,
+        phase_residual_rotation_metric_scale=args.phase_residual_rotation_metric_scale,
+        phase_residual_translation_metric_scale=args.phase_residual_translation_metric_scale,
+        phase_residual_chi_metric_scale=args.phase_residual_chi_metric_scale,
+        phase_residual_min_tangent_norm=args.phase_residual_min_tangent_norm,
         init_from_checkpoint=args.init_from_checkpoint,
         teacher_residual_cache_dir=args.teacher_residual_cache_dir,
         w_teacher_residual=args.w_teacher_residual,
@@ -428,6 +460,9 @@ def main():
         w_fm_chi=args.w_fm_chi,
         w_fm_rigid=args.w_fm_rigid,
         w_bg=args.w_bg,
+        w_phase_residual_magnitude=args.w_phase_residual_magnitude,
+        w_phase_residual_temporal_smooth=args.w_phase_residual_temporal_smooth,
+        w_phase_residual_neighbor_smooth=args.w_phase_residual_neighbor_smooth,
         w_smooth=args.w_smooth,
         w_clash=args.w_clash,
         w_ligand_clearance=args.w_ligand_clearance,
@@ -459,6 +494,7 @@ def main():
         geom_loss_every_n_steps=args.geom_loss_every_n_steps,
         save_dir=args.save_dir,
         log_dir=args.log_dir,
+        checkpoint_every_n_epochs=args.checkpoint_every_n_epochs,
         resume_from=args.resume_from,
         auto_resume=not args.no_auto_resume,
         device=args.device,
@@ -484,6 +520,7 @@ def main():
     print(f"  - val 批大小: {config.val_batch_size or config.batch_size}")
     print(f"  - 学习率: {config.lr}")
     print(f"  - 最大轮数: {config.max_epochs}")
+    print(f"  - checkpoint every N epochs: {config.checkpoint_every_n_epochs}")
     print(f"  - ESM fusion enabled: {config.esm_fusion_enabled}")
     print(f"  - ESM num layers: {config.esm_num_layers}")
     print(f"  - ESM fusion mode: {config.esm_fusion_mode}")
@@ -551,6 +588,11 @@ def main():
     print(f"  - time_warp_logit_scale: {config.time_warp_logit_scale}")
     print(f"  - time_warp_rate_eps: {config.time_warp_rate_eps}")
     print(f"  - time_warp_rate_clip: {config.time_warp_rate_clip}")
+    print(f"  - phase_residual_tau_mode: {config.phase_residual_tau_mode}")
+    print(f"  - phase_residual_envelope: {config.phase_residual_envelope}")
+    print(f"  - phase_residual_scale: {config.phase_residual_scale}")
+    print(f"  - phase_residual_metric_scales: rot={config.phase_residual_rotation_metric_scale} trans={config.phase_residual_translation_metric_scale} chi={config.phase_residual_chi_metric_scale}")
+    print(f"  - phase_residual_min_tangent_norm: {config.phase_residual_min_tangent_norm}")
     print(f"  - init_from_checkpoint: {config.init_from_checkpoint or 'OFF'}")
     print(f"  - teacher_residual_cache_dir: {config.teacher_residual_cache_dir or 'OFF'}")
     print(f"  - w_teacher_residual: {config.w_teacher_residual}")
@@ -563,6 +605,7 @@ def main():
     print(f"  - ligand_clearance: w={config.w_ligand_clearance} dist={config.ligand_clearance_dist} hard_dist={config.ligand_clearance_hard_negative_dist} mode={config.ligand_clearance_loss_mode} mask={config.ligand_clearance_mask_mode} t={config.ligand_clearance_t_min}-{config.ligand_clearance_t_max}")
     print(f"  - bridge_anchor: w={config.w_bridge_anchor} mask={config.bridge_anchor_mask_mode} t={config.bridge_anchor_t_min}-{config.bridge_anchor_t_max}")
     print(f"  - loss weights: fm_chi={config.w_fm_chi} fm_rigid={config.w_fm_rigid} bg={config.w_bg} smooth={config.w_smooth} clash={config.w_clash} ligand_clearance={config.w_ligand_clearance} bridge_anchor={config.w_bridge_anchor} pep={config.w_pep} end={config.w_end}")
+    print(f"  - phase residual loss weights: magnitude={config.w_phase_residual_magnitude} temporal={config.w_phase_residual_temporal_smooth} neighbor={config.w_phase_residual_neighbor_smooth}")
     print(f"  - resume_from: {config.resume_from or 'OFF'}")
     print(f"  - auto_resume: {config.auto_resume}")
     print(f"  - NMA: {config.use_nma}")

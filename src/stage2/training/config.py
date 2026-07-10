@@ -33,6 +33,7 @@ class TrainingConfig:
     # Logging / saving
     save_dir: str = "checkpoints/stage2"
     log_dir: str = "logs/stage2"
+    checkpoint_every_n_epochs: int = 0
 
     # Random seed
     seed: int = 42
@@ -106,13 +107,20 @@ class TrainingConfig:
 
     # Bridge / FM
     alpha: float = 1.5
-    path_parameterization: str = "flow"  # flow | boundary_residual_v1 | boundary_residual | projected_flow | bridge_timewarp_v1
+    path_parameterization: str = "flow"  # flow | boundary_residual_v1 | boundary_residual | projected_flow | bridge_timewarp_v1 | phase_orthogonal_residual_v1
     boundary_residual_envelope: str = "sin2"  # sin2 | poly
     boundary_residual_scale: float = 1.0
     terminal_projection_schedule: str = "smootherstep"  # smoothstep | smootherstep | late_smoother | quadratic
     time_warp_logit_scale: float = 1.0
     time_warp_rate_eps: float = 1e-3
     time_warp_rate_clip: float = 10.0
+    phase_residual_tau_mode: str = "learned"  # learned | identity
+    phase_residual_envelope: str = "poly"  # poly | sin2
+    phase_residual_scale: float = 1.0
+    phase_residual_rotation_metric_scale: float = 1.0
+    phase_residual_translation_metric_scale: float = 1.0
+    phase_residual_chi_metric_scale: float = 1.0
+    phase_residual_min_tangent_norm: float = 1e-3
     init_from_checkpoint: Optional[str] = None
 
     # Boundary-residual teacher distillation. The cache stores free-flow
@@ -152,6 +160,9 @@ class TrainingConfig:
     w_contact: float = 0.1
     w_prior: float = 0.1
     w_bg: float = 0.1
+    w_phase_residual_magnitude: float = 0.01
+    w_phase_residual_temporal_smooth: float = 0.01
+    w_phase_residual_neighbor_smooth: float = 0.01
 
     # L_bg
     bg_beta: float = 1.5
