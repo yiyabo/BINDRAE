@@ -2,9 +2,13 @@
 
 Date: 2026-06-25
 
+> Status update (2026-07-10): this is a frozen historical baseline. The active
+> architecture is the endpoint-exact asynchronous phase-normal bridge described
+> in `BINDRAE_CONFERENCE_METHOD_BLUEPRINT_20260710.md`.
+
 ## Status
 
-This document freezes the current best BINDRAE baseline before starting the
+This document freezes the then-best BINDRAE baseline before starting the
 RAEv2/REPA-style representation enhancement track.
 
 The frozen claim is intentionally narrow:

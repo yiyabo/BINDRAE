@@ -2,6 +2,10 @@
 
 Date: 2026-07-01
 
+> Status update (2026-07-10): the benchmark contract and metric definitions
+> remain active. Replace the older generic OracleMotion/free-flow model label
+> with the matched synchronous, warp-only, residual-only, and full APNB matrix.
+
 This note consolidates the proposed Stage-2 comparison plan and metric
 definitions for the current BINDRAE OracleMotion / holo-conditioned path line.
 

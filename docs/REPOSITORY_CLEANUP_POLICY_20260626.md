@@ -1,10 +1,10 @@
 # Repository Cleanup Policy
 
-Date: 2026-06-26
+Date: 2026-06-26; updated 2026-07-10
 
-The repository is now in a transition from exploratory validation to full-scale
-Stage-2 training and downstream comparison. Cleanup should reduce navigation
-noise without deleting experiment evidence.
+The repository is in a transition from exploratory Stage-2 variants to the
+endpoint-exact asynchronous phase-normal bridge. Cleanup should keep this
+method easy to find without deleting experiment evidence.
 
 ## Cleanup Principle
 
@@ -22,13 +22,12 @@ Stage-1 scripts are reproducibility anchors for previous negative controls.
 
 Docs:
 
-- `docs/CURRENT_PROJECT_STATUS_20260622.md`
+- `docs/BINDRAE_CONFERENCE_METHOD_BLUEPRINT_20260710.md`
+- `docs/CURRENT_PROJECT_STATUS_20260710.md`
 - `docs/ORACLE_MOTION_BASELINE_SNAPSHOT_20260625.md`
-- `docs/RAEV2_REPA_STAGE2_ENHANCEMENT_PLAN_20260625.md`
-- `docs/STAGE2_ENDPOINT_BOUNDARY_STATUS_20260708.md`
-- `docs/FULL_SCALE_TRAINING_AND_EVALUATION_RUNBOOK_20260626.md`
 - `docs/COMPETITOR_DATASETS_METRICS_20260624.md`
-- `docs/STAGE1V2_TEACHER_POSTERIOR_PLAN_20260622.md`
+- `docs/PATH_BASELINE_LITERATURE_SCAN_20260630.md`
+- `docs/STAGE2_COMPARISON_METRICS_AND_BASELINES_20260701.md`
 - `docs/STAGE1_STAGE2_PRIOR_INTERFACE_DECISION.md`
 
 Stage-2 code:
@@ -38,9 +37,10 @@ Stage-2 code:
 - `src/stage2/training/trainer.py`
 - `src/stage2/datasets/dataset_stage2.py`
 - `src/stage2/modules/`
+- `src/stage2/modules/phase_residual.py`
 - `src/stage2/evaluation/`
 
-Stage-1-v2 code:
+Future Stage-1 deployment code:
 
 - `src/stage1/posterior_v2/`
 - `scripts/train_stage1v2_posterior.py`
@@ -65,10 +65,16 @@ Slurm launchers:
 - `scripts/slurm/generate_stage2_trajectories_1gpu.sh`
 - `scripts/slurm/train_stage1v2_posterior_4gpu.sh`
 
-## Archive Candidates
+## Archive Posture
 
-Archive only after the current REPA comparison and full-scale launcher are
-stable:
+The 2026-07-10 method cleanup moved superseded top-level documents and the old
+proposal to:
+
+```text
+docs/archive/20260710_pre_phase_normal_bridge/
+```
+
+Continue to archive, rather than delete, reproducibility anchors such as:
 
 - change-prediction RAE scripts;
 - chi-head-only scripts;
@@ -76,14 +82,6 @@ stable:
 - typed candidate energy launchers;
 - old contrastive Stage-1 launchers;
 - one-off gradient and geometry diagnostics.
-
-Recommended archive destination:
-
-```text
-scripts/archive/20260626_pre_fullscale_stage2/
-scripts/slurm/archive/20260626_pre_fullscale_stage2/
-docs/archive/20260626_pre_fullscale_stage2/
-```
 
 Keep a short `README.md` in each archive folder explaining why the files moved.
 
@@ -125,10 +123,11 @@ These should remain local/generated unless explicitly needed:
 
 ## Commit Boundary Recommendation
 
-Before the next clean commit, split changes into at least two commits:
+Before the next clean commit, split changes into at least three commits:
 
-1. Stage-2 ESM/REPA implementation and validation launchers.
-2. Documentation and cleanup indexes/runbooks.
+1. Canonical residue/cache/export reliability fixes.
+2. Phase-normal Stage-2 implementation, evaluator, and tests.
+3. Documentation and archive moves.
 
-Avoid mixing large Stage-1 historical rewrites with the Stage-2 full-scale
-training baseline.
+Avoid mixing future stochastic or Stage-1 work into the deterministic APNB
+implementation commit.

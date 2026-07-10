@@ -2,6 +2,10 @@
 
 Date: 2026-04-26
 
+> Status update (2026-07-10): retained as evidence for the future no-Oracle
+> deployment track. Stage-1 is not the current paper bottleneck; the active
+> method is the endpoint-conditioned phase-normal Stage-2 path.
+
 ## Executive Summary
 
 Recent diagnostics indicate that the current BINDRAE prior interface should not continue as a deterministic Stage-1 holo decoder consumed as a Stage-2 attractor. Stage-1 E2 `epoch_018` is worse than apo χ1 carryover on pocket and ligand-facing subsets, while Stage-2 can use an oracle-quality χ signal weakly but does not benefit from the current E2 deterministic prior. The next architecture direction is therefore to reframe Stage-1 as a ligand-conditioned pocket rotamer/contact posterior with confidence, and to let Stage-2 consume soft features or energies rather than a single FK endpoint.

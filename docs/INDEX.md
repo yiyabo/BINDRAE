@@ -1,34 +1,63 @@
 # BINDRAE Docs Index
 
-Top-level docs are the current reading path. Historical analyses, superseded
-plans, and consultation packets live under `docs/archive/`.
+Top-level documents are the active research and execution surface. Superseded
+plans and experiment records live under `docs/archive/` and are never
+operational truth.
 
 ## Start Here
 
-- `CURRENT_PROJECT_STATUS_20260622.md` - current goal, evidence, active entrypoints, and cleanup policy.
-- `ORACLE_MOTION_BASELINE_SNAPSHOT_20260625.md` - frozen OracleMotion Stage-2 upper-bound baseline before representation-enhancement work.
-- `RAEV2_REPA_STAGE2_ENHANCEMENT_PLAN_20260625.md` - next engineering plan for ESM last-K fusion and REPA-style alignment on top of the frozen baseline.
-- `STAGE2_GATED_REPRESENTATION_EXPERIMENTS_20260629.md` - latest Stage-2 ESM gated-residual / REPA screening record and 24k candidate recommendation.
-- `STAGE2_ENDPOINT_BOUNDARY_STATUS_20260708.md` - current Stage-2 endpoint-boundary status, free-flow vs exact-endpoint decision, negative clearance ablations, and next model route.
-- `BINDRAE_POSITIONING_AND_BENCHMARK_STRATEGY_20260629.md` - paper-positioning strategy for known-pose induced-fit modeling, novelty boundaries, benchmark tracks, reviewer risks, and compute priorities.
-- `FULL_SCALE_TRAINING_AND_EVALUATION_RUNBOOK_20260626.md` - operational route for full-scale Stage-2 training and downstream comparison.
-- `REPOSITORY_CLEANUP_POLICY_20260626.md` - cleanup boundaries, mainline files, archive candidates, and commit split guidance.
-- `GIT_STAGING_PLAN_20260626.md` - explicit commit-boundary plan for the current dirty worktree.
-- `STAGE1V2_TEACHER_POSTERIOR_PLAN_20260622.md` - Stage-1-v2 teacher-distilled posterior and optional REPA-style guidance plan.
-- `TODO_STAGE1V2_POSTERIOR.md` - executable TODO for the teacher-distilled Stage-1-v2 student.
-- `LC_PGBF_STAGE2_EXPERIMENT_RECORD_20260620.md` - Stage-2 transition-path experiment record and current main ablation table.
+1. `BINDRAE_CONFERENCE_METHOD_BLUEPRINT_20260710.md`
+   - Canonical method definition, theory, deterministic architecture,
+     stochastic multipath extension, evaluation program, and conference story.
+2. `CURRENT_PROJECT_STATUS_20260710.md`
+   - Implemented state, smoke evidence, current data jobs, scientific claim
+     boundary, and immediate execution order.
+3. `STAGE2_COMPARISON_METRICS_AND_BASELINES_20260701.md`
+   - Metric definitions and internal/external comparison-table structure.
 
-## Current Design Context
+## Active Scientific References
 
-- `LC_PGBF_ARCHITECTURE_PLAN_20260618.md` - compact LC-PGBF v1 method plan and scientific posture.
-- `COMPETITOR_DATASETS_METRICS_20260624.md` - competitor dataset/metric map and benchmark design for endpoint, trajectory, ensemble, and downstream claims.
-- `STAGE1_STAGE2_PRIOR_INTERFACE_DECISION.md` - decision to avoid hard deterministic Stage-1 endpoint priors.
-- `STAGE1_INTERACTION_PRIOR_PIVOT_20260617.md` - pivot from hard rotamer prediction to local interaction/posterior prior.
-- `PROJECT_CLEANUP_LOG_20260622.md` - cleanup actions and remaining candidates.
+- `PATH_BASELINE_LITERATURE_SCAN_20260630.md`
+  - Endpoint-conditioned path-method literature and reproduction notes.
+- `COMPETITOR_DATASETS_METRICS_20260624.md`
+  - Adjacent model, dataset, and metric map. Use as background, not as the
+    current task definition.
+- `ORACLE_MOTION_BASELINE_SNAPSHOT_20260625.md`
+  - Frozen evidence from the earlier OracleMotion free-flow line. It is a
+    historical baseline, not the active architecture.
+- `STAGE1_STAGE2_PRIOR_INTERFACE_DECISION.md`
+  - Evidence against rigid deterministic Stage-1 priors and context for the
+    future no-Oracle deployment paper.
+
+## Repository Operation
+
+- `REPOSITORY_CLEANUP_POLICY_20260626.md`
+  - Generated-file, archive, and commit-boundary policy, updated for the
+    phase-normal track.
+- `scripts/INDEX.md`
+  - Active script surface and current launch entrypoints.
+
+## Current Method In One Line
+
+```text
+known apo/holo endpoints + aligned ligand
+  -> monotone residue phase + normal-space manifold residual
+  -> endpoint-exact atom14 conformational path
+```
+
+The model produces path proposals, not physical MD trajectories. The proposed
+stochastic latent extension is documented but not yet implemented.
 
 ## Archive
 
-- `docs/archive/20260511_stage1_ligand_causality/` - consultation packets and superseded notes from the causality investigation.
-- `docs/archive/20260622_pre_stage1v2_pivot/` - top-level documents demoted after the Stage-1-v2 teacher-posterior pivot.
-- `docs/archive/reference_notes/` - general references, component explainers, and older workflow summaries.
-- `docs/archive/legacy_notes/` - older experiment-design notes kept for traceability.
+- `archive/20260710_pre_phase_normal_bridge/`
+  - Old free-flow, REPA, generic boundary-residual, Stage-1 proposal, and theory
+    documents superseded by the current method.
+- `archive/20260622_pre_stage1v2_pivot/`
+  - Documents from before the Stage-1-v2 posterior pivot.
+- `archive/20260511_stage1_ligand_causality/`
+  - Stage-1 ligand-causality consultation and negative-result records.
+- `archive/reference_notes/`
+  - General references and older component explainers.
+- `archive/legacy_notes/`
+  - Older experiment-design notes retained for traceability.

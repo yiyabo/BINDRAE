@@ -1,0 +1,334 @@
+\documentclass[11pt,a4paper,fontset=fandol]{ctexart}
+
+\usepackage{geometry}
+\usepackage{amsmath, amssymb, amsfonts}
+\usepackage{titlesec}
+\usepackage{parskip}
+\usepackage{graphicx}
+\usepackage{caption}
+\usepackage[table]{xcolor}
+\usepackage{multirow}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+
+\bibliographystyle{IEEEtran}
+\renewcommand{\refname}{参考文献}
+
+\definecolor{wpone}{HTML}{9ecae1}   % WP1 蓝
+\definecolor{wptwo}{HTML}{fdae6b}   % WP2 橙
+\definecolor{wpthree}{HTML}{bcbddc} % WP3 紫
+\definecolor{thesis}{HTML}{a1d99b}  % Thesis 绿
+
+\geometry{left=2.54cm, right=2.54cm, top=2.54cm, bottom=2.54cm}
+
+\titleformat{\section}{\large\bfseries}{}{0em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{}{0em}{}
+
+\title{\bfseries
+BIND-RAE：用于隐匿口袋体系的配体条件化构象通路生成与构象集合采样
+}
+
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\section{引言}
+
+隐匿口袋（cryptic pocket）是指在常规游离态（Apo）结构中不可见，但会在配体结合或罕见构象波动中显现的结合位点。对于 KRAS、Bcl-2 家族蛋白以及免疫检查点蛋白等重要靶点，这类“隐藏”位点为小分子调控提供了关键机会。一旦通过实验筛选、计算对接或获得 Holo 复合物结构确定了隐匿口袋及其初始配体，仍面临一个核心挑战：\emph{理解 Apo 到 Holo 的构象转变通路，并生成多样的“口袋打开”构象集合}，以支持机制解释与后续药物设计。
+
+近年来，蛋白结构预测与生成建模取得了显著进展——包括从序列预测单一静态结构的深度网络~\cite{jumper2021highly, baek2021accurate, lin2023evolutionary, abramson2024accurate}，以及生成蛋白骨架的 SE(3)-等变扩散/流模型~\cite{somnath2023aligned, costa2025accelerating, jing2024alphafold}——极大扩展了我们探索结构空间的能力。然而，这些方法大多聚焦于\emph{端点}结构，缺乏对 Apo 与 Holo 之间\emph{连续、配体条件化转变过程}的显式建模。
+
+另一方面，增强采样分子动力学（MD）方法（如 Gaussian-accelerated MD）能够模拟隐匿口袋的开启事件，但要在多靶点上获得足够轨迹通常代价高昂。这提示我们需要一种混合式路线：
+
+\begin{itemize}
+    \item 在紧凑但富表达的表示空间中捕获精细的、配体条件化的结构先验（Stage~1）。
+    \item 学习一个高效的替代动力学（Stage~2），生成与这些先验及基本生物物理约束一致的连续 Apo\,$\to$\,Holo 轨迹。
+\end{itemize}
+
+本文提出的 BIND-RAE 框架遵循上述理念。它借鉴了：(i) 冻结强大预训练编码器、仅在潜空间训练轻量解码器的 relational auto-encoder 思路~\cite{zheng2025diffusion}；以及 (ii) 在类 SE(3) 流形上用于蛋白与分子生成的 flow matching 与 Schrödinger bridge 相关进展~\cite{jin2024p2dflow, vargas2024scoobdoob}。
+
+\section{相关工作与背景}
+
+\paragraph{静态结构预测}
+AlphaFold2~\cite{jumper2021highly}、RoseTTAFold~\cite{baek2021accurate}、ESMFold~\cite{lin2023evolutionary} 与 AlphaFold3~\cite{abramson2024accurate} 等方法能够以极高精度从序列预测单一静态结构。然而，它们通常只输出端点结构，未显式建模构象动力学或配体诱导的状态转变。\textbf{区别：} 我们关注生成连续的 Apo$\to$Holo 通路，而不仅是预测最终结构；这有助于机制解释（口袋如何打开），并产出可直接用于对接与先导优化的中间“口袋打开”构象集合。
+
+\paragraph{生成式构象集合模型}
+AlphaFlow~\cite{jing2024alphafold}、EigenFold、Str2Str 及相关扩散/流模型可从单一输入结构采样构象集合。这些方法能够生成多样构象，但往往是无条件或仅弱条件化于序列，既不产生显式的时间参数化轨迹，也很少直接对配体结合进行条件化。\textbf{区别：} BIND-RAE 生成按时间排序的构象路径，并显式以配体作为条件，从而支持对口袋开启过程的可解释分析。
+
+\paragraph{Schrödinger Bridge 与 MD 加速}
+桥流（bridge flow）相关方法~\cite{somnath2023aligned, vargas2024scoobdoob} 学习分布之间的传输过程，已用于小分子构象生成与蛋白动力学建模。然而，多数应用聚焦于无条件转变或小分子体系，而非“配体条件化的蛋白构象变化”。\textbf{区别：} 我们在混合的 SE(3)$\times$torsion 流形上应用条件流匹配（CFM），并加入配体条件与口袋特定的弹性门控（elastic gating），面向隐匿口袋体系进行定制化建模。
+
+\paragraph{隐匿口袋发现与预测}
+CryptoSite、P2Rank、Fpocket 等方法可从静态结构中识别潜在结合位点；增强采样（metadynamics、GaMD、adaptive sampling）也能通过模拟揭示隐匿口袋，但代价昂贵。\textbf{区别：} 我们不解决“口袋在哪里”的发现问题，而是在给定已知或近似的配体姿势时，生成“口袋如何打开”的通路，用于补全并增强现有口袋预测工具的下游能力。
+
+\paragraph{蛋白表征学习}
+冻结大规模预训练编码器、仅训练轻量解码器的 RAE 思路~\cite{zheng2025diffusion} 已在图像生成中得到验证。\textbf{区别：} 我们将其迁移到蛋白几何建模中：结合冻结的 ESM 表征、SE(3)-等变几何编码与基于扭转角的解码，并显式引入口袋条件，以适配隐匿口袋相关任务。
+
+\section{研究目标}
+
+\paragraph{范围与问题定义}
+本研究聚焦于在\textbf{已知或具备强先验信息的 Holo 复合物}条件下进行通路重建与构象集合生成，而非仅从纯 Apo 结构中从零发现隐匿口袋。我们考虑两类主要使用场景：
+\begin{itemize}
+    \item \textbf{类型 I（已知 Holo）}：已存在带配体的实验 Holo 结构（如 KRAS、PD-1）。目标是生成 Apo$\to$Holo 通路与“口袋打开”构象集合，用于机制理解与先导优化。
+    \item \textbf{类型 II（近似姿势）}：配体姿势来自同源结构、片段筛选或计算对接推断。生成的通路可能需要后处理精修，但可提供有价值的构象假设。
+\end{itemize}
+需要强调的是，我们不主张解决“冷启动”问题（仅给定 Apo 就同时从零发现口袋与配体）；这仍是未来值得探索的困难扩展方向。
+
+\paragraph{总体目标}
+在给定 Apo 结构与已知或近似的配体姿势时，构建一个配体条件化的生成框架，高效地产生连续的 Apo\,$\to$\,Holo-like 构象轨迹，并输出多样的“口袋打开”构象集合。
+
+本项目围绕以下三个具体目标展开：
+
+\begin{description}[style=unboxed, leftmargin=0cm]
+    \item[目标 1：] 构建\textbf{对口袋敏感、配体条件化的 Holo 解码器（BIND-RAE）}，在基于扭转角的表示下提供高保真 Holo 先验，并显式聚焦口袋与环区等关键柔性区域。
+
+    \item[目标 2：] 在混合的 SE(3)\,$\times$\,torsion 状态空间上学习\textbf{配体条件化桥流}，利用受 Schrödinger bridge 启发的条件流匹配（CFM）将 Apo-like 构象传输到 Holo-like 构象。
+
+    \item[目标 3：] 集成\textbf{生物物理路径正则}（例如碰撞惩罚、路径平滑、口袋--配体接触先验、Stage~1 的 Holo 先验等），并系统评估其对隐匿口袋开启与构象集合质量的影响；同时探索更简化的潜空间变体作为基线方案。
+\end{description}
+
+\section{方法}
+
+\begin{figure*}
+    \centering
+    \includegraphics[width=1\linewidth]{Pipeline_new_upscayl_4x_upscayl-standard-4x.png}
+    \caption{两阶段 BIND-RAE 框架概览。
+Stage~1 训练配体与口袋条件化的解码器，在混合的 SE(3)$\times$torsion 流形上重构 Holo 构象，作为几何先验；
+Stage~2 在该状态空间上通过条件流匹配（CFM）学习配体条件化流，并结合生物物理路径正则，生成连续的 Apo$\rightarrow$Holo-like 口袋开启轨迹。}
+    \label{fig:placeholder}
+\end{figure*}
+
+\subsection{WP1：BIND-RAE——配体条件化的 Holo 解码器}
+
+我们将 Stage~1 命名为 BIND-RAE，以呼应\emph{表征自编码器}（representation auto-encoder, RAE）思想~\cite{zheng2025diffusion}：冻结大规模预训练编码器（此处为 ESM），仅训练轻量、任务特定的解码器。尽管 Stage~1 主要承担解码功能，但 RAE 的叙事强调：表示质量来自冻结编码器，而解码器学习配体条件化的几何重构。
+
+\paragraph{状态表示}
+BIND-RAE 不直接在笛卡尔坐标上建模，而采用将刚体帧与扭转角分离的内坐标表示：
+
+\begin{itemize}
+    \item 对于包含 $N$ 个残基的蛋白，每个残基 $i$ 由主链原子（如 N、C$_\alpha$、C）定义一个局部刚体帧 $F_i = (R_i, t_i) \in \mathrm{SE(3)}$。
+    \item 主链与侧链构象用扭转角参数化：$\theta_i \in (S^1)^{K_i}$（例如 $\phi$、$\psi$、$\omega$ 与 $\chi$ 角）。
+\end{itemize}
+
+由此得到混合状态空间
+\[
+\mathcal{M} = \mathrm{SE(3)}^N \times (S^1)^K,
+\]
+其中 $K$ 为定义的总扭转角数量。
+
+\paragraph{表征：冻结 PLM + 几何分支 + 配体条件}
+表征模块遵循 RAE 思路，冻结强大的预训练编码器，并结合几何与配体信息：
+
+\begin{itemize}
+    \item 冻结的蛋白语言模型（PLM，例如 ESM 变体）输出逐残基序列表征，用于编码进化与功能约束。
+    \item SE(3)-等变几何编码器（例如在残基刚体帧图上的消息传递网络）输入当前 3D 结构并生成局部几何特征。为保证在不同构象态（Apo、Holo 与中间态）上的泛化，我们采用两种策略之一：(a) 用多样 PDB 结构上的自监督任务（如坐标去噪、距离预测）进行预训练初始化；或 (b) 在 WP1 阶段引入 Apo 及 MD 采样帧作为辅助训练数据，并加入额外的重构/对比损失。
+    \item 通过注意力或门控融合将 PLM 与几何特征融合为逐残基潜变量 token $z_i$，并引入额外的\emph{口袋 token} 汇聚隐匿口袋区域信息，利用 FiLM 或交叉注意力调制邻近残基。
+\end{itemize}
+
+该设计强调“蛋白\emph{在哪里允许运动}”：靠近口袋的残基获得更强调制与更高表示容量，而远端区域相对保持刚性。进入 WP2 的全规模流训练前，我们将在早期通过可视化或线性探针等方式检验 Apo/Holo/中间态嵌入是否形成一致流形，以降低表征失配风险。
+
+\paragraph{解码器：Torsion $\to$ FK 全原子重构}
+解码器从潜变量 token 预测扭转角，并通过可微前向运动学（forward kinematics, FK）重构全原子结构。对每个残基 $i$，解码器预测主链与侧链扭转角（用 $\sin/\cos$ 对参数化以体现周期性），并基于标准键长/键角，使用 NeRF/TF-NeRF 风格的可微 FK 模块以数值稳定的方式重构原子坐标。
+
+训练损失为多项加权和：\textbf{FAPE} 风格的帧对齐点误差、\textbf{wrap} 感知的扭转角损失、\textbf{距离/接触}损失，以及 \textbf{clash/基础几何}惩罚；残基级项按平滑口袋权重 $w_{\text{res},i}$ 重新加权，以强调口袋与环区等关键区域。
+
+\paragraph{WP1 产出}
+WP1 的产出是一套训练好的 BIND-RAE 模型：在给定 Holo 骨架与配体姿势时，可解码高保真 Holo-like 全原子构象，并为 Stage~2 提供对口袋敏感的扭转角先验与工具箱（FK、损失项等）。模型基于少量隐匿口袋体系的 Holo 结构进行训练，并可选用配体结合的 MD 帧进行增强。
+
+\subsection{WP2：基于条件流匹配的配体条件化桥流}
+
+\paragraph{问题表述}
+给定固定序列 $S$ 与具有已知/对接姿势的配体 $L$，记
+
+\[
+p_0(x) = p(x \mid \mathrm{Apo}, S, L), \quad
+p_1(x) = p(x \mid \mathrm{Holo}, S, L)
+\]
+
+分别表示状态 $x = (F, \theta) \in \mathcal{M}$ 上的 Apo-like 与“口袋打开”的 Holo-like 构象分布。WP2 旨在学习一个在 $t\in[0,1]$ 上连续的过程 $(X_t)$，使得 $X_0 \sim p_0$、$X_1 \sim p_1$（或其数据可得的近似），同时保证中间态 $X_t$ 在几何与生物物理上合理，并且演化在\emph{配体条件}下主要集中于口袋区域。
+
+从本质上看，这是定义在 $\mathcal{M}$ 上的条件桥（conditional bridge）问题，与 Schrödinger bridge 在概念上相关。我们使用条件流匹配（conditional flow matching, CFM）进行近似求解。
+
+\paragraph{参考桥与条件流匹配}
+直接求解 Schrödinger bridge 代价较高，因此我们采用 CFM：对每个配对样本 $(x_0, x_1)$（Apo/Holo 配对，或来自 MD 的闭合/开启帧），构造一个简单的\emph{参考桥} $X_t^{\text{ref}}$。其中扭转角在 $(S^1)^K$ 上按最短角差进行插值（可叠加布朗噪声），刚体帧沿 SE(3) 测地线插值（可在李代数中注入噪声）。
+
+\textbf{参考桥质量试验：} 在全规模训练前，我们先验证参考桥不会产生病态的非物理中间帧。对 3--5 个试验体系，我们在 $t \in \{0.25, 0.5, 0.75\}$ 采样，并统计 clash 率（存在任意原子对距离 $<$1.5\,\AA\ 的帧比例）。若路径中段严重 clash 的比例 $>$20\%，则切换到备用参考桥：在 BIND-RAE 的潜空间 $z$ 上线性插值后解码，或采用 ENM（elastic network model）形变并结合局部能量最小化。
+
+参考桥对应一个解析可得的参考漂移 $u_t^{\text{ref}}(x)$。随后我们训练一个可学习的、配体条件化向量场
+    \[
+    v_\Theta(x,t \mid S, L, w_{\text{res}}) = (\dot F_\Theta(x,t), \dot\theta_\Theta(x,t))
+    \]
+    以在参考桥采样点上逼近该漂移。训练目标为最小化
+    \[
+        \mathcal{L}_{\text{FM}}
+        = \mathbb{E}_{x_0,x_1,t,X_t^{\text{ref}}}
+        \big[
+        \| v_\Theta(X_t^{\text{ref}},t) - u_t^{\text{ref}}(X_t^{\text{ref}}) \|^2
+        \big],
+    \]
+    并通过逐残基权重强调口袋相关自由度。
+
+推理阶段，我们从 Apo-like 初始状态 $x_0$ 出发，对学习到的 ODE 进行数值积分：
+\[
+\frac{dx}{dt} = v_\Theta(x,t \mid S, L, w_{\text{res}}),\quad x(0)=x_0
+\]
+并使用标准 ODE 求解器生成连续的 Apo\,$\to$\,Holo 构象轨迹。
+
+\paragraph{网络结构与弹性门控}
+向量场网络复用 BIND-RAE 的编码模块：将当前状态 $x(t)$ 通过 FK 解码为原子级坐标，几何编码器（类似 Flash-IPA 或 SE(3) Transformer 变体）结合这些坐标、ESM 序列表征与配体 token 形成逐残基特征。随后，\textbf{弹性门控}头输出逐残基标量 $g_i(t)\in(0,1)$，用于调制预测速度的幅度；其输入融合了\emph{口袋邻近度} $w_{\text{res},i}$ 与\emph{NMA 位移幅度} $M_i^{\text{nma}}$（由弹性网络模型预计算的低频法向模态幅值）。该设计可在铰链区或柔性环区（即使远离口袋）打开门控，从而更好覆盖大尺度构象变化（RMSD $>$ 5\,\AA）。
+
+\textbf{NMA 验证（WP2 早期）：} 在依赖 NMA 特征之前，我们将对其相关性进行验证：在具有 Apo/Holo 配对的体系上，计算 Apo$\to$Holo 位移向量与低频 ENM 特征向量的重叠程度。作为暂定阈值，若在多数体系中前 3--5 个模态的累计重叠解释的位移比例 $<$30\%，则退化为仅使用口袋门控，或将 NMA 作为可学习下权的软先验。该阈值将基于 3--5 个体系的试验分析进一步校准，并参考 NMA 文献中的参与率（participation ratio）与集体性指数（collectivity index）等指标。
+
+网络通过两个输出头分别给出 $(S^1)^K$ 上的扭转角速度 $\dot\theta_\Theta$，以及 $\mathfrak{se}(3)$（李代数 twist 表示）中的刚体速度 $\dot F_\Theta$；刚体更新通过指数映射实现，以保持 SO(3) 的正交性约束。
+
+训练过程中在参考桥上的纯 flow matching 与对学习到的向量场进行周期性积分之间交替，以强化端点一致性（Apo $\to$ Holo）。
+
+\paragraph{WP2 产出}
+WP2 的产出是一个学习得到的、配体条件化桥流：在给定 Apo 结构与配体时，可在 SE(3)\,$\times$\,torsion 空间中生成连续的口袋开启轨迹，并可通过 BIND-RAE 解码为沿路径的全原子 3D 帧，同时尽量保持非口袋区域相对稳定。
+
+\subsection{WP3：生物物理路径正则与变体}
+
+WP3 探索如何将显式生物物理先验注入到学习到的流中，以及这些先验如何影响隐匿口袋开启与可成药性（ligandability）。
+
+\paragraph{路径级几何正则}
+借助 BIND-RAE 解码器，我们可以在生成轨迹上评估多个中间帧 $x(t_k)$ 的几何合理性。我们使用 FAPE 或相邻帧之间的 C$_\alpha$ RMSD（尤其关注非口袋区域）对路径平滑性进行正则，并通过对非键连原子对的子采样来惩罚整条路径上的空间碰撞（steric clash）。
+
+\paragraph{口袋接触先验（数据校准）}
+一个直观假设是：随着口袋打开，蛋白--配体接触总体应当增加。但真实结合机制并不单一：构象选择可能发生在\emph{配体接触之前}，多步结合也可能呈现非单调接触曲线。我们不对单调性进行硬编码，而采用\textbf{数据驱动}策略：
+我们将 (i) 从可用的 MD 轨迹中校准接触模式，通过经验接触分数 $C_{\text{MD}}(t)$ 进行分析（例如单调、先选择后结合、多阶段）；(ii) 使用软终端先验，仅要求 $C(1) > C(0)$ 且 $C(t)$ 在 $t=1$ 附近保持较高；(iii) 通过消融对比“有/无接触先验”的模型，量化其对路径质量的影响。
+
+这种假设驱动但由数据校准的正则方式，可避免将模型偏置到不符合真实物理机制的路径上。
+
+\paragraph{Stage~1 的 Holo 先验作为路径先验}
+BIND-RAE 的 Holo 解码器为每个配体与 Apo 骨架提供高保真的 Holo 先验。WP3 将探索用该先验温和地引导轨迹后半段：当 $t$ 接近 1 时，加入小幅惩罚项，使扭转角构型接近 BIND-RAE 的 Holo 预测，同时在可获得真实 Holo 结构时仍尊重其监督信号。该设计将 Stage~1 与 Stage~2 闭环耦合：Stage~1 捕获“配体条件化的平衡构象”，Stage~2 学习“如何从 Apo 连续到达该流形”。
+
+\paragraph{消融与变体}
+WP3 将通过系统性消融实验分离各组件贡献：比较“仅口袋门控”与“口袋+NMA 门控”以评估物理启发的柔性先验；比较“有/无软接触正则”对路径质量的影响；并实现一个更轻量的潜空间变体，使流在 BIND-RAE 潜变量 $z$ 上运行，而非显式的 SE(3)$\times$torsion 状态。我们还加入负对照：\emph{非配对训练}（打乱 Apo--Holo 配对）与\emph{无条件流}（移除配体与口袋 token）。成功的必要条件之一是：完整的、配体条件化且正确配对的模型在系统级成功率与端点质量上显著优于两类负对照。
+
+\section{预期贡献}
+
+\begin{itemize}
+	    \item \textbf{配体条件化的 Holo 解码器（BIND-RAE）}：融合冻结的 PLM 表征、SE(3)-等变几何编码与基于扭转角的 FK 解码，生成面向隐匿口袋的高保真 Holo 先验。
+	    \item \textbf{配体条件化流模型}：在混合的 SE(3)\,$\times$\,torsion 流形上，通过条件流匹配（CFM）训练生成连续 Apo\,$\to$\,Holo 轨迹，并将运动集中于口袋与环区等关键区域。
+	    \item \textbf{路径级正则与验证体系}：包含 clash 控制、路径平滑、数据校准的接触先验与 Stage~1 的 Holo 先验，并在一组隐匿口袋体系上给出实证结果，证明相较于短程 MD 与法向模态采样等基线，可更好恢复“口袋打开”构象并富集可成药构象集合。
+\end{itemize}
+
+除上述直接产出外，BIND-RAE 框架还可作为进一步扩展的基础：将配体生成或对接集成到同一管线中（更接近端到端的“ligand + pocket + path”建模）；将桥流扩展到其他构象转变（如变构调控、结构域运动）；以及将来自科学语言模型的高层语义先验转化为显式结构约束，并在路径正则化阶段落地实现。
+
+\clearpage
+\section*{时间表}
+
+\begin{center}
+\small
+\setlength{\tabcolsep}{2pt}
+\renewcommand{\arraystretch}{1.2}
+
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{|p{2.1cm}|>{\raggedright\arraybackslash}p{5.2cm}|*{12}{c|}}
+\hline
+\multicolumn{1}{|c|}{\textbf{工作包}} &
+\multicolumn{1}{c|}{\textbf{任务}} &
+\multicolumn{12}{c|}{\textbf{时间线（Oct -- Sept）}} \\ \cline{3-14}
+& & Oct & Nov & Dec & Jan & Feb & Mar & Apr & May & Jun & Jul & Aug & Sept \\
+\hline
+
+% ========================== Year 1 ==========================
+\rowcolor{black!5}
+\multicolumn{14}{|l|}{\textbf{第一年}} \\ \hline
+
+\multirow{4}{*}{WP1}
+& 1.1 整理隐匿口袋体系与数据
+& \cellcolor{wpone} & \cellcolor{wpone} & \cellcolor{wpone} &  &  &  &  &  &  &  &  &  \\ \cline{2-14}
+
+& 1.2 实现 BIND-RAE 编码器--解码器
+&  & \cellcolor{wpone} & \cellcolor{wpone} & \cellcolor{wpone} & \cellcolor{wpone} &  &  &  &  &  &  &  \\ \cline{2-14}
+
+& 1.3 初始训练与重构基线
+&  &  &  & \cellcolor{wpone} & \cellcolor{wpone} & \cellcolor{wpone} & \cellcolor{wpone} &  &  &  &  &  \\ \cline{2-14}
+
+& 1.4 口袋几何分析与内部报告
+&  &  &  &  &  & \cellcolor{wpone} & \cellcolor{wpone} & \cellcolor{wpone} & \cellcolor{wpone} &  &  &  \\ \hline
+
+% ========================== Year 2 ==========================
+\rowcolor{black!5}
+\multicolumn{14}{|l|}{\textbf{第二年}} \\ \hline
+
+\multirow{4}{*}{WP1}
+& 1.5 优化口袋加权与动力学感知训练
+& \cellcolor{wpone} & \cellcolor{wpone} & \cellcolor{wpone} & \cellcolor{wpone} &  &  &  &  &  &  &  &  \\ \cline{2-14}
+
+& 1.6 在留出体系上的系统评估
+&  &  &  & \cellcolor{wpone} & \cellcolor{wpone} & \cellcolor{wpone} & \cellcolor{wpone} &  &  &  &  &  \\ \cline{2-14}
+
+& 1.7 冻结最佳 BIND-RAE 模型（Stage~1 先验）
+&  &  &  &  &  & \cellcolor{wpone} & \cellcolor{wpone} & \cellcolor{wpone} &  &  &  &  \\ \cline{2-14}
+
+& 1.8 撰写 BIND-RAE 表征论文初稿
+&  &  &  &  &  &  &  & \cellcolor{wpone} & \cellcolor{wpone} & \cellcolor{wpone} &  &  \\ \hline
+
+\multirow{2}{*}{WP2}
+& 2.1 形式化 SE(3)$\times$torsion 状态空间；NMA 验证
+&  &  &  &  &  & \cellcolor{wptwo} & \cellcolor{wptwo} & \cellcolor{wptwo} &  &  &  &  \\ \cline{2-14}
+
+& 2.2 实现参考桥并进行质量试验
+&  &  &  &  &  &  &  & \cellcolor{wptwo} & \cellcolor{wptwo} & \cellcolor{wptwo} &  &  \\ \hline
+
+% ========================== Year 3 ==========================
+\rowcolor{black!5}
+\multicolumn{14}{|l|}{\textbf{第三年}} \\ \hline
+
+\multirow{2}{*}{WP1}
+& 1.9 完成并投稿 BIND-RAE 论文
+& \cellcolor{wpone} & \cellcolor{wpone} & \cellcolor{wpone} &  &  &  &  &  &  &  &  &  \\ \cline{2-14}
+
+& （如需修改）
+&  &  &  & \cellcolor{wpone} & \cellcolor{wpone} &  &  &  &  &  &  &  \\ \hline
+
+\multirow{4}{*}{WP2}
+& 2.3 CFM 训练代码与试验
+& \cellcolor{wptwo} & \cellcolor{wptwo} & \cellcolor{wptwo} & \cellcolor{wptwo} &  &  &  &  &  &  &  &  \\ \cline{2-14}
+
+& 2.4 全面训练配体条件化桥流
+&  &  &  & \cellcolor{wptwo} & \cellcolor{wptwo} & \cellcolor{wptwo} & \cellcolor{wptwo} &  &  &  &  &  \\ \cline{2-14}
+
+& 2.6 基线对比（MD / NMA / 潜空间插值）
+&  &  &  &  &  & \cellcolor{wptwo} & \cellcolor{wptwo} & \cellcolor{wptwo} &  &  &  &  \\ \cline{2-14}
+
+& 2.7 桥流论文（Apo$\to$Holo 轨迹）
+&  &  &  &  &  &  & \cellcolor{wptwo} & \cellcolor{wptwo} & \cellcolor{wptwo} &  &  &  \\ \hline
+
+\multirow{2}{*}{WP3}
+& 3.1 设计路径级正则（clash、平滑、接触）
+&  &  &  &  &  & \cellcolor{wpthree} & \cellcolor{wpthree} & \cellcolor{wpthree} &  &  &  &  \\ \cline{2-14}
+
+& 3.2 实现潜空间流变体（消融）
+&  &  &  &  &  &  & \cellcolor{wpthree} & \cellcolor{wpthree} & \cellcolor{wpthree} &  &  &  \\ \hline
+
+% ========================== Year 4 ==========================
+\rowcolor{black!5}
+\multicolumn{14}{|l|}{\textbf{第四年}} \\ \hline
+
+\multirow{3}{*}{WP3}
+& 3.3 将正则集成进桥流并调参
+& \cellcolor{wpthree} & \cellcolor{wpthree} & \cellcolor{wpthree} & \cellcolor{wpthree} &  &  &  &  &  &  &  &  \\ \cline{2-14}
+
+& 3.4 在更多靶点上扩展评估
+&  &  &  & \cellcolor{wpthree} & \cellcolor{wpthree} & \cellcolor{wpthree} &  &  &  &  &  &  \\ \cline{2-14}
+
+& 3.5 撰写路径正则化 BIND-RAE 框架综合论文
+&  &  &  &  &  & \cellcolor{wpthree} & \cellcolor{wpthree} & \cellcolor{wpthree} &  &  &  &  \\ \hline
+
+\multirow{1}{*}{论文}
+& 4.1 学位论文写作与答辩准备
+&  &  &  &  &  &  & \cellcolor{thesis} & \cellcolor{thesis} & \cellcolor{thesis} & \cellcolor{thesis} & \cellcolor{thesis} & \cellcolor{thesis} \\ \hline
+
+\end{tabular}
+} % end resizebox
+\end{center}
+
+\bibliography{Reference}
+
+\end{document}

@@ -2,6 +2,10 @@
 
 Date: 2026-06-24
 
+> Status update (2026-07-10): retained as an adjacent-task map. The active
+> headline method is endpoint-conditioned phase-normal path learning; static
+> endpoint predictors remain contextual rather than primary baselines.
+
 ## Executive Position
 
 BINDRAE should not be benchmarked as a generic docking method. The clean task is:

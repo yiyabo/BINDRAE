@@ -1,9 +1,9 @@
 # BINDRAE Agent Guide
 
 ## Project shape
-BINDRAE is a two-stage protein-ligand induced-fit system for known ligand poses. Stage-1 learns a ligand-conditioned holo prior / pocket posterior from apo structure, sequence embeddings, and ligand tokens. Stage-2 learns an apo-to-holo conditional bridge flow on per-residue `SE(3)` frames and side-chain chi angles. The main implementation lives under `src/stage1/`, `src/stage2/`, and `scripts/`; `CLIProxyAPI/` is an independent nested Go project with its own `AGENTS.md`.
+BINDRAE is a protein-ligand conformational-path project for known ligand poses. The active paper track learns endpoint-conditioned apo-to-holo paths on per-residue `SE(3)` frames and side-chain chi angles. Its current method is an endpoint-exact asynchronous phase-normal bridge: a monotone residue phase controls progress along an analytic endpoint bridge, while a metric-orthogonal residual models off-bridge motion. Stage-1 is a future deployment track that will replace privileged endpoint-derived conditioning with an apo-and-ligand-conditioned posterior. The main implementation lives under `src/stage1/`, `src/stage2/`, and `scripts/`; `CLIProxyAPI/` is an independent nested Go project with its own `AGENTS.md`.
 
-The main scientific contract is apo protein plus aligned ligand pose to holo endpoint/path. Do not reframe the repository as docking unless the task explicitly asks for pose-search work. The code and docs assume ligand coordinates are already in the apo frame or consistently aligned into it.
+The active scientific contract is known apo and holo endpoints plus an aligned ligand pose to an ordered conformational path. Do not reframe the repository as docking, apo-only holo prediction, or physical MD generation unless the task explicitly changes scope. The code and docs assume ligand coordinates are already in the apo frame or consistently aligned into it.
 
 ## Operating constraints
 Never run Python training directly on the Beijing supercomputing login node. Use Slurm launchers through `sbatch`, with `/data/soft/slurm/24.11.4/bin` added to `PATH`, and activate the remote `BINDRAE` conda env first. Local edits can be syntax-checked here, but GPU training and large diagnostics belong on the cluster under `/mnt/inaisfs/data/home/zhaozc_criait/XinxiangWang/BINDRAE`.
@@ -16,14 +16,14 @@ When using SSH examples from `CLAUDE.md`, treat them as operational context and 
 - `src/stage1/`: holo prior / ligand-conditioned pocket rotamer-contact modeling. See its local guide before changing losses, candidate scoring, or FK outputs.
 - `src/stage2/`: conditional bridge flow using Stage-1 guidance, path integration, and path-level geometry losses. See its local guide before changing flow state or priors.
 - `scripts/`: active training, diagnostics, preprocessing, and Slurm wrappers. See its local guide before launching jobs or adding CLI flags. Archived scripts under `scripts/archive/` and `scripts/slurm/archive/` are reproducibility records, not templates for new experiments.
-- `docs/`: experiment rationale and design decisions. Start from `docs/CURRENT_PROJECT_STATUS_20260622.md`, then read the active Stage-1-v2 and Stage-2 records. Archived files are scientific context, not executable truth.
+- `docs/`: experiment rationale and design decisions. Start from `docs/BINDRAE_CONFERENCE_METHOD_BLUEPRINT_20260710.md` and `docs/CURRENT_PROJECT_STATUS_20260710.md`. Archived files are scientific context, not executable truth.
 - `data/`, `processed_data/`, `logs/`, `checkpoints/`, `tmp/`: generated or large artifacts. Do not casually rewrite, commit, or recursively scan them unless the task is explicitly about data or results.
 - `reference/` and `legacy/`: borrowed or historical code. Prefer wrapping or comparing against it instead of modifying it in-place.
 
 `proposal/`, `RP/`, and large merged documents may contain presentation or historical material; use them for context only after checking fresher files under `docs/` and active code under `src/`.
 
 ## Code navigation priorities
-For Stage-1 work, start from `src/stage1/training/trainer.py`, `src/stage1/models/stage1_model.py`, and `src/stage1/models/torsion_head.py`. For Stage-2 work, start from `src/stage2/training/trainer.py`, `src/stage2/models/torsion_flow.py`, and `src/stage2/modules/se3.py`. For experiment launch behavior, inspect the exact Slurm script under `scripts/slurm/` rather than assuming CLI defaults.
+For Stage-1 work, start from `src/stage1/training/trainer.py`, `src/stage1/models/stage1_model.py`, and `src/stage1/models/torsion_head.py`. For Stage-2 work, start from `src/stage2/training/trainer.py`, `src/stage2/models/torsion_flow.py`, `src/stage2/modules/phase_residual.py`, and `src/stage2/modules/se3.py`. For experiment launch behavior, inspect the exact Slurm script under `scripts/slurm/` rather than assuming CLI defaults.
 
 ## Scientific assumptions to preserve
 The default task is known-pose induced fit, not docking. Ligand coordinates are expected in the apo frame or aligned consistently to it. The structural state is per-residue backbone frames plus chi angles; do not introduce redundant backbone torsion state unless the design docs are intentionally being revised. FK and losses should remain global-SE(3)-consistent.
@@ -31,21 +31,21 @@ The default task is known-pose induced fit, not docking. Ligand coordinates are 
 Angles live on `S^1`; use wrap-aware differences or sin/cos representations. Frame operations should remain consistent with the local SE(3) utilities instead of ad-hoc matrix math. Ligand effects should be evaluated on biologically relevant subsets such as contact, ligand-facing, switch, and pocket residues.
 
 ## Current Stage-1 direction
-Stage-1-v2 should be a teacher-distilled local posterior encoder, not a hard holo-rotamer endpoint model. The current active plan is `docs/STAGE1V2_TEACHER_POSTERIOR_PLAN_20260622.md`: export local teacher posterior labels, train a compact posterior encoder, and use its scalar/latent guidance to improve Stage-2 path generation.
+Stage-1 is not the active paper bottleneck. It remains the future no-Oracle deployment track: predict a calibrated local motion/contact posterior and an endpoint distribution from apo structure, sequence, and ligand information, then condition the path model on those predictions. Do not restart the archived hard-holo or broad teacher-posterior sweeps unless the user explicitly resumes that track.
 
-Older diagnostics showed that raw global chi1 accuracy can be dominated by a Dunbrack-like base prior, not ligand-causal learning. Keep evaluating ligand effects with lift-over-base, decoy/shuffled-ligand controls, contact/switch subsets, rescue/harm metrics, and calibrated local posterior quality.
+Older diagnostics showed that raw global chi1 accuracy can be dominated by a Dunbrack-like base prior, not ligand-causal learning. When Stage-1 resumes, keep evaluating ligand effects with lift-over-base, decoy/shuffled-ligand controls, contact/switch subsets, rescue/harm metrics, and calibrated local posterior quality.
 
 ## Stage-2 interface posture
-Older notes may describe Stage-1 as a deterministic endpoint anchor. Newer diagnostics in `docs/STAGE1_STAGE2_PRIOR_INTERFACE_DECISION.md` recommend softer local posterior/contact information and caution against rigid priors. Keep Stage-2 prior changes compatible with zero-prior fallback and explicit ablations.
+The active parameterization is `phase_orthogonal_residual_v1`. Preserve its scientific decomposition:
 
-As of 2026-06-25, the strongest Stage-2 evidence is the frozen OracleMotion upper-bound baseline in `docs/ORACLE_MOTION_BASELINE_SNAPSHOT_20260625.md`. Treat it as the current stable starting point. Do not launch additional reliability step sweeps, sample ranking, or visualization jobs unless the user explicitly asks; the next default engineering track is `docs/RAEV2_REPA_STAGE2_ENHANCEMENT_PLAN_20260625.md` with ESM last-K fusion and REPA-style alignment.
+- `tau_i(t)` is monotone and controls along-bridge progress;
+- the rigid/chi residual is projected into the product-metric normal space;
+- an endpoint-zero envelope and explicit endpoint insertion guarantee exact boundaries;
+- residual magnitude, temporal, neighbor, and background terms keep the correction controlled.
 
-As of 2026-06-27, the active full-scale preparation matrix is OracleMotion
-conditioning with ESM last-K fusion and optional REPA-style hidden-state
-alignment. Compare REPA runs with `val_total_no_repa` plus endpoint/contact/path
-metrics; `val_repa` is only an auxiliary target-fitting diagnostic. Before
-60k/long training, run a matching Slurm precheck and ensure checkpoint resume
-support is available or the walltime is sufficient.
+The frozen OracleMotion snapshot in `docs/ORACLE_MOTION_BASELINE_SNAPSHOT_20260625.md` remains historical evidence, not the current architecture. OracleMotion is privileged endpoint-derived conditioning and contains no MD intermediate trajectory. ESM fusion and REPA are secondary representation studies, not headline novelty.
+
+Before any full-scale run, complete the matched four-model screen: synchronous bridge, warp-only, residual-only, and full phase-normal bridge. Select using path/contact/event-order metrics and independent physical validity, not endpoint error alone. The proposed stochastic global path latent is documented but not implemented; do not present it as completed work.
 
 ## Validation habits
 After Python edits, run targeted import or compile checks first, for example `python -m py_compile <changed files>`. For shell launchers, run `bash -n <script>`. For training changes, use smoke or diagnostic Slurm scripts before long runs, then inspect `logs/slurm/` and JSONL metrics under `logs/stage1/` or `logs/stage2/`.

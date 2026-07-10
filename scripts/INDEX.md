@@ -8,12 +8,12 @@ to revive that lane.
 ## Active Entry Points
 
 - `train_stage1.py` - main Stage-1 training CLI.
-- `train_stage2.py` - main Stage-2 training CLI; currently supports OracleMotion features, ESM last-K fusion, and optional REPA-style hidden-state alignment.
+- `train_stage2.py` - main Stage-2 training CLI; supports the endpoint-exact phase-normal path, OracleMotion features, ESM last-K fusion, and controlled legacy ablations.
 - `train_stage1v2_posterior.py` - trains the Stage-1-v2 teacher-distilled posterior student.
 - `audit_stage1v2_posterior.py` - audits a trained Stage-1-v2 posterior checkpoint with threshold, ranking, calibration, and ligand-control metrics.
 - `export_stage1v2_posterior_cache.py` - exports per-sample Stage-1-v2 student posterior `.npz` caches for Stage-2 consumption.
 - `export_oracle_motion_features.py` - exports OracleMotion-UB apo-to-holo motion features and direct oracle-apply audits.
-- `export_stage2_teacher_residual_cache.py` - exports free-flow teacher residual targets for endpoint-preserving boundary-residual Stage-2 students.
+- `export_stage2_teacher_residual_cache.py` - historical/free-flow teacher-residual exporter retained for reproducibility; it is not the active phase-normal path target.
 - `validate_triplets_data.py` - validates Stage-1 triplet datasets.
 - `audit_ligand_sensitive_dataset.py` - ligand-sensitive dataset audit.
 - `diagnose_stage1_prior.py` - Stage-1 diagnostic entrypoint.
@@ -35,13 +35,14 @@ to revive that lane.
 
 ## Current Stage-2 Run Path
 
-Use the runbook before launching full-scale jobs:
+Read the current method and status before launching full-scale jobs:
 
-- `../docs/FULL_SCALE_TRAINING_AND_EVALUATION_RUNBOOK_20260626.md`
+- `../docs/BINDRAE_CONFERENCE_METHOD_BLUEPRINT_20260710.md`
+- `../docs/CURRENT_PROJECT_STATUS_20260710.md`
 
 Current primary training surface:
 
-- `slurm/train_stage2_oracle_motion_ablation_4gpu.sh` - despite the historical filename, this is the active OracleMotion / ESM last-K / REPA ablation launcher and defaults to 2xA100.
+- `slurm/train_stage2_oracle_motion_ablation_4gpu.sh` - despite the historical filename, this is the active Stage-2 launcher and includes phase-normal, OracleMotion, ESM, REPA, and legacy ablation controls.
 
 For final-scale runs, prefer a short `PRECHECK_ONLY=1` Slurm run before the
 long training submission. Long jobs should use unique tags and should not
