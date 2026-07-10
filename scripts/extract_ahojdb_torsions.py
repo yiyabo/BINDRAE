@@ -5,6 +5,7 @@ Extract Backbone and Sidechain Torsions for AHoJ-DB Triplets (Stage-2)
 - Output: torsion_apo.npz, torsion_holo.npz in the same directory
 """
 
+import os
 import sys
 import numpy as np
 from pathlib import Path
@@ -12,6 +13,18 @@ from typing import Dict, Optional, List
 import concurrent.futures
 from tqdm import tqdm
 import warnings
+
+project_root = Path(__file__).resolve().parent.parent
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
+from src.data.residue_identity import (
+    RESIDUE_ALIGNMENT_VERSION,
+    iter_standard_residues,
+    residue_key_from_biopython,
+    residue_keys_to_array,
+    residue_names_to_sequence,
+)
 
 # Add project root to path to import potential utils if needed, 
 # but here we keep it standalone similar to extract_torsions.py for robustness.
@@ -102,7 +115,12 @@ class TorsionExtractor:
     def is_sequential(self, r1, r2):
         if not r1 or not r2: return False
         if r1.get_parent().id != r2.get_parent().id: return False
-        return abs(r1.id[1] - r2.id[1]) == 1
+        c_prev = self.get_atom_coord(r1, 'C')
+        n_next = self.get_atom_coord(r2, 'N')
+        if c_prev is None or n_next is None:
+            return False
+        peptide_distance = float(np.linalg.norm(c_prev - n_next))
+        return 0.8 <= peptide_distance <= 2.0
 
     def extract(self, pdb_path: Path) -> Optional[Dict]:
         if not pdb_path.exists():
@@ -118,26 +136,15 @@ class TorsionExtractor:
             return None
         
         try:
-            # More robust residue filtering - handle altLoc and non-standard naming
-            standard_aa = {
-                'ALA', 'CYS', 'ASP', 'GLU', 'PHE', 'GLY', 'HIS', 'ILE',
-                'LYS', 'LEU', 'MET', 'ASN', 'PRO', 'GLN', 'ARG', 'SER',
-                'THR', 'VAL', 'TRP', 'TYR'
-            }
-            
-            residues = []
-            for r in structure.get_residues():
-                # Get residue name and clean it
-                resname = r.get_resname().strip()
-                # Handle altLoc: AALA -> ALA, BALA -> ALA
-                if len(resname) == 4 and resname[0] in 'AB' and resname[1:] in standard_aa:
-                    resname = resname[1:]
-                
-                # Check if it's a standard amino acid
-                if resname in standard_aa:
-                    residues.append(r)
+            residues = list(iter_standard_residues(structure))
             
             if not residues: return None
+
+            residue_keys = [
+                residue_key_from_biopython(residue.get_parent(), residue)
+                for residue in residues
+            ]
+            residue_names = [residue.get_resname().strip().upper() for residue in residues]
 
             n_res = len(residues)
             phi = np.zeros(n_res, dtype=np.float32)
@@ -193,7 +200,11 @@ class TorsionExtractor:
                 'phi': phi, 'psi': psi, 'omega': omega,
                 'chi': chi, 'bb_mask': bb_mask, 'chi_mask': chi_mask,
                 'omega_cis_trans': omega_cis_trans,
-                'n_residues': n_res
+                'n_residues': n_res,
+                'residue_keys': residue_keys_to_array(residue_keys),
+                'residue_names': np.asarray(residue_names, dtype=np.str_),
+                'sequence_str': np.asarray(residue_names_to_sequence(residue_names)),
+                'residue_alignment_version': np.asarray(RESIDUE_ALIGNMENT_VERSION),
             }
 
         except Exception as e:
@@ -201,6 +212,27 @@ class TorsionExtractor:
             print(f"Error processing {pdb_path}: {e}", file=sys.stderr)
             return None
 
+def _torsion_cache_is_current(path: Path) -> bool:
+    if not path.exists():
+        return False
+    try:
+        with np.load(path, allow_pickle=False) as data:
+            if 'residue_keys' not in data or 'residue_alignment_version' not in data:
+                return False
+            return str(np.asarray(data['residue_alignment_version']).item()) == RESIDUE_ALIGNMENT_VERSION
+    except Exception:
+        return False
+
+
+def _atomic_savez(path: Path, data: Dict) -> None:
+    temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temp_path.open("wb") as handle:
+            np.savez_compressed(handle, **data)
+        os.replace(temp_path, path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
 def process_sample(sample_dir: Path):
     """Process one sample - creates its own extractor to avoid threading issues"""
     sample_id = sample_dir.name
@@ -210,23 +242,29 @@ def process_sample(sample_dir: Path):
     
     # Process Apo
     apo_pdb = sample_dir / "apo.pdb"
-    if apo_pdb.exists() and not (sample_dir / "torsion_apo.npz").exists():
+    apo_out = sample_dir / "torsion_apo.npz"
+    if apo_pdb.exists() and not _torsion_cache_is_current(apo_out):
         data = extractor.extract(apo_pdb)
         if data:
-            np.savez_compressed(sample_dir / "torsion_apo.npz", **data)
+            _atomic_savez(apo_out, data)
     
     # Process Holo
     holo_pdb = sample_dir / "holo.pdb"
-    if holo_pdb.exists() and not (sample_dir / "torsion_holo.npz").exists():
+    holo_out = sample_dir / "torsion_holo.npz"
+    if holo_pdb.exists() and not _torsion_cache_is_current(holo_out):
         data = extractor.extract(holo_pdb)
         if data:
-            np.savez_compressed(sample_dir / "torsion_holo.npz", **data)
+            _atomic_savez(holo_out, data)
 
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Extract Torsions for AHoJ-DB")
     parser.add_argument("--data-dir", required=True, help="Root directory containing sample subdirectories (output of prepare_ahojdb_triplets.py)")
     parser.add_argument("--num-workers", type=int, default=4, help="Number of threads")
+    parser.add_argument("--sample-list", type=str, default=None,
+                        help="Optional file containing sample IDs to process")
+    parser.add_argument("--max-samples", type=int, default=0,
+                        help="Optional cap after sample-list filtering; 0 means all")
     
     args = parser.parse_args()
     
@@ -246,13 +284,28 @@ def main():
         sys.exit(1)
         
     sample_dirs = [d for d in samples_dir.iterdir() if d.is_dir()]
+    if args.sample_list:
+        sample_list_path = Path(args.sample_list)
+        if not sample_list_path.is_absolute() and not sample_list_path.exists():
+            sample_list_path = data_dir / sample_list_path
+        if not sample_list_path.exists():
+            raise FileNotFoundError(sample_list_path)
+        requested = {
+            line.strip()
+            for line in sample_list_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        }
+        sample_dirs = [sample_dir for sample_dir in sample_dirs if sample_dir.name in requested]
+    sample_dirs.sort(key=lambda path: path.name)
+    if args.max_samples > 0:
+        sample_dirs = sample_dirs[:args.max_samples]
     print(f"Found {len(sample_dirs)} samples in {samples_dir}")
     
     # Run in parallel using ProcessPoolExecutor for true parallelism
     # ProcessPoolExecutor bypasses GIL and uses multiple CPU cores effectively
     with concurrent.futures.ProcessPoolExecutor(max_workers=args.num_workers) as executor:
-        # Use map for simpler and often faster execution
-        list(tqdm(executor.map(process_sample, sample_dirs, chunksize=100), 
+        chunksize = max(1, min(16, len(sample_dirs) // max(args.num_workers * 8, 1)))
+        list(tqdm(executor.map(process_sample, sample_dirs, chunksize=chunksize),
                   total=len(sample_dirs), desc="Extracting Torsions"))
 
 if __name__ == "__main__":

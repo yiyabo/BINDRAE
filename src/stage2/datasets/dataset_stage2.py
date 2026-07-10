@@ -17,7 +17,6 @@ from typing import Dict, List, Optional
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-from Bio.PDB import PDBParser
 
 # Add project root
 _current_file = Path(__file__).resolve()
@@ -27,6 +26,11 @@ if str(project_root) not in sys.path:
 
 from utils.ligand_utils import build_ligand_tokens_from_file, LIGAND_TYPE_DIM
 from src.stage1.data.residue_constants import restype_order
+from src.data.residue_identity import (
+    RESIDUE_ALIGNMENT_VERSION,
+    load_residue_keys,
+    residue_identity_hash,
+)
 from .batch import Stage2Batch, collate_stage2_batch
 from .backbone import (
     extract_backbone_coords,
@@ -39,6 +43,7 @@ from .backbone import (
     _align_matrix,
     _align_nma,
     _load_torsions,
+    _load_torsion_residue_keys,
     _sequence_to_aatype,
 )
 from .features import (
@@ -278,9 +283,15 @@ class ApoHoloBridgeDataset(Dataset):
         node_mask: Optional[np.ndarray],
         feature_mode: str,
         strict_residue_identity: bool,
+        residue_hash: Optional[str],
     ) -> np.ndarray:
         expected_aatype = aatype if strict_residue_identity else None
         expected_node_mask = node_mask if strict_residue_identity else None
+        expected_residue_hash = (
+            residue_hash
+            if strict_residue_identity and feature_mode in ORACLE_MOTION_FEATURE_MODES
+            else None
+        )
         if feature_mode in ORACLE_MOTION_FEATURE_MODES:
             return load_oracle_motion_features(
                 path,
@@ -289,6 +300,7 @@ class ApoHoloBridgeDataset(Dataset):
                 expected_sample_id=sample_id,
                 expected_aatype=expected_aatype,
                 expected_node_mask=expected_node_mask,
+                expected_residue_identity_hash=expected_residue_hash,
             )
         return load_stage1v2_posterior_features(
             path,
@@ -297,6 +309,7 @@ class ApoHoloBridgeDataset(Dataset):
             expected_sample_id=sample_id,
             expected_aatype=expected_aatype,
             expected_node_mask=expected_node_mask,
+            expected_residue_identity_hash=expected_residue_hash,
         )
 
     def _load_index(self, index_file: Optional[str]) -> List[Dict]:
@@ -363,6 +376,38 @@ class ApoHoloBridgeDataset(Dataset):
         sequence_str = esm_data.get('sequence_str', '')
         n_res = int(esm_features.shape[0])
 
+        torsion_apo_path = self._resolve_path(sample, 'torsion_apo', 'torsion_apo.npz')
+        torsion_holo_path = self._resolve_path(sample, 'torsion_holo', 'torsion_holo.npz')
+        if torsion_apo_path is None or torsion_holo_path is None:
+            raise FileNotFoundError(f"torsion files not found for {sample_id}")
+        if not torsion_apo_path.exists() or not torsion_holo_path.exists():
+            raise FileNotFoundError(f"torsion files not found for {sample_id}")
+
+        apo_torsion_keys = _load_torsion_residue_keys(torsion_apo_path)
+        target_residue_keys = load_residue_keys(esm_data)
+        if target_residue_keys is not None:
+            version = esm_data.get('residue_alignment_version')
+            if version != RESIDUE_ALIGNMENT_VERSION:
+                raise ValueError(
+                    f"{esm_path} residue_alignment_version={version!r}, "
+                    f"expected {RESIDUE_ALIGNMENT_VERSION!r}"
+                )
+        else:
+            # Legacy ESM caches contain the same apo sequence axis but no keys.
+            # The upgraded apo torsion cache supplies that canonical identity.
+            target_residue_keys = apo_torsion_keys
+        if len(target_residue_keys) != n_res:
+            raise ValueError(
+                f"{sample_id} canonical residue count {len(target_residue_keys)} "
+                f"does not match ESM length {n_res}"
+            )
+        if sequence_str and len(sequence_str) != n_res:
+            raise ValueError(
+                f"{sample_id} ESM sequence length {len(sequence_str)} does not match "
+                f"embedding length {n_res}"
+            )
+        residue_hash = residue_identity_hash(target_residue_keys)
+
         # Apo/Holo backbone
         apo_pdb = self._resolve_path(sample, 'apo_pdb', 'apo.pdb')
         holo_pdb = self._resolve_path(sample, 'holo_pdb', 'holo.pdb')
@@ -377,25 +422,25 @@ class ApoHoloBridgeDataset(Dataset):
 
         if apo_backbone is not None and apo_backbone.exists():
             N_apo, Ca_apo, C_apo, apo_res_ids = _load_backbone_npz(apo_backbone)
+            if apo_res_ids is None:
+                N_apo, Ca_apo, C_apo, _, apo_res_ids = extract_backbone_coords(apo_pdb)
         else:
             N_apo, Ca_apo, C_apo, _, apo_res_ids = extract_backbone_coords(apo_pdb)
 
         if holo_backbone is not None and holo_backbone.exists():
             N_holo, Ca_holo, C_holo, holo_res_ids = _load_backbone_npz(holo_backbone)
+            if holo_res_ids is None:
+                N_holo, Ca_holo, C_holo, _, holo_res_ids = extract_backbone_coords(holo_pdb)
         else:
             N_holo, Ca_holo, C_holo, _, holo_res_ids = extract_backbone_coords(holo_pdb)
 
-        # Align using residue IDs if available
-        if apo_res_ids is not None and holo_res_ids is not None:
-            (N_apo, Ca_apo, C_apo), (N_holo, Ca_holo, C_holo), node_mask = align_by_residue_ids(
-                (N_apo, Ca_apo, C_apo), apo_res_ids,
-                (N_holo, Ca_holo, C_holo), holo_res_ids,
-                n_res
-            )
-        else:
-            N_apo, Ca_apo, C_apo = _align_len(N_apo, Ca_apo, C_apo, n_res)
-            N_holo, Ca_holo, C_holo = _align_len(N_holo, Ca_holo, C_holo, n_res)
-            node_mask = _coords_valid_mask(N_apo, Ca_apo, C_apo) & _coords_valid_mask(N_holo, Ca_holo, C_holo)
+        (N_apo, Ca_apo, C_apo), (N_holo, Ca_holo, C_holo), node_mask = align_by_residue_ids(
+            (N_apo, Ca_apo, C_apo), apo_res_ids,
+            (N_holo, Ca_holo, C_holo), holo_res_ids,
+            target_residue_keys,
+        )
+        node_mask &= _coords_valid_mask(N_apo, Ca_apo, C_apo)
+        node_mask &= _coords_valid_mask(N_holo, Ca_holo, C_holo)
 
         # Ligand tokens
         lig_coords_path = self._resolve_path(sample, 'ligand_coords', 'ligand_coords.npy')
@@ -409,29 +454,21 @@ class ApoHoloBridgeDataset(Dataset):
             max_tokens=self.max_lig_tokens
         )
 
-        # Torsions
-        torsion_apo_path = self._resolve_path(sample, 'torsion_apo', 'torsion_apo.npz')
-        torsion_holo_path = self._resolve_path(sample, 'torsion_holo', 'torsion_holo.npz')
-        if torsion_apo_path is None or torsion_holo_path is None:
-            raise FileNotFoundError(f"torsion files not found for {sample_id}")
-
-        torsion_apo = _load_torsions(torsion_apo_path, n_res)
-        torsion_holo = _load_torsions(torsion_holo_path, n_res)
+        # Torsions share the same canonical apo/ESM residue axis.
+        torsion_apo = _load_torsions(torsion_apo_path, target_residue_keys)
+        torsion_holo = _load_torsions(torsion_holo_path, target_residue_keys)
+        node_mask &= torsion_apo['residue_present']
+        node_mask &= torsion_holo['residue_present']
 
         # AAtype
         aatype = torsion_apo.get('aatype')
         if aatype is None:
             aatype = _sequence_to_aatype(sequence_str, n_res)
-        else:
-            aatype = _align_array(aatype, n_res)
 
         # Pocket weights (apo frame)
-        w_res_path = self._resolve_path(sample, 'w_res', 'w_res.npy')
-        if w_res_path is not None and w_res_path.exists():
-            w_res = np.load(w_res_path).astype(np.float32)
-            w_res = _align_array(w_res, n_res)
-        else:
-            w_res = compute_pocket_weights(Ca_apo, lig_tokens['coords'])
+        # Legacy w_res arrays do not carry residue identity. Recompute cheaply
+        # from canonical apo coordinates instead of trusting prefix alignment.
+        w_res = compute_pocket_weights(Ca_apo, lig_tokens['coords'])
         w_res = w_res * node_mask.astype(np.float32)
 
         stage1v2_posterior_features = None
@@ -450,6 +487,7 @@ class ApoHoloBridgeDataset(Dataset):
                 node_mask=node_mask,
                 feature_mode=self.stage1v2_posterior_feature_mode,
                 strict_residue_identity=True,
+                residue_hash=residue_hash,
             )
         elif self.stage1v2_posterior_feature_mode == "oracle_motion_residue_shuffled":
             posterior_path = self._stage1v2_path_for_sample_id(sample_id)
@@ -461,6 +499,7 @@ class ApoHoloBridgeDataset(Dataset):
                 node_mask=node_mask,
                 feature_mode=self.stage1v2_posterior_feature_mode,
                 strict_residue_identity=True,
+                residue_hash=residue_hash,
             )
             stage1v2_posterior_features = _shuffle_valid_residue_rows(
                 stage1v2_posterior_features,
@@ -490,14 +529,15 @@ class ApoHoloBridgeDataset(Dataset):
                 node_mask=None,
                 feature_mode=source_mode,
                 strict_residue_identity=False,
+                residue_hash=None,
             )
         elif self.stage1v2_posterior_feature_mode != "none":
             raise ValueError(f"Unknown stage1v2_posterior_feature_mode={self.stage1v2_posterior_feature_mode}")
         if stage1v2_posterior_features is not None:
             stage1v2_posterior_features = stage1v2_posterior_features * node_mask[:, None].astype(np.float32)
 
-        bb_mask = torsion_apo['bb_mask'] & node_mask[:, None]
-        chi_mask = torsion_apo['chi_mask'] & node_mask[:, None]
+        bb_mask = torsion_apo['bb_mask'] & torsion_holo['bb_mask'] & node_mask[:, None]
+        chi_mask = torsion_apo['chi_mask'] & torsion_holo['chi_mask'] & node_mask[:, None]
 
         # Optional NMA features
         nma_features = None
@@ -530,6 +570,7 @@ class ApoHoloBridgeDataset(Dataset):
             'nma_features': nma_features,
             'n_residues': n_res,
             'node_mask': node_mask,
+            'residue_identity_hash': residue_hash,
         }
 
 

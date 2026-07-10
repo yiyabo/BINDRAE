@@ -41,6 +41,14 @@ class Stage2Batch:
     sequences: List[str]
     pdb_ids: List[str]
     n_residues: List[int]
+    residue_identity_hashes: List[str]
+
+    def pin_memory(self):
+        """Pin every tensor field so non-blocking GPU copies are effective."""
+        for name, value in vars(self).items():
+            if torch.is_tensor(value):
+                setattr(self, name, value.pin_memory())
+        return self
 
 
 def collate_stage2_batch(samples: List[Dict]) -> Stage2Batch:
@@ -98,6 +106,7 @@ def collate_stage2_batch(samples: List[Dict]) -> Stage2Batch:
     pdb_ids = []
     n_residues = []
     sequences = []
+    residue_identity_hashes = []
 
     for i, sample in enumerate(samples):
         n_res = sample['n_residues']
@@ -141,6 +150,7 @@ def collate_stage2_batch(samples: List[Dict]) -> Stage2Batch:
         pdb_ids.append(sample['id'])
         n_residues.append(n_res)
         sequences.append(sample.get('sequence', ''))
+        residue_identity_hashes.append(sample['residue_identity_hash'])
 
     return Stage2Batch(
         esm=torch.from_numpy(esm_batch),
@@ -169,4 +179,5 @@ def collate_stage2_batch(samples: List[Dict]) -> Stage2Batch:
         sequences=sequences,
         pdb_ids=pdb_ids,
         n_residues=n_residues,
+        residue_identity_hashes=residue_identity_hashes,
     )

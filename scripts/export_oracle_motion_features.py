@@ -44,7 +44,7 @@ from src.stage2.datasets.dataset_stage2 import (  # noqa: E402
 from src.stage2.modules import rigid_compose, rigid_inverse, se3_log, so3_log, wrap_to_pi  # noqa: E402
 
 
-SCHEMA_VERSION = "bindrae_oracle_motion_v1"
+SCHEMA_VERSION = "bindrae_oracle_motion_v2_canonical_residue_keys"
 FEATURE_NAMES = (
     "delta_trans_local_x_norm",
     "delta_trans_local_y_norm",
@@ -476,6 +476,7 @@ def save_sample(output_dir: Path, batch, motion: Dict[str, torch.Tensor], index:
         "source": np.array("holo_truth"),
         "sample_id": np.array(sample_id),
         "n_residues": np.array(n_res, dtype=np.int32),
+        "residue_identity_hash": np.array(batch.residue_identity_hashes[index]),
         "feature_names": np.array(FEATURE_NAMES),
         "aatype": tensor_to_np(batch.aatype[index, :n_res]).astype(np.int16),
         "node_mask": tensor_to_np(motion["valid_mask"][index, :n_res]).astype(np.bool_),
@@ -542,7 +543,8 @@ def print_progress(n_seen: int, records: List[Dict], counts: Dict[str, int]) -> 
     )
 
 
-def iter_batches_skip_bad(args: argparse.Namespace):
+def iter_dataset_batches(args: argparse.Namespace, *, skip_bad_samples: bool):
+    """Iterate one dataset shard, optionally recording samples that fail to load."""
     dataset = ApoHoloBridgeDataset(
         args.data_dir,
         split=args.split,
@@ -559,6 +561,8 @@ def iter_batches_skip_bad(args: argparse.Namespace):
         try:
             sample = dataset[idx]
         except Exception as exc:
+            if not skip_bad_samples:
+                raise
             bad_records.append({"index": idx, "sample_id": sample_id, "error": str(exc)})
             print(
                 json.dumps(
@@ -597,6 +601,12 @@ def write_bad_samples(path_raw: Optional[str], bad_records: List[Dict]) -> None:
 
 def main() -> None:
     args = parse_args()
+    if args.num_shards < 1:
+        raise ValueError(f"num_shards must be >= 1, got {args.num_shards}")
+    if not 0 <= args.shard_id < args.num_shards:
+        raise ValueError(
+            f"shard_id must be in [0, {args.num_shards}), got {args.shard_id}"
+        )
     device = torch.device(args.device if args.device != "cuda" or torch.cuda.is_available() else "cpu")
     output_dir = Path(args.output_dir)
     if not output_dir.is_absolute():
@@ -604,8 +614,11 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     bad_records: List[Dict] = []
-    if args.skip_bad_samples:
-        loader_iter = iter_batches_skip_bad(args)
+    if args.num_shards > 1 or args.skip_bad_samples:
+        loader_iter = iter_dataset_batches(
+            args,
+            skip_bad_samples=bool(args.skip_bad_samples),
+        )
     else:
         loader_iter = (
             (batch, bad_records)

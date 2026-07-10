@@ -4,6 +4,8 @@
 
 # 数据目录
 data/
+!src/data/
+!src/data/*.py
 processed_data/
 
 # Legacy & historical code

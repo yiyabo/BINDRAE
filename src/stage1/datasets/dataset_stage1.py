@@ -31,6 +31,19 @@ if os.path.exists(flash_ipa_path) and flash_ipa_path not in sys.path:
     sys.path.insert(0, flash_ipa_path)
 
 from utils.ligand_utils import build_ligand_tokens_from_file, LIGAND_TYPE_DIM
+from src.data.residue_identity import (
+    RESIDUE_ALIGNMENT_VERSION,
+    load_residue_keys,
+    residue_identity_hash,
+    scatter_by_residue_keys,
+)
+from src.stage2.datasets.backbone import (
+    extract_backbone_coords as _extract_backbone_coords_canonical,
+    _load_backbone_npz as _load_backbone_npz_canonical,
+    align_by_residue_ids as _align_by_residue_ids_canonical,
+    _load_torsion_residue_keys,
+    _load_torsions as _load_torsions_canonical,
+)
 
 
 @dataclass
@@ -78,182 +91,41 @@ class Stage1Batch:
     pdb_ids: List[str]
     n_residues: List[int]
     sequences: List[str]
+    residue_identity_hashes: List[str]
+
+    def pin_memory(self):
+        for name, value in vars(self).items():
+            if torch.is_tensor(value):
+                setattr(self, name, value.pin_memory())
+        return self
 
 
 # -----------------------------
 # PDB parsing
 # -----------------------------
 
-def extract_backbone_coords(pdb_file: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[str], List[int]]:
-    """Extract N, CA, C coords, sequence and residue IDs from a PDB file.
-    
-    Returns:
-        N_coords: [N, 3] array
-        Ca_coords: [N, 3] array
-        C_coords: [N, 3] array
-        sequence: list of 3-letter residue names
-        residue_ids: list of integer residue IDs (for alignment)
-        
-    Raises:
-        ValueError: If PDB only contains CA atoms (missing N/C backbone)
-    """
-    parser = PDBParser(QUIET=True)
-    structure = parser.get_structure('protein', str(pdb_file))
-
-    N_coords = []
-    Ca_coords = []
-    C_coords = []
-    sequence = []
-    residue_ids = []
-    
-    # Track atom types for diagnostic
-    all_atom_types = set()
-    n_ca_only_residues = 0
-
-    for model in structure:
-        for chain in model:
-            for residue in chain:
-                if residue.get_id()[0] != ' ':
-                    continue
-                
-                # Track what atoms this residue has
-                residue_atoms = set(atom.get_name() for atom in residue)
-                all_atom_types.update(residue_atoms)
-                
-                try:
-                    N = residue['N'].get_coord()
-                    Ca = residue['CA'].get_coord()
-                    C = residue['C'].get_coord()
-                except KeyError:
-                    # Count CA-only residues for diagnostic
-                    if 'CA' in residue_atoms and ('N' not in residue_atoms or 'C' not in residue_atoms):
-                        n_ca_only_residues += 1
-                    continue
-
-                N_coords.append(N)
-                Ca_coords.append(Ca)
-                C_coords.append(C)
-                sequence.append(residue.get_resname())
-                residue_ids.append(residue.get_id()[1])  # residue sequence number
-
-    N_coords = np.array(N_coords, dtype=np.float32)
-    Ca_coords = np.array(Ca_coords, dtype=np.float32)
-    C_coords = np.array(C_coords, dtype=np.float32)
-
-    # Check for CA-only structures (common issue with some apo predictions)
-    if len(N_coords) == 0 and n_ca_only_residues > 0:
-        raise ValueError(
-            f"PDB file only contains CA atoms ({n_ca_only_residues} residues with CA but missing N/C). "
-            f"Atom types found: {sorted(all_atom_types)}"
-        )
-
-    return N_coords, Ca_coords, C_coords, sequence, residue_ids
+def extract_backbone_coords(pdb_file: Path):
+    """Extract complete backbone atoms with canonical residue keys."""
+    return _extract_backbone_coords_canonical(pdb_file)
 
 
-def _load_backbone_npz(path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[List[int]]]:
-    """Load cached backbone coords. Returns residue_ids if stored."""
-    data = np.load(path)
-    residue_ids = data['residue_ids'].tolist() if 'residue_ids' in data else None
-    return data['N'], data['Ca'], data['C'], residue_ids
+def _load_backbone_npz(path: Path):
+    return _load_backbone_npz_canonical(path)
 
 
 def align_by_residue_ids(
-    apo_coords: Tuple[np.ndarray, np.ndarray, np.ndarray],
-    apo_res_ids: List[int],
-    holo_coords: Tuple[np.ndarray, np.ndarray, np.ndarray],
-    holo_res_ids: List[int],
-    target_len: int
-) -> Tuple[Tuple[np.ndarray, np.ndarray, np.ndarray],
-           Tuple[np.ndarray, np.ndarray, np.ndarray],
-           np.ndarray]:
-    """
-    Align apo and holo backbone coords based on residue IDs, not prefix.
-    
-    Only residues present in BOTH apo and holo (by ID) will be valid.
-    This fixes the issue where missing residues in the middle cause misalignment.
-    
-    Args:
-        apo_coords: (N_apo, Ca_apo, C_apo) arrays
-        apo_res_ids: list of residue IDs for apo
-        holo_coords: (N_holo, Ca_holo, C_holo) arrays
-        holo_res_ids: list of residue IDs for holo
-        target_len: target output length (typically from ESM)
-    
-    Returns:
-        aligned_apo: (N, Ca, C) aligned to target_len
-        aligned_holo: (N, Ca, C) aligned to target_len
-        valid_mask: [target_len] boolean mask, True where both apo and holo have data
-    """
-    N_apo, Ca_apo, C_apo = apo_coords
-    N_holo, Ca_holo, C_holo = holo_coords
-    
-    # Build residue ID -> index mapping
-    apo_id_to_idx = {rid: i for i, rid in enumerate(apo_res_ids)}
-    holo_id_to_idx = {rid: i for i, rid in enumerate(holo_res_ids)}
-    
-    # Find common residue IDs
-    common_ids = set(apo_res_ids) & set(holo_res_ids)
-    
-    # Initialize output arrays
-    N_apo_out = np.zeros((target_len, 3), dtype=np.float32)
-    Ca_apo_out = np.zeros((target_len, 3), dtype=np.float32)
-    C_apo_out = np.zeros((target_len, 3), dtype=np.float32)
-    N_holo_out = np.zeros((target_len, 3), dtype=np.float32)
-    Ca_holo_out = np.zeros((target_len, 3), dtype=np.float32)
-    C_holo_out = np.zeros((target_len, 3), dtype=np.float32)
-    valid_mask = np.zeros(target_len, dtype=bool)
-    
-    # Map common residue IDs to output indices while preserving numbering gaps.
-    # This avoids compressing residues to the front when there are middle gaps.
-    sorted_common = sorted(common_ids)
-    if sorted_common:
-        residue_min = sorted_common[0]
-        residue_max = sorted_common[-1]
-        residue_span = residue_max - residue_min + 1
-        residue_offset = residue_min if residue_span <= target_len else residue_max - target_len + 1
-    else:
-        residue_offset = 0
-    placed = 0
-
-    for res_id in sorted_common:
-        out_idx = res_id - residue_offset
-        if out_idx < 0 or out_idx >= target_len:
-            continue
-        
-        apo_idx = apo_id_to_idx[res_id]
-        holo_idx = holo_id_to_idx[res_id]
-        
-        N_apo_out[out_idx] = N_apo[apo_idx]
-        Ca_apo_out[out_idx] = Ca_apo[apo_idx]
-        C_apo_out[out_idx] = C_apo[apo_idx]
-        N_holo_out[out_idx] = N_holo[holo_idx]
-        Ca_holo_out[out_idx] = Ca_holo[holo_idx]
-        C_holo_out[out_idx] = C_holo[holo_idx]
-        valid_mask[out_idx] = True
-        placed += 1
-
-    # Fallback: if residue numbering is too irregular to map into target_len,
-    # keep the previous behavior rather than returning an empty alignment.
-    if placed == 0:
-        for out_idx, res_id in enumerate(sorted_common):
-            if out_idx >= target_len:
-                break
-
-            apo_idx = apo_id_to_idx[res_id]
-            holo_idx = holo_id_to_idx[res_id]
-
-            N_apo_out[out_idx] = N_apo[apo_idx]
-            Ca_apo_out[out_idx] = Ca_apo[apo_idx]
-            C_apo_out[out_idx] = C_apo[apo_idx]
-            N_holo_out[out_idx] = N_holo[holo_idx]
-            Ca_holo_out[out_idx] = Ca_holo[holo_idx]
-            C_holo_out[out_idx] = C_holo[holo_idx]
-            valid_mask[out_idx] = True
-    
-    return (
-        (N_apo_out, Ca_apo_out, C_apo_out),
-        (N_holo_out, Ca_holo_out, C_holo_out),
-        valid_mask
+    apo_coords,
+    apo_residue_keys,
+    holo_coords,
+    holo_residue_keys,
+    target_residue_keys,
+):
+    return _align_by_residue_ids_canonical(
+        apo_coords,
+        apo_residue_keys,
+        holo_coords,
+        holo_residue_keys,
+        target_residue_keys,
     )
 
 
@@ -482,6 +354,32 @@ class ApoHoloTripletDataset(Dataset):
         sequence_str = esm_data.get('sequence_str', '')
         n_res = len(esm_features)
 
+        torsion_apo_path = self._resolve_path(sample, 'torsion_apo', 'torsion_apo.npz')
+        torsion_holo_path = self._resolve_path(sample, 'torsion_holo', 'torsion_holo.npz')
+        if torsion_apo_path is None or torsion_holo_path is None:
+            raise FileNotFoundError(f"torsion files not found for {sample_id}")
+        if not torsion_apo_path.exists() or not torsion_holo_path.exists():
+            raise FileNotFoundError(f"torsion files not found for {sample_id}")
+
+        apo_torsion_keys = _load_torsion_residue_keys(torsion_apo_path)
+        holo_torsion_keys = _load_torsion_residue_keys(torsion_holo_path)
+        target_residue_keys = load_residue_keys(esm_data)
+        if target_residue_keys is not None:
+            version = esm_data.get('residue_alignment_version')
+            if version != RESIDUE_ALIGNMENT_VERSION:
+                raise ValueError(
+                    f"{esm_path} residue_alignment_version={version!r}, "
+                    f"expected {RESIDUE_ALIGNMENT_VERSION!r}"
+                )
+        else:
+            target_residue_keys = apo_torsion_keys
+        if len(target_residue_keys) != n_res:
+            raise ValueError(
+                f"{sample_id} canonical residue count {len(target_residue_keys)} "
+                f"does not match ESM length {n_res}"
+            )
+        residue_hash = residue_identity_hash(target_residue_keys)
+
         # Apo/Holo backbone
         apo_pdb = self._resolve_path(sample, 'apo_pdb', 'apo.pdb')
         holo_pdb = self._resolve_path(sample, 'holo_pdb', 'holo.pdb')
@@ -497,11 +395,15 @@ class ApoHoloTripletDataset(Dataset):
         # Try to load cached backbone with residue IDs
         if apo_backbone is not None and apo_backbone.exists():
             N_apo, Ca_apo, C_apo, apo_res_ids = _load_backbone_npz(apo_backbone)
+            if apo_res_ids is None:
+                N_apo, Ca_apo, C_apo, _, apo_res_ids = extract_backbone_coords(apo_pdb)
         else:
             N_apo, Ca_apo, C_apo, _, apo_res_ids = extract_backbone_coords(apo_pdb)
 
         if holo_backbone is not None and holo_backbone.exists():
             N_holo, Ca_holo, C_holo, holo_res_ids = _load_backbone_npz(holo_backbone)
+            if holo_res_ids is None:
+                N_holo, Ca_holo, C_holo, _, holo_res_ids = extract_backbone_coords(holo_pdb)
         else:
             N_holo, Ca_holo, C_holo, _, holo_res_ids = extract_backbone_coords(holo_pdb)
 
@@ -511,19 +413,13 @@ class ApoHoloTripletDataset(Dataset):
         if len(N_holo) == 0:
             raise ValueError(f"Empty holo backbone for {sample_id} (PDB parsing failed)")
 
-        # Align to ESM length - prefer residue ID alignment if available
-        if apo_res_ids is not None and holo_res_ids is not None:
-            # Use residue ID based alignment (fixes middle-missing residue issues)
-            (N_apo, Ca_apo, C_apo), (N_holo, Ca_holo, C_holo), node_mask = align_by_residue_ids(
-                (N_apo, Ca_apo, C_apo), apo_res_ids,
-                (N_holo, Ca_holo, C_holo), holo_res_ids,
-                n_res
-            )
-        else:
-            # Fallback to prefix alignment (legacy behavior)
-            N_apo, Ca_apo, C_apo = _align_len(N_apo, Ca_apo, C_apo, n_res)
-            N_holo, Ca_holo, C_holo = _align_len(N_holo, Ca_holo, C_holo, n_res)
-            node_mask = _coords_valid_mask(N_apo, Ca_apo, C_apo) & _coords_valid_mask(N_holo, Ca_holo, C_holo)
+        (N_apo, Ca_apo, C_apo), (N_holo, Ca_holo, C_holo), node_mask = align_by_residue_ids(
+            (N_apo, Ca_apo, C_apo), apo_res_ids,
+            (N_holo, Ca_holo, C_holo), holo_res_ids,
+            target_residue_keys,
+        )
+        node_mask &= _coords_valid_mask(N_apo, Ca_apo, C_apo)
+        node_mask &= _coords_valid_mask(N_holo, Ca_holo, C_holo)
 
         # Ligand tokens
         lig_coords_path = self._resolve_path(sample, 'ligand_coords', 'ligand_coords.npy')
@@ -537,26 +433,17 @@ class ApoHoloTripletDataset(Dataset):
             max_tokens=self.max_lig_tokens
         )
 
-        # Torsions
-        torsion_apo_path = self._resolve_path(sample, 'torsion_apo', 'torsion_apo.npz')
-        torsion_holo_path = self._resolve_path(sample, 'torsion_holo', 'torsion_holo.npz')
-        if torsion_apo_path is None or torsion_holo_path is None:
-            raise FileNotFoundError(f"torsion files not found for {sample_id}")
-
-        torsion_apo = _load_torsions(torsion_apo_path, n_res)
-        torsion_holo = _load_torsions(torsion_holo_path, n_res)
+        torsion_apo = _load_torsions(torsion_apo_path, target_residue_keys)
+        torsion_holo = _load_torsions(torsion_holo_path, target_residue_keys)
+        node_mask &= torsion_apo['residue_present']
+        node_mask &= torsion_holo['residue_present']
 
         chi_holo = torsion_holo['angles'][:, 3:7]
-        chi_mask = torsion_holo['chi_mask'][:, :4]
+        chi_mask = torsion_apo['chi_mask'][:, :4] & torsion_holo['chi_mask'][:, :4]
         chi_mask = chi_mask & node_mask[:, None]
 
         # Pocket weights (apo frame)
-        w_res_path = self._resolve_path(sample, 'w_res', 'w_res.npy')
-        if w_res_path is not None and w_res_path.exists():
-            w_res = np.load(w_res_path).astype(np.float32)
-            w_res = _align_array(w_res, n_res)
-        else:
-            w_res = compute_pocket_weights(Ca_apo, lig_tokens['coords'])
+        w_res = compute_pocket_weights(Ca_apo, lig_tokens['coords'])
         w_res = w_res * node_mask.astype(np.float32)
 
         # Optional atom14 holo
@@ -565,12 +452,22 @@ class ApoHoloTripletDataset(Dataset):
         atom14_holo = None
         atom14_holo_mask = None
         if atom14_path is not None and atom14_path.exists():
-            atom14_holo = np.load(atom14_path).astype(np.float32)
-            atom14_holo = _align_atom14(atom14_holo, n_res)
+            atom14_source = np.load(atom14_path).astype(np.float32)
+            atom14_holo, _ = scatter_by_residue_keys(
+                atom14_source,
+                holo_torsion_keys,
+                target_residue_keys,
+                label=f"{atom14_path.name} atom14",
+            )
 
             if atom14_mask_path is not None and atom14_mask_path.exists():
-                atom14_holo_mask = np.load(atom14_mask_path).astype(bool)
-                atom14_holo_mask = _align_atom14_mask(atom14_holo_mask, n_res)
+                atom14_mask_source = np.load(atom14_mask_path).astype(bool)
+                atom14_holo_mask, _ = scatter_by_residue_keys(
+                    atom14_mask_source,
+                    holo_torsion_keys,
+                    target_residue_keys,
+                    label=f"{atom14_mask_path.name} atom14 mask",
+                )
         if self.require_atom14 and atom14_holo is None:
             raise FileNotFoundError(
                 f"atom14 holo not found for {sample_id} (require_atom14=True)"
@@ -597,6 +494,7 @@ class ApoHoloTripletDataset(Dataset):
             'atom14_holo': atom14_holo,
             'atom14_holo_mask': atom14_holo_mask,
             'n_residues': n_res,
+            'residue_identity_hash': residue_hash,
         }
 
     def __getitem__(self, idx: int) -> Dict:
@@ -665,6 +563,7 @@ def collate_stage1_batch(samples: List[Dict], max_n_res: Optional[int] = None) -
     pdb_ids = []
     n_residues = []
     sequences = []
+    residue_identity_hashes = []
 
     for i, sample in enumerate(samples):
         n_res = sample['n_residues']
@@ -704,6 +603,7 @@ def collate_stage1_batch(samples: List[Dict], max_n_res: Optional[int] = None) -
         pdb_ids.append(sample['id'])
         n_residues.append(n_res)
         sequences.append(sample.get('sequence', ''))
+        residue_identity_hashes.append(sample['residue_identity_hash'])
 
     if not atom14_available:
         atom14_holo = np.zeros((batch_size, max_n_res, 14, 3), dtype=np.float32)
@@ -731,6 +631,7 @@ def collate_stage1_batch(samples: List[Dict], max_n_res: Optional[int] = None) -
         pdb_ids=pdb_ids,
         n_residues=n_residues,
         sequences=sequences,
+        residue_identity_hashes=residue_identity_hashes,
     )
 
 
@@ -833,21 +734,8 @@ def _align_atom14_mask(mask: np.ndarray, n_res: int) -> np.ndarray:
     return out
 
 
-def _load_torsions(path: Path, n_res: int) -> Dict[str, np.ndarray]:
-    data = np.load(path)
-
-    torsion_angles = np.zeros((n_res, 7), dtype=np.float32)
-    torsion_angles[:, 0] = _align_array(data['phi'], n_res)
-    torsion_angles[:, 1] = _align_array(data['psi'], n_res)
-    torsion_angles[:, 2] = _align_array(data['omega'], n_res)
-    torsion_angles[:, 3:7] = _align_matrix(data['chi'][:, :4], n_res, 4)
-
-    chi_mask = _align_matrix(data['chi_mask'][:, :4], n_res, 4).astype(bool)
-
-    return {
-        'angles': torsion_angles,
-        'chi_mask': chi_mask,
-    }
+def _load_torsions(path: Path, target_residue_keys) -> Dict[str, np.ndarray]:
+    return _load_torsions_canonical(path, target_residue_keys)
 
 
 def _align_matrix(arr: np.ndarray, n_res: int, n_cols: int) -> np.ndarray:

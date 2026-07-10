@@ -17,6 +17,18 @@ import warnings
 import argparse
 from tqdm import tqdm
 
+project_root = Path(__file__).resolve().parent.parent
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
+from src.data.residue_identity import (
+    RESIDUE_ALIGNMENT_VERSION,
+    iter_standard_residues,
+    residue_key_from_biopython,
+    residue_keys_to_array,
+    residue_names_to_sequence,
+)
+
 warnings.filterwarnings('ignore')
 
 try:
@@ -158,23 +170,28 @@ class ESM2CacheAHoJ:
         except Exception:
             return False
             
-    def extract_sequence(self, pdb_path: Path) -> Optional[str]:
+    def extract_sequence_and_keys(self, pdb_path: Path):
         if not pdb_path.exists():
             return None
         try:
             structure = self.parser.get_structure(pdb_path.stem, str(pdb_path))
-            residues = [r for r in structure.get_residues() if is_aa(r, standard=True)]
+            residues = list(iter_standard_residues(structure))
             if not residues: return None
-            
-            seq = ""
-            for res in residues:
-                seq += AA_MAP.get(res.get_resname().strip(), 'X')
-            return seq
+            residue_names = [res.get_resname().strip().upper() for res in residues]
+            residue_keys = [
+                residue_key_from_biopython(res.get_parent(), res)
+                for res in residues
+            ]
+            return residue_names_to_sequence(residue_names), residue_keys
         except Exception as e:
             # print(f"Seq extraction failed for {pdb_path}: {e}")
             return None
 
-    def encode_sequence(self, sample_id: str, sequence: str) -> Optional[Dict]:
+    def extract_sequence(self, pdb_path: Path) -> Optional[str]:
+        metadata = self.extract_sequence_and_keys(pdb_path)
+        return metadata[0] if metadata is not None else None
+
+    def encode_sequence(self, sample_id: str, sequence: str, residue_keys=None) -> Optional[Dict]:
         try:
             data = [(sample_id, sequence)]
             _, _, batch_tokens = self.batch_converter(data)
@@ -205,6 +222,14 @@ class ESM2CacheAHoJ:
                 'sequence_str': sequence,
                 'n_residues': len(sequence)
             }
+            if residue_keys is not None:
+                if len(residue_keys) != len(sequence):
+                    raise ValueError(
+                        f"residue key count {len(residue_keys)} does not match sequence "
+                        f"length {len(sequence)}"
+                    )
+                encoding['residue_keys'] = residue_keys_to_array(residue_keys)
+                encoding['residue_alignment_version'] = RESIDUE_ALIGNMENT_VERSION
             if self.last_k_layers > 1:
                 encoding['per_residue_layers'] = per_residue_layers.cpu()
                 encoding['esm_layer_indices'] = torch.tensor(repr_layers, dtype=torch.long)
@@ -213,7 +238,7 @@ class ESM2CacheAHoJ:
             print(f"Encoding failed for {sample_id}: {e}")
             return None
 
-    def prepare_samples(self) -> List[Tuple[str, str, Path]]:
+    def prepare_samples(self) -> List[Tuple[str, str, list, Path]]:
         """Collect all valid samples that need processing."""
         if not self.samples_dir.exists():
             if (self.data_dir / "index.json").exists():
@@ -237,9 +262,10 @@ class ESM2CacheAHoJ:
             if not apo_pdb.exists():
                 continue
                 
-            seq = self.extract_sequence(apo_pdb)
-            if seq:
-                tasks.append((sample_id, seq, esm_path))
+            metadata = self.extract_sequence_and_keys(apo_pdb)
+            if metadata:
+                seq, residue_keys = metadata
+                tasks.append((sample_id, seq, residue_keys, esm_path))
                 if self.max_samples > 0 and len(tasks) >= self.max_samples:
                     break
                 
@@ -265,7 +291,7 @@ class ESM2CacheAHoJ:
             batch_tasks = tasks[i : i + batch_size]
             self.process_batch_safe(batch_tasks)
 
-    def process_batch_safe(self, batch_tasks: List[Tuple[str, str, Path]]):
+    def process_batch_safe(self, batch_tasks: List[Tuple[str, str, list, Path]]):
         """Process a batch with OOM automatic recovery (recursive splitting)."""
         if not batch_tasks:
             return
@@ -286,7 +312,7 @@ class ESM2CacheAHoJ:
             token_reprs = results['representations'][final_layer]
             
             # Save results
-            for j, (sample_id, seq, out_path) in enumerate(batch_tasks):
+            for j, (sample_id, seq, residue_keys, out_path) in enumerate(batch_tasks):
                 seq_len = len(seq)
                 per_residue = token_reprs[j, 1 : seq_len + 1].cpu()
                 sequence_repr = token_reprs[j, 0].cpu()
@@ -302,7 +328,9 @@ class ESM2CacheAHoJ:
                     'per_residue': per_residue,
                     'sequence': sequence_repr,
                     'sequence_str': seq,
-                    'n_residues': seq_len
+                    'n_residues': seq_len,
+                    'residue_keys': residue_keys_to_array(residue_keys),
+                    'residue_alignment_version': RESIDUE_ALIGNMENT_VERSION,
                 }
                 if self.last_k_layers > 1:
                     encoding['per_residue_layers'] = per_residue_layers

@@ -2,7 +2,7 @@
 
 import sys
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List, Sequence
 
 import numpy as np
 from Bio.PDB import PDBParser
@@ -13,10 +13,18 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 from src.stage1.data.residue_constants import restype_order
+from src.data.residue_identity import (
+    RESIDUE_ALIGNMENT_VERSION,
+    ResidueKey,
+    iter_standard_residues,
+    load_residue_keys,
+    residue_key_from_biopython,
+    scatter_by_residue_keys,
+)
 
 
 def extract_backbone_coords(pdb_file: Path):
-    """Extract N, CA, C coords, sequence and residue IDs from a PDB file."""
+    """Extract complete backbone atoms and canonical residue keys."""
     parser = PDBParser(QUIET=True)
     structure = parser.get_structure('protein', str(pdb_file))
 
@@ -24,38 +32,41 @@ def extract_backbone_coords(pdb_file: Path):
     Ca_coords = []
     C_coords = []
     sequence = []
-    residue_ids = []
+    residue_keys: List[ResidueKey] = []
 
-    for model in structure:
-        for chain in model:
-            for residue in chain:
-                if residue.get_id()[0] != ' ':
-                    continue
-                try:
-                    N = residue['N'].get_coord()
-                    Ca = residue['CA'].get_coord()
-                    C = residue['C'].get_coord()
-                except KeyError:
-                    continue
+    for residue in iter_standard_residues(structure):
+        try:
+            N = residue['N'].get_coord()
+            Ca = residue['CA'].get_coord()
+            C = residue['C'].get_coord()
+        except KeyError:
+            continue
 
-                N_coords.append(N)
-                Ca_coords.append(Ca)
-                C_coords.append(C)
-                sequence.append(residue.get_resname())
-                residue_ids.append(residue.get_id()[1])
+        N_coords.append(N)
+        Ca_coords.append(Ca)
+        C_coords.append(C)
+        sequence.append(residue.get_resname().strip().upper())
+        residue_keys.append(residue_key_from_biopython(residue.get_parent(), residue))
 
     N_coords = np.array(N_coords, dtype=np.float32)
     Ca_coords = np.array(Ca_coords, dtype=np.float32)
     C_coords = np.array(C_coords, dtype=np.float32)
 
-    return N_coords, Ca_coords, C_coords, sequence, residue_ids
+    return N_coords, Ca_coords, C_coords, sequence, residue_keys
 
 
 def _load_backbone_npz(path: Path):
-    """Load cached backbone coords. Returns residue_ids if stored."""
-    data = np.load(path)
-    residue_ids = data['residue_ids'].tolist() if 'residue_ids' in data else None
-    return data['N'], data['Ca'], data['C'], residue_ids
+    """Load cached backbone coords and canonical residue keys when available."""
+    with np.load(path, allow_pickle=False) as data:
+        residue_keys = load_residue_keys(data)
+        if residue_keys is not None and 'residue_alignment_version' in data:
+            version = str(np.asarray(data['residue_alignment_version']).item())
+            if version != RESIDUE_ALIGNMENT_VERSION:
+                raise ValueError(
+                    f"{path} residue_alignment_version={version!r}, "
+                    f"expected {RESIDUE_ALIGNMENT_VERSION!r}"
+                )
+        return data['N'], data['Ca'], data['C'], residue_keys
 
 
 def _coords_valid_mask(N_coords: np.ndarray,
@@ -69,66 +80,31 @@ def _coords_valid_mask(N_coords: np.ndarray,
 
 
 def align_by_residue_ids(
-    apo_coords, apo_res_ids, holo_coords, holo_res_ids, target_len
+    apo_coords,
+    apo_residue_keys: Sequence[ResidueKey],
+    holo_coords,
+    holo_residue_keys: Sequence[ResidueKey],
+    target_residue_keys: Sequence[ResidueKey],
 ):
-    """Align apo and holo backbone coords based on residue IDs."""
-    N_apo, Ca_apo, C_apo = apo_coords
-    N_holo, Ca_holo, C_holo = holo_coords
-    
-    apo_id_to_idx = {rid: i for i, rid in enumerate(apo_res_ids)}
-    holo_id_to_idx = {rid: i for i, rid in enumerate(holo_res_ids)}
-    common_ids = set(apo_res_ids) & set(holo_res_ids)
-    
-    N_apo_out = np.zeros((target_len, 3), dtype=np.float32)
-    Ca_apo_out = np.zeros((target_len, 3), dtype=np.float32)
-    C_apo_out = np.zeros((target_len, 3), dtype=np.float32)
-    N_holo_out = np.zeros((target_len, 3), dtype=np.float32)
-    Ca_holo_out = np.zeros((target_len, 3), dtype=np.float32)
-    C_holo_out = np.zeros((target_len, 3), dtype=np.float32)
-    valid_mask = np.zeros(target_len, dtype=bool)
-    
-    sorted_common = sorted(common_ids)
-    if sorted_common:
-        residue_min = sorted_common[0]
-        residue_max = sorted_common[-1]
-        residue_span = residue_max - residue_min + 1
-        residue_offset = residue_min if residue_span <= target_len else residue_max - target_len + 1
-    else:
-        residue_offset = 0
-
-    placed = 0
-    for res_id in sorted_common:
-        out_idx = res_id - residue_offset
-        if out_idx < 0 or out_idx >= target_len:
-            continue
-        apo_idx = apo_id_to_idx[res_id]
-        holo_idx = holo_id_to_idx[res_id]
-        N_apo_out[out_idx] = N_apo[apo_idx]
-        Ca_apo_out[out_idx] = Ca_apo[apo_idx]
-        C_apo_out[out_idx] = C_apo[apo_idx]
-        N_holo_out[out_idx] = N_holo[holo_idx]
-        Ca_holo_out[out_idx] = Ca_holo[holo_idx]
-        C_holo_out[out_idx] = C_holo[holo_idx]
-        valid_mask[out_idx] = True
-        placed += 1
-
-    if placed == 0:
-        for out_idx, res_id in enumerate(sorted_common):
-            if out_idx >= target_len:
-                break
-            apo_idx = apo_id_to_idx[res_id]
-            holo_idx = holo_id_to_idx[res_id]
-            N_apo_out[out_idx] = N_apo[apo_idx]
-            Ca_apo_out[out_idx] = Ca_apo[apo_idx]
-            C_apo_out[out_idx] = C_apo[apo_idx]
-            N_holo_out[out_idx] = N_holo[holo_idx]
-            Ca_holo_out[out_idx] = Ca_holo[holo_idx]
-            C_holo_out[out_idx] = C_holo[holo_idx]
-            valid_mask[out_idx] = True
-    
+    """Align apo/holo backbones onto the apo/ESM canonical residue axis."""
+    apo_stacked = np.stack(apo_coords, axis=1).astype(np.float32, copy=False)
+    holo_stacked = np.stack(holo_coords, axis=1).astype(np.float32, copy=False)
+    apo_out, apo_present = scatter_by_residue_keys(
+        apo_stacked,
+        apo_residue_keys,
+        target_residue_keys,
+        label="apo backbone",
+    )
+    holo_out, holo_present = scatter_by_residue_keys(
+        holo_stacked,
+        holo_residue_keys,
+        target_residue_keys,
+        label="holo backbone",
+    )
+    valid_mask = apo_present & holo_present
     return (
-        (N_apo_out, Ca_apo_out, C_apo_out),
-        (N_holo_out, Ca_holo_out, C_holo_out),
+        (apo_out[:, 0], apo_out[:, 1], apo_out[:, 2]),
+        (holo_out[:, 0], holo_out[:, 1], holo_out[:, 2]),
         valid_mask
     )
 
@@ -190,33 +166,130 @@ def _align_nma(arr: np.ndarray, n_res: int) -> np.ndarray:
     return out
 
 
-def _load_torsions(path: Path, n_res: int) -> Dict[str, np.ndarray]:
-    data = np.load(path)
+def _load_torsion_residue_keys(path: Path) -> List[ResidueKey]:
+    with np.load(path, allow_pickle=False) as data:
+        residue_keys = load_residue_keys(data)
+        if residue_keys is None:
+            raise ValueError(
+                f"{path} has no canonical residue_keys. Upgrade or regenerate the "
+                "torsion cache before training."
+            )
+        if 'residue_alignment_version' not in data:
+            raise ValueError(f"{path} missing residue_alignment_version")
+        version = str(np.asarray(data['residue_alignment_version']).item())
+        if version != RESIDUE_ALIGNMENT_VERSION:
+            raise ValueError(
+                f"{path} residue_alignment_version={version!r}, "
+                f"expected {RESIDUE_ALIGNMENT_VERSION!r}"
+            )
+        return residue_keys
 
-    torsion_angles = np.zeros((n_res, 7), dtype=np.float32)
-    torsion_angles[:, 0] = _align_array(data['phi'], n_res)
-    torsion_angles[:, 1] = _align_array(data['psi'], n_res)
-    torsion_angles[:, 2] = _align_array(data['omega'], n_res)
-    torsion_angles[:, 3:7] = _align_matrix(data['chi'][:, :4], n_res, 4)
 
-    chi_mask = _align_matrix(data['chi_mask'][:, :4], n_res, 4).astype(bool)
+def _load_torsions(
+    path: Path,
+    target_residue_keys: Sequence[ResidueKey],
+) -> Dict[str, np.ndarray]:
+    with np.load(path, allow_pickle=False) as data:
+        source_residue_keys = load_residue_keys(data)
+        if source_residue_keys is None:
+            raise ValueError(
+                f"{path} has no canonical residue_keys. Upgrade or regenerate the "
+                "torsion cache before training."
+            )
+        if 'residue_alignment_version' not in data:
+            raise ValueError(f"{path} missing residue_alignment_version")
+        version = str(np.asarray(data['residue_alignment_version']).item())
+        if version != RESIDUE_ALIGNMENT_VERSION:
+            raise ValueError(
+                f"{path} residue_alignment_version={version!r}, "
+                f"expected {RESIDUE_ALIGNMENT_VERSION!r}"
+            )
 
-    if 'bb_mask' in data:
-        bb_mask_raw = data['bb_mask']
-        if bb_mask_raw.ndim == 1:
-            bb_mask = np.repeat(bb_mask_raw[:, None], 3, axis=1).astype(bool)
+        n_source = len(source_residue_keys)
+        torsion_source = np.zeros((n_source, 7), dtype=np.float32)
+        for column, field in enumerate(('phi', 'psi', 'omega')):
+            values = np.asarray(data[field], dtype=np.float32)
+            if values.shape != (n_source,):
+                raise ValueError(f"{path} {field} shape={values.shape}, expected {(n_source,)}")
+            torsion_source[:, column] = values
+        chi_source = np.asarray(data['chi'], dtype=np.float32)
+        if chi_source.ndim != 2 or chi_source.shape[0] != n_source or chi_source.shape[1] < 4:
+            raise ValueError(f"{path} chi shape={chi_source.shape}, expected [{n_source}, >=4]")
+        torsion_source[:, 3:7] = chi_source[:, :4]
+
+        chi_mask_source = np.asarray(data['chi_mask'])
+        if (
+            chi_mask_source.ndim != 2
+            or chi_mask_source.shape[0] != n_source
+            or chi_mask_source.shape[1] < 4
+        ):
+            raise ValueError(
+                f"{path} chi_mask shape={chi_mask_source.shape}, expected [{n_source}, >=4]"
+            )
+        chi_mask_source = chi_mask_source[:, :4].astype(np.bool_)
+
+        if 'bb_mask' in data:
+            bb_mask_source = np.asarray(data['bb_mask'])
+            if bb_mask_source.ndim == 1:
+                if bb_mask_source.shape[0] != n_source:
+                    raise ValueError(
+                        f"{path} bb_mask shape={bb_mask_source.shape}, expected [{n_source}]"
+                    )
+                bb_mask_source = np.repeat(bb_mask_source[:, None], 3, axis=1)
+            elif bb_mask_source.shape != (n_source, 3):
+                raise ValueError(
+                    f"{path} bb_mask shape={bb_mask_source.shape}, expected {(n_source, 3)}"
+                )
+            bb_mask_source = bb_mask_source.astype(np.bool_)
         else:
-            bb_mask = _align_matrix(bb_mask_raw, n_res, 3).astype(bool)
-    else:
-        bb_mask = np.ones((n_res, 3), dtype=bool)
+            bb_mask_source = np.ones((n_source, 3), dtype=np.bool_)
 
-    aatype = data['aatype'] if 'aatype' in data else None
+        aatype_source = np.asarray(data['aatype']) if 'aatype' in data else None
+        if aatype_source is not None and aatype_source.shape != (n_source,):
+            raise ValueError(
+                f"{path} aatype shape={aatype_source.shape}, expected {(n_source,)}"
+            )
+
+    torsion_angles, residue_present = scatter_by_residue_keys(
+        torsion_source,
+        source_residue_keys,
+        target_residue_keys,
+        label=f"{path.name} angles",
+    )
+    chi_mask, chi_present = scatter_by_residue_keys(
+        chi_mask_source,
+        source_residue_keys,
+        target_residue_keys,
+        label=f"{path.name} chi_mask",
+    )
+    bb_mask, bb_present = scatter_by_residue_keys(
+        bb_mask_source,
+        source_residue_keys,
+        target_residue_keys,
+        label=f"{path.name} bb_mask",
+    )
+    if not np.array_equal(residue_present, chi_present) or not np.array_equal(
+        residue_present, bb_present
+    ):
+        raise RuntimeError(f"Internal residue scatter mismatch while loading {path}")
+
+    aatype = None
+    if aatype_source is not None:
+        aatype, aatype_present = scatter_by_residue_keys(
+            aatype_source,
+            source_residue_keys,
+            target_residue_keys,
+            label=f"{path.name} aatype",
+        )
+        if not np.array_equal(residue_present, aatype_present):
+            raise RuntimeError(f"Internal aatype scatter mismatch while loading {path}")
 
     return {
         'angles': torsion_angles,
-        'chi_mask': chi_mask,
-        'bb_mask': bb_mask,
+        'chi_mask': chi_mask.astype(np.bool_),
+        'bb_mask': bb_mask.astype(np.bool_),
         'aatype': aatype,
+        'residue_present': residue_present,
     }
 
 

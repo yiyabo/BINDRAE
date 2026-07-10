@@ -135,6 +135,7 @@ def _validate_feature_cache_metadata(
     expected_n_res: int,
     expected_aatype: Optional[np.ndarray],
     expected_node_mask: Optional[np.ndarray],
+    expected_residue_identity_hash: Optional[str],
 ) -> None:
     missing_meta = [
         key for key in ("sample_id", "n_residues")
@@ -150,6 +151,19 @@ def _validate_feature_cache_metadata(
     n_res = _scalar_int(data["n_residues"])
     if n_res != int(expected_n_res):
         raise ValueError(f"{path} n_residues={n_res}, expected {expected_n_res}")
+
+    if expected_residue_identity_hash is not None:
+        if "residue_identity_hash" not in data:
+            raise ValueError(
+                f"{path} missing residue_identity_hash; regenerate this feature cache "
+                "with canonical residue alignment"
+            )
+        cache_hash = _scalar_string(data["residue_identity_hash"])
+        if cache_hash != expected_residue_identity_hash:
+            raise ValueError(
+                f"{path} residue_identity_hash={cache_hash!r}, "
+                f"expected {expected_residue_identity_hash!r}"
+            )
 
     if expected_aatype is not None:
         if "aatype" not in data:
@@ -209,6 +223,7 @@ def load_stage1v2_posterior_features(
     expected_sample_id: str,
     expected_aatype: Optional[np.ndarray],
     expected_node_mask: Optional[np.ndarray],
+    expected_residue_identity_hash: Optional[str],
 ) -> np.ndarray:
     if not path.exists():
         raise FileNotFoundError(path)
@@ -220,6 +235,7 @@ def load_stage1v2_posterior_features(
             expected_n_res=n_res,
             expected_aatype=expected_aatype,
             expected_node_mask=expected_node_mask,
+            expected_residue_identity_hash=expected_residue_identity_hash,
         )
         cols = [_read_npz_vector(data, name, n_res, path) for name in feature_names]
     return np.stack(cols, axis=-1).astype(np.float32)
@@ -239,6 +255,7 @@ def load_oracle_motion_features(
     expected_sample_id: str,
     expected_aatype: Optional[np.ndarray],
     expected_node_mask: Optional[np.ndarray],
+    expected_residue_identity_hash: Optional[str],
 ) -> np.ndarray:
     if not path.exists():
         raise FileNotFoundError(path)
@@ -250,6 +267,7 @@ def load_oracle_motion_features(
             expected_n_res=n_res,
             expected_aatype=expected_aatype,
             expected_node_mask=expected_node_mask,
+            expected_residue_identity_hash=expected_residue_identity_hash,
         )
         if "oracle_motion_features" not in data:
             raise KeyError(f"{path} missing oracle_motion_features")
