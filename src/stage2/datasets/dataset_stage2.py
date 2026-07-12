@@ -75,6 +75,36 @@ from .features import (
 # -----------------------------
 
 
+def _build_peptide_bond_mask(
+    residue_keys,
+    node_mask: np.ndarray,
+    N_apo: np.ndarray,
+    C_apo: np.ndarray,
+    N_holo: np.ndarray,
+    C_holo: np.ndarray,
+    max_cn_distance: float = 2.0,
+) -> np.ndarray:
+    """Identify true adjacent peptide bonds on the canonical residue axis."""
+    n_res = len(residue_keys)
+    if n_res < 2:
+        return np.zeros((0,), dtype=np.bool_)
+    same_chain = np.asarray(
+        [residue_keys[i][0] == residue_keys[i + 1][0] for i in range(n_res - 1)],
+        dtype=np.bool_,
+    )
+    apo_cn = np.linalg.norm(C_apo[:-1] - N_apo[1:], axis=-1)
+    holo_cn = np.linalg.norm(C_holo[:-1] - N_holo[1:], axis=-1)
+    finite = np.isfinite(apo_cn) & np.isfinite(holo_cn)
+    return (
+        same_chain
+        & node_mask[:-1].astype(np.bool_)
+        & node_mask[1:].astype(np.bool_)
+        & finite
+        & (apo_cn <= float(max_cn_distance))
+        & (holo_cn <= float(max_cn_distance))
+    )
+
+
 class ApoHoloBridgeDataset(Dataset):
     """Apo/Holo/Ligand triplet dataset for Stage-2."""
 
@@ -538,6 +568,14 @@ class ApoHoloBridgeDataset(Dataset):
 
         bb_mask = torsion_apo['bb_mask'] & torsion_holo['bb_mask'] & node_mask[:, None]
         chi_mask = torsion_apo['chi_mask'] & torsion_holo['chi_mask'] & node_mask[:, None]
+        peptide_bond_mask = _build_peptide_bond_mask(
+            target_residue_keys,
+            node_mask,
+            N_apo,
+            C_apo,
+            N_holo,
+            C_holo,
+        )
 
         # Optional NMA features
         nma_features = None
@@ -570,6 +608,7 @@ class ApoHoloBridgeDataset(Dataset):
             'nma_features': nma_features,
             'n_residues': n_res,
             'node_mask': node_mask,
+            'peptide_bond_mask': peptide_bond_mask,
             'residue_identity_hash': residue_hash,
         }
 

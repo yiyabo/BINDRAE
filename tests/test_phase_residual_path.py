@@ -71,6 +71,7 @@ class PhaseResidualPathTest(unittest.TestCase):
             phase_residual_translation_metric_scale=1.0,
             phase_residual_chi_metric_scale=1.0,
             phase_residual_min_tangent_norm=1e-4,
+            phase_residual_max_metric_norm=0.0,
             phase_residual_envelope="poly",
             phase_residual_scale=1.0,
             bg_beta=1.5,
@@ -84,6 +85,7 @@ class PhaseResidualPathTest(unittest.TestCase):
         torsion_holo[..., 3] = torch.tensor([0.4, 0.2, 0.0])
         return SimpleNamespace(
             node_mask=torch.ones(batch_size, n_res, dtype=torch.bool),
+            peptide_bond_mask=torch.ones(batch_size, n_res - 1, dtype=torch.bool),
             chi_mask=torch.ones(batch_size, n_res, 4, dtype=torch.bool),
             torsion_apo=torsion_apo,
             torsion_holo=torsion_holo,

@@ -60,6 +60,8 @@ def parse_args():
                         help='DataLoader prefetch batches per worker when num_workers > 0')
     parser.add_argument('--warmup_steps', type=int, default=1000,
                         help='学习率 warmup 步数')
+    parser.add_argument('--early_stop_patience', type=int, default=20,
+                        help='Validation epochs without improvement before early stopping')
     parser.add_argument('--seed', type=int, default=42,
                         help='随机种子')
     parser.add_argument('--val_t', type=float, default=0.5,
@@ -104,6 +106,8 @@ def parse_args():
                         help='Characteristic chi scale in radians for the product metric')
     parser.add_argument('--phase_residual_min_tangent_norm', type=float, default=1e-3,
                         help='Disable spatial residuals below this endpoint-motion norm')
+    parser.add_argument('--phase_residual_max_metric_norm', type=float, default=0.0,
+                        help='Per-residue product-metric residual cap; <=0 disables the cap')
     parser.add_argument('--init_from_checkpoint', type=str, default=None,
                         help='Warm-start model weights only; does not restore optimizer, scheduler, or epoch')
     parser.add_argument('--teacher_residual_cache_dir', type=str, default=None,
@@ -387,6 +391,7 @@ def main():
         grad_clip=args.grad_clip,
         grad_accum_steps=args.accum_steps,
         warmup_steps=args.warmup_steps,
+        early_stop_patience=args.early_stop_patience,
         seed=args.seed,
         val_t=args.val_t if args.val_t >= 0.0 else None,
         path_parameterization=args.path_parameterization,
@@ -403,6 +408,7 @@ def main():
         phase_residual_translation_metric_scale=args.phase_residual_translation_metric_scale,
         phase_residual_chi_metric_scale=args.phase_residual_chi_metric_scale,
         phase_residual_min_tangent_norm=args.phase_residual_min_tangent_norm,
+        phase_residual_max_metric_norm=args.phase_residual_max_metric_norm,
         init_from_checkpoint=args.init_from_checkpoint,
         teacher_residual_cache_dir=args.teacher_residual_cache_dir,
         w_teacher_residual=args.w_teacher_residual,
@@ -571,6 +577,7 @@ def main():
     print(f"  - w_prior: {config.w_prior}")
     print(f"  - t_mid: {config.t_mid}")
     print(f"  - warmup_steps: {config.warmup_steps}")
+    print(f"  - early_stop_patience: {config.early_stop_patience}")
     print(f"  - num_workers: {config.num_workers}")
     print(f"  - prefetch_factor: {config.prefetch_factor}")
     print(f"  - n_integration_steps: {config.n_integration_steps}")
@@ -593,6 +600,7 @@ def main():
     print(f"  - phase_residual_scale: {config.phase_residual_scale}")
     print(f"  - phase_residual_metric_scales: rot={config.phase_residual_rotation_metric_scale} trans={config.phase_residual_translation_metric_scale} chi={config.phase_residual_chi_metric_scale}")
     print(f"  - phase_residual_min_tangent_norm: {config.phase_residual_min_tangent_norm}")
+    print(f"  - phase_residual_max_metric_norm: {config.phase_residual_max_metric_norm}")
     print(f"  - init_from_checkpoint: {config.init_from_checkpoint or 'OFF'}")
     print(f"  - teacher_residual_cache_dir: {config.teacher_residual_cache_dir or 'OFF'}")
     print(f"  - w_teacher_residual: {config.w_teacher_residual}")

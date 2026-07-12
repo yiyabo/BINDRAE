@@ -121,6 +121,7 @@ class TrainingConfig:
     phase_residual_translation_metric_scale: float = 1.0
     phase_residual_chi_metric_scale: float = 1.0
     phase_residual_min_tangent_norm: float = 1e-3
+    phase_residual_max_metric_norm: float = 0.0
     init_from_checkpoint: Optional[str] = None
 
     # Boundary-residual teacher distillation. The cache stores free-flow

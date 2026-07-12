@@ -55,6 +55,7 @@ def project_product_tangent_normal(
     translation_scale: float = 1.0,
     chi_scale: float = 1.0,
     min_tangent_norm: float = 1e-4,
+    max_metric_norm: float = 0.0,
     eps: float = 1e-8,
 ) -> Dict[str, torch.Tensor]:
     """Project a residual off the endpoint-bridge tangent.
@@ -80,6 +81,9 @@ def project_product_tangent_normal(
     min_tangent_norm = float(min_tangent_norm)
     if min_tangent_norm < 0.0:
         raise ValueError("min_tangent_norm must be >= 0")
+    max_metric_norm = float(max_metric_norm)
+    if max_metric_norm < 0.0:
+        raise ValueError("max_metric_norm must be >= 0")
 
     if node_mask is None:
         node_mask = torch.ones(
@@ -146,6 +150,20 @@ def project_product_tangent_normal(
         chi_scale=chi_scale,
     )
     projected_norm_sq = projected_metric.square().sum(dim=-1)
+    if max_metric_norm > 0.0:
+        projected_norm = projected_norm_sq.clamp_min(eps).sqrt()
+        cap_scale = (max_metric_norm / projected_norm).clamp(max=1.0)
+        cap_scale = torch.where(active_mask, cap_scale, torch.zeros_like(cap_scale))
+        projected_rigid = projected_rigid * cap_scale.unsqueeze(-1)
+        projected_chi = projected_chi * cap_scale.unsqueeze(-1)
+        projected_metric = _metric_coordinates(
+            projected_rigid,
+            projected_chi,
+            rotation_scale=rotation_scale,
+            translation_scale=translation_scale,
+            chi_scale=chi_scale,
+        )
+        projected_norm_sq = projected_metric.square().sum(dim=-1)
     projected_dot = (projected_metric * tangent_metric).sum(dim=-1)
     raw_parallel_cos = dot.abs() / (
         residual_norm_sq.sqrt() * tangent_norm_sq.sqrt()

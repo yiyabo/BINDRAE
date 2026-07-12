@@ -409,6 +409,8 @@ class Stage2Trainer:
                 raise ValueError(f"{name} must be > 0")
         if float(config.phase_residual_min_tangent_norm) < 0.0:
             raise ValueError("phase_residual_min_tangent_norm must be >= 0")
+        if float(config.phase_residual_max_metric_norm) < 0.0:
+            raise ValueError("phase_residual_max_metric_norm must be >= 0")
         for name in (
             'w_phase_residual_magnitude',
             'w_phase_residual_temporal_smooth',
@@ -1954,6 +1956,7 @@ class Stage2Trainer:
                 translation_scale=self.config.phase_residual_translation_metric_scale,
                 chi_scale=self.config.phase_residual_chi_metric_scale,
                 min_tangent_norm=self.config.phase_residual_min_tangent_norm,
+                max_metric_norm=self.config.phase_residual_max_metric_norm,
             )
             projected_rigid = projection['projected_rigid']
             projected_chi = projection['projected_chi']
@@ -2107,6 +2110,7 @@ class Stage2Trainer:
                 & record['active_mask'][:, 1:]
                 & batch.node_mask[:, :-1].bool()
                 & batch.node_mask[:, 1:].bool()
+                & batch.peptide_bond_mask.bool()
             )
             pair_f = pair_mask.float()
             rigid_diff = torch.cat(
@@ -3135,6 +3139,7 @@ class Stage2Trainer:
                     angle_cacn=self.config.pep_angle_cacn,
                     angle_cnca=self.config.pep_angle_cnca,
                     angle_weight=self.config.pep_angle_weight,
+                    peptide_bond_mask=batch.peptide_bond_mask,
                 )
 
                 # Contact score
@@ -3189,6 +3194,12 @@ class Stage2Trainer:
                         batch,
                     )
                     stage1v2_guidance_terms += 1
+
+            geometry_frame_count = max(len(geom_indices), 1)
+            geometry_interval_count = max(len(geom_indices) - 1, 1)
+            L_clash = L_clash / geometry_frame_count
+            L_pep = L_pep / geometry_frame_count
+            L_smooth = L_smooth / geometry_interval_count
 
             # Endpoint loss
             # Precompute holo atom14 for FAPE
@@ -3376,24 +3387,29 @@ class Stage2Trainer:
                      self.config.w_end_fape * L_end_fape +
                      L_end_rigid)
 
+        def stabilized(value: torch.Tensor) -> torch.Tensor:
+            if phase_residual_mode:
+                return 100.0 * torch.log1p(value.clamp_min(0.0) / 100.0)
+            return value.clamp(max=100.0)
+
         total_no_repa = (
-            self.config.w_fm_chi * L_fm_chi.clamp(max=100.0) +
-            self.config.w_fm_rigid * L_fm_rigid.clamp(max=100.0) +
-            self.config.w_teacher_residual * L_teacher_residual.clamp(max=100.0) +
-            self.config.w_bg * L_bg.clamp(max=100.0) +
-            self.config.w_phase_residual_magnitude * L_phase_residual_magnitude.clamp(max=100.0) +
-            self.config.w_phase_residual_temporal_smooth * L_phase_residual_temporal_smooth.clamp(max=100.0) +
-            self.config.w_phase_residual_neighbor_smooth * L_phase_residual_neighbor_smooth.clamp(max=100.0) +
-            self.config.w_smooth * L_smooth.clamp(max=100.0) +
-            self.config.w_clash * L_clash.clamp(max=100.0) +
-            self.config.w_ligand_clearance * L_ligand_clearance.clamp(max=100.0) +
-            self.config.w_bridge_anchor * L_bridge_anchor.clamp(max=100.0) +
-            self.config.w_pep * L_pep.clamp(max=100.0) +
-            self.config.w_contact * L_contact.clamp(max=100.0) +
-            self.config.w_stage1v2_guidance * L_stage1v2_guidance.clamp(max=100.0) +
-            self.config.w_prior * L_prior.clamp(max=100.0) +
-            self.config.w_interaction_prior * L_interaction_prior.clamp(max=100.0) +
-            self.config.w_end * L_end.clamp(max=100.0)
+            self.config.w_fm_chi * stabilized(L_fm_chi) +
+            self.config.w_fm_rigid * stabilized(L_fm_rigid) +
+            self.config.w_teacher_residual * stabilized(L_teacher_residual) +
+            self.config.w_bg * stabilized(L_bg) +
+            self.config.w_phase_residual_magnitude * stabilized(L_phase_residual_magnitude) +
+            self.config.w_phase_residual_temporal_smooth * stabilized(L_phase_residual_temporal_smooth) +
+            self.config.w_phase_residual_neighbor_smooth * stabilized(L_phase_residual_neighbor_smooth) +
+            self.config.w_smooth * stabilized(L_smooth) +
+            self.config.w_clash * stabilized(L_clash) +
+            self.config.w_ligand_clearance * stabilized(L_ligand_clearance) +
+            self.config.w_bridge_anchor * stabilized(L_bridge_anchor) +
+            self.config.w_pep * stabilized(L_pep) +
+            self.config.w_contact * stabilized(L_contact) +
+            self.config.w_stage1v2_guidance * stabilized(L_stage1v2_guidance) +
+            self.config.w_prior * stabilized(L_prior) +
+            self.config.w_interaction_prior * stabilized(L_interaction_prior) +
+            self.config.w_end * stabilized(L_end)
         )
         total = total_no_repa + self.config.repa_weight * L_repa.clamp(max=100.0)
 
@@ -3580,6 +3596,10 @@ class Stage2Trainer:
         batch.bb_mask = batch.bb_mask.to(self.device, non_blocking=non_blocking)
         batch.chi_mask = batch.chi_mask.to(self.device, non_blocking=non_blocking)
         batch.node_mask = batch.node_mask.to(self.device, non_blocking=non_blocking)
+        batch.peptide_bond_mask = batch.peptide_bond_mask.to(
+            self.device,
+            non_blocking=non_blocking,
+        )
         batch.N_apo = batch.N_apo.to(self.device, non_blocking=non_blocking)
         batch.Ca_apo = batch.Ca_apo.to(self.device, non_blocking=non_blocking)
         batch.C_apo = batch.C_apo.to(self.device, non_blocking=non_blocking)
@@ -3782,6 +3802,7 @@ class Stage2Trainer:
             'phase_residual_translation_metric_scale',
             'phase_residual_chi_metric_scale',
             'phase_residual_min_tangent_norm',
+            'phase_residual_max_metric_norm',
             'length_bucket_residue_budget',
             # Loss contract.
             'contact_loss_mode',
@@ -3816,6 +3837,7 @@ class Stage2Trainer:
             'phase_residual_translation_metric_scale': 1.0,
             'phase_residual_chi_metric_scale': 1.0,
             'phase_residual_min_tangent_norm': 1e-3,
+            'phase_residual_max_metric_norm': 0.0,
             'w_phase_residual_magnitude': 0.01,
             'w_phase_residual_temporal_smooth': 0.01,
             'w_phase_residual_neighbor_smooth': 0.01,

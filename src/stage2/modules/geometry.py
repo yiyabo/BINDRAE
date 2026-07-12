@@ -30,6 +30,7 @@ def compute_peptide_loss(atom14_pos: torch.Tensor,
                           angle_cacn: float = 2.035,
                           angle_cnca: float = 2.124,
                           angle_weight: float = 0.1,
+                          peptide_bond_mask: Optional[torch.Tensor] = None,
                           eps: float = 1e-8) -> torch.Tensor:
     """
     Peptide geometry guard: C-N bond length + angles.
@@ -49,6 +50,12 @@ def compute_peptide_loss(atom14_pos: torch.Tensor,
         node_mask[:, :-1] &
         node_mask[:, 1:]
     )
+    if peptide_bond_mask is not None:
+        if peptide_bond_mask.shape != mask_cn.shape:
+            raise ValueError(
+                f"peptide_bond_mask shape={peptide_bond_mask.shape}, expected {mask_cn.shape}"
+            )
+        mask_cn = mask_cn & peptide_bond_mask.bool()
 
     dist_cn = torch.norm(C_i - N_ip1, dim=-1)
     bond_loss = (dist_cn - bond_len) ** 2
@@ -71,6 +78,8 @@ def compute_peptide_loss(atom14_pos: torch.Tensor,
         node_mask[:, :-1] &
         node_mask[:, 1:]
     )
+    if peptide_bond_mask is not None:
+        mask_angle = mask_angle & peptide_bond_mask.bool()
 
     angle_loss = ((angle1 - angle_cacn) ** 2 + (angle2 - angle_cnca) ** 2)
     angle_loss = (angle_loss * mask_angle.float()).sum() / (mask_angle.float().sum() + eps)

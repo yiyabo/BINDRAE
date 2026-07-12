@@ -95,6 +95,25 @@ class PhaseResidualProjectionTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(residual_rigid.grad).all().item())
         self.assertTrue(torch.isfinite(residual_chi.grad).all().item())
 
+    def test_metric_norm_cap_preserves_orthogonality(self):
+        torch.manual_seed(17)
+        tangent_rigid = torch.randn(2, 4, 6)
+        tangent_chi = torch.randn(2, 4, 4)
+        result = project_product_tangent_normal(
+            20.0 * torch.randn(2, 4, 6),
+            20.0 * torch.randn(2, 4, 4),
+            tangent_rigid,
+            tangent_chi,
+            max_metric_norm=0.5,
+        )
+        projected = torch.cat(
+            [result["projected_rigid"], result["projected_chi"]],
+            dim=-1,
+        )
+        tangent = torch.cat([tangent_rigid, tangent_chi], dim=-1)
+        self.assertLessEqual(projected.norm(dim=-1).max().item(), 0.50001)
+        self.assertLess((projected * tangent).sum(dim=-1).abs().max().item(), 2e-5)
+
 
 if __name__ == "__main__":
     unittest.main()

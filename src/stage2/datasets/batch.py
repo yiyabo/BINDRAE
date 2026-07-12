@@ -25,6 +25,7 @@ class Stage2Batch:
     bb_mask: torch.Tensor
     chi_mask: torch.Tensor
     node_mask: torch.Tensor
+    peptide_bond_mask: torch.Tensor
     N_apo: torch.Tensor
     Ca_apo: torch.Tensor
     C_apo: torch.Tensor
@@ -69,6 +70,7 @@ def collate_stage2_batch(samples: List[Dict]) -> Stage2Batch:
     bb_mask = np.zeros((batch_size, max_n_res, 3), dtype=bool)
     chi_mask = np.zeros((batch_size, max_n_res, 4), dtype=bool)
     node_mask = np.zeros((batch_size, max_n_res), dtype=bool)
+    peptide_bond_mask = np.zeros((batch_size, max(max_n_res - 1, 0)), dtype=bool)
 
     N_apo = np.zeros((batch_size, max_n_res, 3), dtype=np.float32)
     Ca_apo = np.zeros((batch_size, max_n_res, 3), dtype=np.float32)
@@ -121,6 +123,13 @@ def collate_stage2_batch(samples: List[Dict]) -> Stage2Batch:
         if sample_mask is None:
             sample_mask = np.ones((n_res,), dtype=bool)
         node_mask[i, :n_res] = sample_mask
+        if n_res > 1:
+            sample_bonds = np.asarray(sample['peptide_bond_mask'], dtype=bool)
+            if sample_bonds.shape != (n_res - 1,):
+                raise ValueError(
+                    f"peptide_bond_mask shape={sample_bonds.shape}, expected {(n_res - 1,)}"
+                )
+            peptide_bond_mask[i, :n_res - 1] = sample_bonds
 
         N_apo[i, :n_res] = sample['N_apo']
         Ca_apo[i, :n_res] = sample['Ca_apo']
@@ -159,6 +168,7 @@ def collate_stage2_batch(samples: List[Dict]) -> Stage2Batch:
         bb_mask=torch.from_numpy(bb_mask),
         chi_mask=torch.from_numpy(chi_mask),
         node_mask=torch.from_numpy(node_mask),
+        peptide_bond_mask=torch.from_numpy(peptide_bond_mask),
         N_apo=torch.from_numpy(N_apo),
         Ca_apo=torch.from_numpy(Ca_apo),
         C_apo=torch.from_numpy(C_apo),

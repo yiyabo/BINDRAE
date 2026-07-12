@@ -63,6 +63,8 @@ LENGTH_BUCKET_RESIDUE_BUDGET="${LENGTH_BUCKET_RESIDUE_BUDGET:-}"
 PROGRESS_LOG_EVERY="${PROGRESS_LOG_EVERY:-100}"
 CHECKPOINT_EVERY_N_EPOCHS="${CHECKPOINT_EVERY_N_EPOCHS:-0}"
 LR="${LR:-2e-5}"
+WARMUP_STEPS="${WARMUP_STEPS:-0}"
+EARLY_STOP_PATIENCE="${EARLY_STOP_PATIENCE:-20}"
 VAL_T="${VAL_T:-0.5}"
 VAL_SPLIT="${VAL_SPLIT:-val}"
 SEED="${SEED:-42}"
@@ -81,6 +83,7 @@ PHASE_RESIDUAL_ROTATION_METRIC_SCALE="${PHASE_RESIDUAL_ROTATION_METRIC_SCALE:-1.
 PHASE_RESIDUAL_TRANSLATION_METRIC_SCALE="${PHASE_RESIDUAL_TRANSLATION_METRIC_SCALE:-1.0}"
 PHASE_RESIDUAL_CHI_METRIC_SCALE="${PHASE_RESIDUAL_CHI_METRIC_SCALE:-1.0}"
 PHASE_RESIDUAL_MIN_TANGENT_NORM="${PHASE_RESIDUAL_MIN_TANGENT_NORM:-1e-3}"
+PHASE_RESIDUAL_MAX_METRIC_NORM="${PHASE_RESIDUAL_MAX_METRIC_NORM:-0.0}"
 INIT_FROM_CHECKPOINT="${INIT_FROM_CHECKPOINT:-}"
 TEACHER_RESIDUAL_CACHE_DIR="${TEACHER_RESIDUAL_CACHE_DIR:-}"
 W_TEACHER_RESIDUAL="${W_TEACHER_RESIDUAL:-0.0}"
@@ -297,6 +300,8 @@ for name, value in positive.items():
         raise SystemExit(f"ERROR: {name} must be > 0")
 if float("$PHASE_RESIDUAL_MIN_TANGENT_NORM") < 0.0:
     raise SystemExit("ERROR: PHASE_RESIDUAL_MIN_TANGENT_NORM must be >= 0")
+if float("$PHASE_RESIDUAL_MAX_METRIC_NORM") < 0.0:
+    raise SystemExit("ERROR: PHASE_RESIDUAL_MAX_METRIC_NORM must be >= 0")
 for name, value in {
     "W_PHASE_RESIDUAL_MAGNITUDE": float("$W_PHASE_RESIDUAL_MAGNITUDE"),
     "W_PHASE_RESIDUAL_TEMPORAL_SMOOTH": float("$W_PHASE_RESIDUAL_TEMPORAL_SMOOTH"),
@@ -852,6 +857,8 @@ echo "bucket res budget:${LENGTH_BUCKET_RESIDUE_BUDGET:-OFF}"
 echo "progress every:  $PROGRESS_LOG_EVERY"
 echo "ckpt every ep:   $CHECKPOINT_EVERY_N_EPOCHS"
 echo "lr:              $LR"
+echo "warmup steps:    $WARMUP_STEPS"
+echo "early stop:      $EARLY_STOP_PATIENCE"
 echo "path param:      $PATH_PARAMETERIZATION"
 echo "boundary env:    $BOUNDARY_RESIDUAL_ENVELOPE"
 echo "boundary scale:  $BOUNDARY_RESIDUAL_SCALE"
@@ -864,6 +871,7 @@ echo "phase envelope:  $PHASE_RESIDUAL_ENVELOPE"
 echo "phase scale:     $PHASE_RESIDUAL_SCALE"
 echo "phase metric:    rot=$PHASE_RESIDUAL_ROTATION_METRIC_SCALE trans=$PHASE_RESIDUAL_TRANSLATION_METRIC_SCALE chi=$PHASE_RESIDUAL_CHI_METRIC_SCALE"
 echo "phase min norm:  $PHASE_RESIDUAL_MIN_TANGENT_NORM"
+echo "phase max norm:  ${PHASE_RESIDUAL_MAX_METRIC_NORM:-OFF}"
 echo "init ckpt:       ${INIT_FROM_CHECKPOINT:-OFF}"
 echo "teacher cache:   ${TEACHER_RESIDUAL_CACHE_DIR:-OFF}"
 echo "w_teacher_resid: $W_TEACHER_RESIDUAL"
@@ -934,7 +942,8 @@ python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA {torch.versio
   --lr "$LR" \
   --grad_clip 0.3 \
   --accum_steps 1 \
-  --warmup_steps 0 \
+  --warmup_steps "$WARMUP_STEPS" \
+  --early_stop_patience "$EARLY_STOP_PATIENCE" \
   --seed "$SEED" \
   --val_t "$VAL_T" \
   --path_parameterization "$PATH_PARAMETERIZATION" \
@@ -951,6 +960,7 @@ python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA {torch.versio
   --phase_residual_translation_metric_scale "$PHASE_RESIDUAL_TRANSLATION_METRIC_SCALE" \
   --phase_residual_chi_metric_scale "$PHASE_RESIDUAL_CHI_METRIC_SCALE" \
   --phase_residual_min_tangent_norm "$PHASE_RESIDUAL_MIN_TANGENT_NORM" \
+  --phase_residual_max_metric_norm "$PHASE_RESIDUAL_MAX_METRIC_NORM" \
   "${TEACHER_RESIDUAL_ARGS[@]}" \
   --val_split "$VAL_SPLIT" \
   --no_stage1_prior \
