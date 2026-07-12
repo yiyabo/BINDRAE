@@ -30,6 +30,8 @@ CHECKPOINT="${CHECKPOINT:?CHECKPOINT is required}"
 VALID_SAMPLES_FILE="${VALID_SAMPLES_FILE:-}"
 MAX_BATCHES="${MAX_BATCHES:-}"
 TOP_K="${TOP_K:-32}"
+PHASE_RESIDUAL_SCALE="${PHASE_RESIDUAL_SCALE:-}"
+PHASE_RESIDUAL_TAU_MODE="${PHASE_RESIDUAL_TAU_MODE:-}"
 OUTPUT="${OUTPUT:-logs/stage2/objective_outliers/$(basename "$(dirname "$CHECKPOINT")").json}"
 
 ARGS=(
@@ -44,6 +46,12 @@ if [[ -n "$VALID_SAMPLES_FILE" ]]; then
 fi
 if [[ -n "$MAX_BATCHES" ]]; then
   ARGS+=(--max_batches "$MAX_BATCHES")
+fi
+if [[ -n "$PHASE_RESIDUAL_SCALE" ]]; then
+  ARGS+=(--phase_residual_scale "$PHASE_RESIDUAL_SCALE")
+fi
+if [[ -n "$PHASE_RESIDUAL_TAU_MODE" ]]; then
+  ARGS+=(--phase_residual_tau_mode "$PHASE_RESIDUAL_TAU_MODE")
 fi
 
 python scripts/diagnose_stage2_objective_outliers.py "${ARGS[@]}"

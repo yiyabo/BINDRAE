@@ -42,6 +42,12 @@ def parse_args():
     parser.add_argument("--max_batches", type=int, default=None)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--top_k", type=int, default=32)
+    parser.add_argument("--phase_residual_scale", type=float, default=None)
+    parser.add_argument(
+        "--phase_residual_tau_mode",
+        choices=["learned", "identity"],
+        default=None,
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--output", required=True)
     return parser.parse_args()
@@ -87,6 +93,12 @@ def main():
     if args.valid_samples_file:
         config.val_samples_file = args.valid_samples_file
         config.trust_prechecked_samples = True
+    if args.phase_residual_scale is not None:
+        if float(args.phase_residual_scale) <= 0.0:
+            raise ValueError("--phase_residual_scale must be > 0")
+        config.phase_residual_scale = float(args.phase_residual_scale)
+    if args.phase_residual_tau_mode is not None:
+        config.phase_residual_tau_mode = args.phase_residual_tau_mode
 
     trainer = Stage2Trainer(config)
     trainer.model.eval()
@@ -122,6 +134,8 @@ def main():
     output = {
         "checkpoint": args.checkpoint,
         "valid_samples_file": config.val_samples_file,
+        "phase_residual_scale": config.phase_residual_scale,
+        "phase_residual_tau_mode": config.phase_residual_tau_mode,
         "samples": len(records),
         "summary": summarize(records),
         "top_objective_pep": records[: int(args.top_k)],
