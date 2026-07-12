@@ -61,7 +61,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_batches", type=int, default=None)
     parser.add_argument("--n_path_steps", type=int, default=16)
     parser.add_argument("--n_tau_grid", type=int, default=33)
+    parser.add_argument("--tau_transition_weight", type=float, default=0.0)
     parser.add_argument("--methods", default="pure_bridge,oracle_global,oracle_group,oracle_residue")
+    parser.add_argument(
+        "--reference_bridge_mode",
+        default="se3_geodesic",
+        choices=["se3_geodesic", "cartesian_backbone"],
+    )
 
     parser.add_argument("--free_flow_path_parameterization", default="flow",
                         choices=["flow", "projected_flow", "boundary_residual_v1", "boundary_residual"])
@@ -128,21 +134,15 @@ def bridge_state_at_tau(
     rigids_apo: Rigid,
     rigids_holo: Rigid,
     tau: torch.Tensor,
+    bridge_mode: str = "se3_geodesic",
 ) -> Tuple[Rigid, torch.Tensor]:
-    tau = tau.clamp(min=0.0, max=1.0).float()
-    gamma = 3.0 * tau * tau - 2.0 * tau * tau * tau
-    chi0 = batch.torsion_apo[..., 3:7]
-    chi1 = batch.torsion_holo[..., 3:7]
-    chi_t = wrap_to_pi(chi0 + gamma.unsqueeze(-1) * wrap_to_pi(chi1 - chi0))
-
-    R0, t0 = base.rigid_to_rt(rigids_apo)
-    R1, t1 = base.rigid_to_rt(rigids_holo)
-    R0_inv, t0_inv = rigid_inverse(R0, t0)
-    R_delta, t_delta = rigid_compose(R0_inv, t0_inv, R1, t1)
-    xi = se3_log(R_delta, t_delta)
-    R_inc, t_inc = se3_exp(xi * gamma.unsqueeze(-1))
-    R_t, trans_t = rigid_compose(R0, t0, R_inc, t_inc)
-    return rigid_from_rt(R_t, trans_t), chi_t
+    return base.phase_interpolate_endpoints_tensor(
+        batch,
+        rigids_apo,
+        rigids_holo,
+        tau,
+        bridge_mode,
+    )
 
 
 def build_tau_grid_path(
@@ -150,13 +150,16 @@ def build_tau_grid_path(
     rigids_apo: Rigid,
     rigids_holo: Rigid,
     tau_seq: torch.Tensor,
+    bridge_mode: str = "se3_geodesic",
 ) -> Tuple[List[Rigid], List[torch.Tensor], List[float]]:
     rigids_list: List[Rigid] = []
     chi_list: List[torch.Tensor] = []
     t_list: List[float] = []
     steps = tau_seq.shape[0] - 1
     for k in range(tau_seq.shape[0]):
-        rigids_t, chi_t = bridge_state_at_tau(batch, rigids_apo, rigids_holo, tau_seq[k])
+        rigids_t, chi_t = bridge_state_at_tau(
+            batch, rigids_apo, rigids_holo, tau_seq[k], bridge_mode
+        )
         rigids_list.append(rigids_t)
         chi_list.append(chi_t)
         t_list.append(k / max(steps, 1))
@@ -169,13 +172,16 @@ def compute_bridge_distance_grid(
     rigids_apo: Rigid,
     rigids_holo: Rigid,
     tau_grid: torch.Tensor,
+    bridge_mode: str = "se3_geodesic",
 ) -> Tuple[torch.Tensor, List[Rigid], List[torch.Tensor]]:
     dists: List[torch.Tensor] = []
     rigids_grid: List[Rigid] = []
     chi_grid: List[torch.Tensor] = []
     for tau_value in tau_grid:
         tau = batch.w_res.new_full(batch.w_res.shape, float(tau_value))
-        rigids_t, chi_t = bridge_state_at_tau(batch, rigids_apo, rigids_holo, tau)
+        rigids_t, chi_t = bridge_state_at_tau(
+            batch, rigids_apo, rigids_holo, tau, bridge_mode
+        )
         atom14 = base.torsions_to_atom14(
             fk_module,
             batch.torsion_apo[..., :3],
@@ -196,7 +202,10 @@ def compute_bridge_distance_grid(
     return torch.stack(dists, dim=0), rigids_grid, chi_grid
 
 
-def monotone_dp(cost: torch.Tensor) -> torch.Tensor:
+def monotone_dp(
+    cost: torch.Tensor,
+    transition_weight: float = 0.0,
+) -> torch.Tensor:
     """Find monotone grid indices minimizing cost.
 
     Args:
@@ -212,13 +221,29 @@ def monotone_dp(cost: torch.Tensor) -> torch.Tensor:
     if T < 2 or G < 2:
         raise ValueError(f"monotone_dp requires T>=2 and G>=2, got T={T}, G={G}")
 
-    dp = cost[0]
+    trailing_shape = cost.shape[2:]
+    flat_cost = cost.reshape(T, G, -1)
+    dp = flat_cost[0]
     backptrs: List[torch.Tensor] = []
-    grid = torch.arange(G, device=cost.device, dtype=torch.long)
+    if float(transition_weight) > 0.0:
+        grid_float = torch.arange(G, device=cost.device, dtype=cost.dtype)
+        previous = grid_float[:, None]
+        current = grid_float[None, :]
+        expected_step = (G - 1) / max(T - 1, 1)
+        transition = float(transition_weight) * (
+            current - previous - expected_step
+        ).square()
+        transition = transition.masked_fill(previous > current, float("inf"))
     for t_idx in range(1, T):
-        prefix_val, prefix_arg = torch.cummin(dp, dim=0)
-        dp = cost[t_idx] + prefix_val
-        backptrs.append(prefix_arg)
+        if float(transition_weight) > 0.0:
+            candidate = dp[:, None, :] + transition[:, :, None]
+            best_value, best_index = candidate.min(dim=0)
+            dp = flat_cost[t_idx] + best_value
+            backptrs.append(best_index)
+        else:
+            prefix_val, prefix_arg = torch.cummin(dp, dim=0)
+            dp = flat_cost[t_idx] + prefix_val
+            backptrs.append(prefix_arg)
 
     last_idx = dp.argmin(dim=0)
     path = [last_idx]
@@ -227,7 +252,7 @@ def monotone_dp(cost: torch.Tensor) -> torch.Tensor:
         prev_idx = torch.gather(backptr, dim=0, index=gather_idx).squeeze(0)
         path.append(prev_idx)
     path.reverse()
-    out = torch.stack(path, dim=0)
+    out = torch.stack(path, dim=0).reshape(T, *trailing_shape)
     if out.shape[0] != T:
         raise RuntimeError("failed to reconstruct monotone path")
     return out.long()
@@ -426,7 +451,10 @@ def build_free_flow_projected_tau(
         teacher_chi,
         batch.chi_mask,
     )
-    idx = monotone_dp(force_endpoint_costs(proj_cost))
+    idx = monotone_dp(
+        force_endpoint_costs(proj_cost),
+        transition_weight=float(args.tau_transition_weight),
+    )
     tau = tau_grid[idx]
     identity = identity_tau_seq(batch, n_steps)
     return torch.where(finite[None], tau, identity)
@@ -605,6 +633,8 @@ def main() -> None:
         raise ValueError("--n_path_steps must be > 0")
     if int(args.n_tau_grid) < 3:
         raise ValueError("--n_tau_grid must be >= 3")
+    if float(args.tau_transition_weight) < 0.0:
+        raise ValueError("--tau_transition_weight must be non-negative")
 
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
     ckpt, config, model, interaction_settings, stage1v2_settings = load_model_for_checkpoint(
@@ -659,7 +689,13 @@ def main() -> None:
             rigids_apo = base.build_rigids_from_backbone(batch.N_apo, batch.Ca_apo, batch.C_apo, batch.node_mask)
             rigids_holo = base.build_rigids_from_backbone(batch.N_holo, batch.Ca_holo, batch.C_holo, batch.node_mask)
             n_steps = int(args.n_path_steps)
-            bridge_path = base.pure_bridge_path(batch, rigids_apo, rigids_holo, n_steps)
+            bridge_path = build_tau_grid_path(
+                batch,
+                rigids_apo,
+                rigids_holo,
+                identity_tau_seq(batch, n_steps),
+                args.reference_bridge_mode,
+            )
 
             atom14_apo = base.torsions_to_atom14(
                 fk_module, batch.torsion_apo[..., :3], batch.torsion_apo[..., 3:7], rigids_apo, batch.aatype
@@ -684,7 +720,12 @@ def main() -> None:
             class_map = class_masks(args, batch, d_apo, d_holo)
             finite = class_map["all_pocket"]
             d_bridge_grid, grid_rigids, grid_chi = compute_bridge_distance_grid(
-                fk_module, batch, rigids_apo, rigids_holo, tau_grid
+                fk_module,
+                batch,
+                rigids_apo,
+                rigids_holo,
+                tau_grid,
+                args.reference_bridge_mode,
             )
             cost = path_cost_against_distance_schedule(
                 d_bridge_grid, d_apo, d_holo, n_steps, float(args.path_dist_cap)
@@ -695,7 +736,9 @@ def main() -> None:
                 paths["pure_bridge"] = bridge_path
             if "oracle_global" in methods:
                 tau = build_oracle_global_tau(cost, finite, tau_grid)
-                paths["oracle_global"] = build_tau_grid_path(batch, rigids_apo, rigids_holo, tau)
+                paths["oracle_global"] = build_tau_grid_path(
+                    batch, rigids_apo, rigids_holo, tau, args.reference_bridge_mode
+                )
             if "oracle_group" in methods:
                 group_masks = build_group_masks(
                     finite, d_apo, d_holo, float(args.active_delta), float(args.contact_dist)
@@ -703,10 +746,14 @@ def main() -> None:
                 tau, group_counts = build_oracle_group_tau(cost, finite, group_masks, tau_grid, n_steps)
                 for name, count in group_counts.items():
                     group_counts_total[name] += int(count)
-                paths["oracle_group"] = build_tau_grid_path(batch, rigids_apo, rigids_holo, tau)
+                paths["oracle_group"] = build_tau_grid_path(
+                    batch, rigids_apo, rigids_holo, tau, args.reference_bridge_mode
+                )
             if "oracle_residue" in methods:
                 tau = build_oracle_residue_tau(cost, finite, tau_grid, n_steps)
-                paths["oracle_residue"] = build_tau_grid_path(batch, rigids_apo, rigids_holo, tau)
+                paths["oracle_residue"] = build_tau_grid_path(
+                    batch, rigids_apo, rigids_holo, tau, args.reference_bridge_mode
+                )
             if "freeflow_projected" in methods:
                 args.config = free_config
                 n_free_steps = int(args.n_free_flow_steps or n_steps)
@@ -729,7 +776,9 @@ def main() -> None:
                     finite,
                 )
                 args.config = config
-                paths["freeflow_projected"] = build_tau_grid_path(batch, rigids_apo, rigids_holo, tau)
+                paths["freeflow_projected"] = build_tau_grid_path(
+                    batch, rigids_apo, rigids_holo, tau, args.reference_bridge_mode
+                )
 
             for method, path in paths.items():
                 stats, counts = evaluate_path(
@@ -770,6 +819,8 @@ def main() -> None:
         "settings": {
             "n_path_steps": int(args.n_path_steps),
             "n_tau_grid": int(args.n_tau_grid),
+            "tau_transition_weight": float(args.tau_transition_weight),
+            "reference_bridge_mode": args.reference_bridge_mode,
             "active_delta": float(args.active_delta),
             "contact_dist": float(args.contact_dist),
             "path_dist_cap": float(args.path_dist_cap),

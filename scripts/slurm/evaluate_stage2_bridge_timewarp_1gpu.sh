@@ -41,9 +41,11 @@ NUM_WORKERS="${NUM_WORKERS:-0}"
 MAX_BATCHES="${MAX_BATCHES:-512}"
 N_PATH_STEPS="${N_PATH_STEPS:-16}"
 N_TAU_GRID="${N_TAU_GRID:-33}"
+TAU_TRANSITION_WEIGHT="${TAU_TRANSITION_WEIGHT:-0.0}"
 # Commas are safe in this script default, but Slurm --export also uses commas.
 # When passing from sbatch --export, prefer ":" or "+" separators.
 METHODS="${METHODS:-pure_bridge,oracle_global,oracle_group,oracle_residue}"
+REFERENCE_BRIDGE_MODE="${REFERENCE_BRIDGE_MODE:-se3_geodesic}"
 FREE_FLOW_PATH_PARAMETERIZATION="${FREE_FLOW_PATH_PARAMETERIZATION:-flow}"
 N_FREE_FLOW_STEPS="${N_FREE_FLOW_STEPS:-}"
 INTEGRATION_CHI_CLIP="${INTEGRATION_CHI_CLIP:-}"
@@ -85,6 +87,13 @@ case "$FREE_FLOW_PATH_PARAMETERIZATION" in
     exit 1
     ;;
 esac
+case "$REFERENCE_BRIDGE_MODE" in
+  se3_geodesic|cartesian_backbone) ;;
+  *)
+    echo "ERROR: REFERENCE_BRIDGE_MODE must be se3_geodesic or cartesian_backbone"
+    exit 1
+    ;;
+esac
 
 echo "=============================================="
 echo "BINDRAE Stage-2 bridge time-warp evaluator"
@@ -98,10 +107,12 @@ echo "Split:              $SPLIT"
 echo "Valid samples:      ${VALID_SAMPLES_FILE:-split_default}"
 echo "Trust prechecked:   $TRUST_PRECHECKED_SAMPLES"
 echo "Methods:            $METHODS"
+echo "Reference bridge:   $REFERENCE_BRIDGE_MODE"
 echo "Max batches:        $MAX_BATCHES"
 echo "Batch size:         $BATCH_SIZE"
 echo "Path steps:         $N_PATH_STEPS"
 echo "Tau grid:           $N_TAU_GRID"
+echo "Tau transition wt:  $TAU_TRANSITION_WEIGHT"
 echo "Output:             $OUTPUT"
 echo "Start:              $(date)"
 echo "=============================================="
@@ -116,7 +127,9 @@ ARGS=(
   --max_batches "$MAX_BATCHES"
   --n_path_steps "$N_PATH_STEPS"
   --n_tau_grid "$N_TAU_GRID"
+  --tau_transition_weight "$TAU_TRANSITION_WEIGHT"
   --methods "$METHODS"
+  --reference_bridge_mode "$REFERENCE_BRIDGE_MODE"
   --free_flow_path_parameterization "$FREE_FLOW_PATH_PARAMETERIZATION"
   --active_delta "$ACTIVE_DELTA"
   --contact_dist "$CONTACT_DIST"
