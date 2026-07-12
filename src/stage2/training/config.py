@@ -149,6 +149,7 @@ class TrainingConfig:
     phase_teacher_min_confidence: float = 0.05
     phase_teacher_missing_policy: str = "error"  # error | skip
     phase_teacher_head_only: bool = False
+    phase_teacher_residual_heads_only: bool = False
 
     # Loss weights
     w_fm_chi: float = 1.0

@@ -157,6 +157,8 @@ def parse_args():
                         choices=['error', 'skip'])
     parser.add_argument('--phase_teacher_head_only', action='store_true',
                         help='Freeze all parameters except time_warp_head for a phase learnability diagnostic')
+    parser.add_argument('--phase_teacher_residual_heads_only', action='store_true',
+                        help='Freeze the shared trunk and train only phase/residual heads')
 
     # ESM representation adapter
     parser.add_argument('--esm_fusion_enabled', action='store_true',
@@ -446,6 +448,7 @@ def main():
         phase_teacher_min_confidence=args.phase_teacher_min_confidence,
         phase_teacher_missing_policy=args.phase_teacher_missing_policy,
         phase_teacher_head_only=args.phase_teacher_head_only,
+        phase_teacher_residual_heads_only=args.phase_teacher_residual_heads_only,
         esm_fusion_enabled=args.esm_fusion_enabled,
         esm_num_layers=args.esm_num_layers,
         esm_fusion_mode=args.esm_fusion_mode,
@@ -635,6 +638,7 @@ def main():
     print(f"  - phase_teacher_cache_dir: {config.phase_teacher_cache_dir or 'OFF'}")
     print(f"  - w_phase_teacher: {config.w_phase_teacher}")
     print(f"  - phase_teacher_head_only: {config.phase_teacher_head_only}")
+    print(f"  - phase_teacher_residual_heads_only: {config.phase_teacher_residual_heads_only}")
     print(f"  - teacher_residual_loss_type: {config.teacher_residual_loss_type}")
     print(f"  - teacher_residual_huber_delta: {config.teacher_residual_huber_delta}")
     print(f"  - teacher_residual_t_range: {config.teacher_residual_t_min}-{config.teacher_residual_t_max}")

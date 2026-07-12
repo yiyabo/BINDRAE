@@ -103,6 +103,7 @@ PHASE_TEACHER_MASK_MODE="${PHASE_TEACHER_MASK_MODE:-contact_event}"
 PHASE_TEACHER_MIN_CONFIDENCE="${PHASE_TEACHER_MIN_CONFIDENCE:-0.05}"
 PHASE_TEACHER_MISSING_POLICY="${PHASE_TEACHER_MISSING_POLICY:-error}"
 PHASE_TEACHER_HEAD_ONLY="${PHASE_TEACHER_HEAD_ONLY:-0}"
+PHASE_TEACHER_RESIDUAL_HEADS_ONLY="${PHASE_TEACHER_RESIDUAL_HEADS_ONLY:-0}"
 ESM_FUSION_ENABLED="${ESM_FUSION_ENABLED:-0}"
 ESM_NUM_LAYERS="${ESM_NUM_LAYERS:-1}"
 ESM_FUSION_MODE="${ESM_FUSION_MODE:-sum}"
@@ -836,6 +837,9 @@ fi
 if [[ "$PHASE_TEACHER_HEAD_ONLY" == "1" ]]; then
   PHASE_TEACHER_ARGS+=(--phase_teacher_head_only)
 fi
+if [[ "$PHASE_TEACHER_RESIDUAL_HEADS_ONLY" == "1" ]]; then
+  PHASE_TEACHER_ARGS+=(--phase_teacher_residual_heads_only)
+fi
 LENGTH_BUCKET_ARGS=()
 if [[ "$LENGTH_BUCKETED_TRAIN" == "1" ]]; then
   LENGTH_BUCKET_ARGS=(
@@ -916,6 +920,7 @@ echo "phase teacher:   ${PHASE_TEACHER_CACHE_DIR:-OFF}"
 echo "w_phase_teacher: $W_PHASE_TEACHER"
 echo "phase teacher mask/conf: $PHASE_TEACHER_MASK_MODE/$PHASE_TEACHER_MIN_CONFIDENCE"
 echo "phase head only: $PHASE_TEACHER_HEAD_ONLY"
+echo "phase/resid heads only: $PHASE_TEACHER_RESIDUAL_HEADS_ONLY"
 echo "w_fm_chi:        $W_FM_CHI"
 echo "w_fm_rigid:      $W_FM_RIGID"
 echo "w_bg:            $W_BG"

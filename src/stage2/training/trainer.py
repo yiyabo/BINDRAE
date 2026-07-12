@@ -557,6 +557,18 @@ class Stage2Trainer:
             raise ValueError(
                 "phase_teacher_head_only requires w_phase_teacher > 0"
             )
+        if (
+            config.phase_teacher_residual_heads_only
+            and config.w_phase_teacher <= 0.0
+        ):
+            raise ValueError(
+                "phase_teacher_residual_heads_only requires w_phase_teacher > 0"
+            )
+        if config.phase_teacher_head_only and config.phase_teacher_residual_heads_only:
+            raise ValueError(
+                "phase_teacher_head_only and phase_teacher_residual_heads_only "
+                "are mutually exclusive"
+            )
         allowed_projection_schedules = {'smoothstep', 'smootherstep', 'late_smoother', 'quadratic'}
         if config.terminal_projection_schedule not in allowed_projection_schedules:
             raise ValueError(
@@ -703,9 +715,19 @@ class Stage2Trainer:
             self._init_model_from_checkpoint(config.init_from_checkpoint)
         elif config.init_from_checkpoint and self.is_main_process:
             print("[Init] Skipping init_from_checkpoint because this run will resume from its own checkpoint")
-        if config.phase_teacher_head_only:
+        if config.phase_teacher_head_only or config.phase_teacher_residual_heads_only:
+            trainable_prefixes = ('time_warp_head.',)
+            scope_name = 'phase head'
+            if config.phase_teacher_residual_heads_only:
+                trainable_prefixes = (
+                    'time_warp_head.',
+                    'residual_gate_mlp.',
+                    'residual_chi_head.',
+                    'residual_rigid_head.',
+                )
+                scope_name = 'phase/residual heads'
             for name, parameter in self.model.named_parameters():
-                parameter.requires_grad_(name.startswith('time_warp_head.'))
+                parameter.requires_grad_(name.startswith(trainable_prefixes))
             trainable = sum(
                 parameter.numel()
                 for parameter in self.model.parameters()
@@ -715,8 +737,8 @@ class Stage2Trainer:
                 raise RuntimeError("phase_teacher_head_only left no trainable parameters")
             if self.is_main_process:
                 print(
-                    "[PhaseTeacher] Head-only diagnostic: "
-                    f"{trainable:,} trainable time-warp parameters"
+                    f"[PhaseTeacher] {scope_name}-only diagnostic: "
+                    f"{trainable:,} trainable parameters"
                 )
 
         # Stage-1 prior model
@@ -4236,6 +4258,7 @@ class Stage2Trainer:
             'phase_teacher_min_confidence',
             'phase_teacher_missing_policy',
             'phase_teacher_head_only',
+            'phase_teacher_residual_heads_only',
             'w_smooth',
             'w_clash',
             'w_pep',
@@ -4274,6 +4297,7 @@ class Stage2Trainer:
             'phase_teacher_min_confidence': 0.05,
             'phase_teacher_missing_policy': 'error',
             'phase_teacher_head_only': False,
+            'phase_teacher_residual_heads_only': False,
         }
         for field in strict_fields:
             old = self._config_value(ckpt_config, field)
