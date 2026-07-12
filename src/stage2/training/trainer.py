@@ -63,6 +63,7 @@ class Stage2Trainer:
         'objective_fm_chi',
         'objective_fm_rigid',
         'objective_teacher_residual',
+        'objective_phase_teacher',
         'objective_bg',
         'objective_phase_residual_magnitude',
         'objective_phase_residual_temporal_smooth',
@@ -107,6 +108,11 @@ class Stage2Trainer:
         'teacher_residual_t_error',
         'teacher_residual_weight_mean',
         'teacher_residual_mask_frac',
+        'phase_teacher',
+        'phase_teacher_tau_mae',
+        'phase_teacher_weight_mean',
+        'phase_teacher_mask_frac',
+        'phase_teacher_t_error',
         'bg',
         'smooth',
         'clash',
@@ -459,6 +465,13 @@ class Stage2Trainer:
             'w_phase_residual_magnitude',
             'w_phase_residual_temporal_smooth',
             'w_phase_residual_neighbor_smooth',
+            'phase_teacher_cache_dir',
+            'w_phase_teacher',
+            'phase_teacher_loss_type',
+            'phase_teacher_huber_delta',
+            'phase_teacher_mask_mode',
+            'phase_teacher_min_confidence',
+            'phase_teacher_missing_policy',
         ):
             if float(getattr(config, name)) < 0.0:
                 raise ValueError(f"{name} must be >= 0")
@@ -510,6 +523,42 @@ class Stage2Trainer:
         if not (0.0 <= config.teacher_residual_t_min < config.teacher_residual_t_max <= 1.0):
             raise ValueError(
                 "teacher_residual_t_min/max must satisfy 0 <= min < max <= 1"
+            )
+        allowed_phase_teacher_masks = {
+            'contact_event',
+            'formed_contact',
+            'approach',
+            'active',
+            'pocket',
+            'node',
+        }
+        if config.phase_teacher_mask_mode not in allowed_phase_teacher_masks:
+            raise ValueError(
+                f"Unsupported phase_teacher_mask_mode={config.phase_teacher_mask_mode}"
+            )
+        if config.phase_teacher_loss_type not in {'mse', 'huber'}:
+            raise ValueError(
+                f"Unsupported phase_teacher_loss_type={config.phase_teacher_loss_type}"
+            )
+        if config.w_phase_teacher < 0.0:
+            raise ValueError("w_phase_teacher must be >= 0")
+        if config.phase_teacher_huber_delta <= 0.0:
+            raise ValueError("phase_teacher_huber_delta must be > 0")
+        if not (0.0 <= config.phase_teacher_min_confidence <= 1.0):
+            raise ValueError("phase_teacher_min_confidence must be in [0, 1]")
+        if config.phase_teacher_missing_policy not in {'error', 'skip'}:
+            raise ValueError(
+                "Unsupported phase_teacher_missing_policy="
+                f"{config.phase_teacher_missing_policy}"
+            )
+        if config.w_phase_teacher > 0.0 and not config.phase_teacher_cache_dir:
+            raise ValueError("w_phase_teacher > 0 requires phase_teacher_cache_dir")
+        if (
+            config.w_phase_teacher > 0.0
+            and config.path_parameterization != 'phase_orthogonal_residual_v1'
+        ):
+            raise ValueError(
+                "phase teacher distillation requires phase_orthogonal_residual_v1"
             )
         allowed_projection_schedules = {'smoothstep', 'smootherstep', 'late_smoother', 'quadratic'}
         if config.terminal_projection_schedule not in allowed_projection_schedules:
@@ -2059,6 +2108,7 @@ class Stage2Trainer:
             interaction_prior=interaction_prior,
             esm_gate_context=esm_gate_context,
         )
+        self._last_phase_tau_values = tau_values
 
         bridge_tangent_chi = wrap_to_pi(
             batch.torsion_holo[..., 3:7] - batch.torsion_apo[..., 3:7]
@@ -2333,6 +2383,117 @@ class Stage2Trainer:
         if not self.config.teacher_residual_cache_dir:
             raise RuntimeError("teacher_residual_cache_dir is not set")
         return Path(self.config.teacher_residual_cache_dir) / f"{self._safe_sample_id(sample_id)}.npz"
+
+    def _phase_teacher_cache_path(self, sample_id: str) -> Path:
+        if not self.config.phase_teacher_cache_dir:
+            raise RuntimeError("phase_teacher_cache_dir is not set")
+        return Path(self.config.phase_teacher_cache_dir) / f"{self._safe_sample_id(sample_id)}.npz"
+
+    def _load_phase_teacher_targets(
+        self,
+        batch,
+        model_t_values: List[float],
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        if not self.config.phase_teacher_cache_dir or self.config.w_phase_teacher <= 0.0:
+            return None
+
+        n_t = len(model_t_values)
+        bsz, max_n = batch.node_mask.shape
+        target_tau = torch.zeros((n_t, bsz, max_n), dtype=torch.float32)
+        target_confidence = torch.zeros_like(target_tau)
+        target_mask = torch.zeros((bsz, max_n), dtype=torch.bool)
+        source_grid_error = torch.zeros((bsz,), dtype=torch.float32)
+        missing = []
+        loaded = 0
+
+        for b, sample_id in enumerate(getattr(batch, 'pdb_ids', [])):
+            n_res = int(batch.n_residues[b])
+            path = self._phase_teacher_cache_path(str(sample_id))
+            if not path.is_file():
+                missing.append(str(path))
+                continue
+            with np.load(path, allow_pickle=False) as data:
+                schema = str(data['schema_version'].item())
+                if schema != 'phase_teacher_v1':
+                    raise ValueError(f"{path} schema_version={schema!r}, expected 'phase_teacher_v1'")
+                cached_id = str(data['sample_id'].item())
+                if cached_id != str(sample_id):
+                    raise ValueError(f"{path} sample_id={cached_id!r}, expected {sample_id!r}")
+                cached_n = int(data['n_residues'].item())
+                if cached_n != n_res:
+                    raise ValueError(f"{path} n_residues={cached_n}, expected {n_res}")
+
+                source_t = np.asarray(data['t_values'], dtype=np.float32)
+                tau = np.asarray(data['tau_target'], dtype=np.float32)[:, :n_res]
+                confidence = np.asarray(data['phase_confidence'], dtype=np.float32)[:, :n_res]
+                if source_t.ndim != 1 or source_t.size < 2:
+                    raise ValueError(f"{path} has invalid t_values")
+                if tau.shape != confidence.shape or tau.shape[0] != source_t.size:
+                    raise ValueError(f"{path} has inconsistent phase target shapes")
+
+                for k, t_value in enumerate(model_t_values):
+                    upper = int(np.searchsorted(source_t, float(t_value), side='left'))
+                    upper = min(max(upper, 1), source_t.size - 1)
+                    lower = upper - 1
+                    span = max(float(source_t[upper] - source_t[lower]), 1e-8)
+                    frac = (float(t_value) - float(source_t[lower])) / span
+                    frac = min(max(frac, 0.0), 1.0)
+                    target_tau[k, b, :n_res] = torch.from_numpy(
+                        (tau[lower] * (1.0 - frac) + tau[upper] * frac).copy()
+                    )
+                    target_confidence[k, b, :n_res] = torch.from_numpy(
+                        (confidence[lower] * (1.0 - frac) + confidence[upper] * frac).copy()
+                    )
+
+                node = np.asarray(data['node_mask'][:n_res]).astype(bool)
+                mode = self.config.phase_teacher_mask_mode
+                if mode == 'node':
+                    selected = node
+                elif mode == 'pocket':
+                    selected = np.asarray(data['pocket_mask'][:n_res]).astype(bool)
+                elif mode == 'active':
+                    selected = np.asarray(data['active_mask'][:n_res]).astype(bool)
+                elif mode == 'approach':
+                    selected = np.asarray(data['approach_mask'][:n_res]).astype(bool)
+                elif mode == 'formed_contact':
+                    selected = np.asarray(data['formed_contact_mask'][:n_res]).astype(bool)
+                else:
+                    selected = (
+                        np.asarray(data['approach_mask'][:n_res]).astype(bool)
+                        | np.asarray(data['formed_contact_mask'][:n_res]).astype(bool)
+                    )
+                target_mask[b, :n_res] = torch.from_numpy(node & selected)
+                nearest_error = [
+                    float(np.min(np.abs(source_t - float(t_value))))
+                    for t_value in model_t_values
+                ]
+                source_grid_error[b] = max(nearest_error, default=0.0)
+                loaded += 1
+
+        if missing and self.config.phase_teacher_missing_policy == 'error':
+            shown = ", ".join(missing[:3])
+            extra = "" if len(missing) <= 3 else f" ... (+{len(missing) - 3})"
+            raise FileNotFoundError(f"Missing phase teacher cache: {shown}{extra}")
+        if loaded == 0:
+            return None
+
+        target_tau = target_tau.to(self.device)
+        target_confidence = target_confidence.to(self.device).clamp(0.0, 1.0)
+        target_mask = target_mask.to(self.device) & batch.node_mask.bool()
+        interior = torch.ones((n_t, 1, 1), dtype=torch.bool, device=self.device)
+        interior[0] = False
+        interior[-1] = False
+        confidence_mask = (
+            target_confidence >= float(self.config.phase_teacher_min_confidence)
+        )
+        loss_mask = interior & target_mask.unsqueeze(0) & confidence_mask
+        weight = target_confidence * loss_mask.float()
+        return {
+            'tau': target_tau,
+            'mask': loss_mask,
+            'weight': weight,
+            'source_grid_error': source_grid_error.to(self.device),
+        }
 
     def _load_teacher_residual_targets(
         self,
@@ -2949,6 +3110,11 @@ class Stage2Trainer:
         L_phase_residual_magnitude = chi_ref.new_tensor(0.0)
         L_phase_residual_temporal_smooth = chi_ref.new_tensor(0.0)
         L_phase_residual_neighbor_smooth = chi_ref.new_tensor(0.0)
+        L_phase_teacher = chi_ref.new_tensor(0.0)
+        phase_teacher_tau_mae = chi_ref.new_tensor(0.0)
+        phase_teacher_weight_mean = chi_ref.new_tensor(0.0)
+        phase_teacher_mask_frac = chi_ref.new_tensor(0.0)
+        phase_teacher_t_error = chi_ref.new_tensor(0.0)
         phase_residual_active_frac = chi_ref.new_tensor(0.0)
         phase_residual_norm_mean = chi_ref.new_tensor(0.0)
         phase_residual_norm_max = chi_ref.new_tensor(0.0)
@@ -3054,6 +3220,47 @@ class Stage2Trainer:
                     'neighbor_smooth'
                 ]
                 L_bg = residual_regularization['background']
+                phase_teacher_targets = self._load_phase_teacher_targets(
+                    batch,
+                    t_list,
+                )
+                if phase_teacher_targets is not None:
+                    pred_tau = torch.stack(self._last_phase_tau_values, dim=0)
+                    target_tau = phase_teacher_targets['tau']
+                    teacher_weight = phase_teacher_targets['weight']
+                    teacher_mask = phase_teacher_targets['mask']
+                    tau_delta = pred_tau - target_tau
+                    if self.config.phase_teacher_loss_type == 'huber':
+                        tau_loss = F.smooth_l1_loss(
+                            tau_delta,
+                            torch.zeros_like(tau_delta),
+                            reduction='none',
+                            beta=float(self.config.phase_teacher_huber_delta),
+                        )
+                    else:
+                        tau_loss = tau_delta.square()
+                    teacher_denom = teacher_weight.sum().clamp(min=1.0)
+                    L_phase_teacher = (
+                        tau_loss * teacher_weight
+                    ).sum() / teacher_denom
+                    phase_teacher_tau_mae = (
+                        tau_delta.abs() * teacher_weight
+                    ).sum().div(teacher_denom).detach()
+                    active_phase_teacher = teacher_mask & (teacher_weight > 0.0)
+                    if active_phase_teacher.any():
+                        phase_teacher_weight_mean = teacher_weight[
+                            active_phase_teacher
+                        ].mean().detach()
+                    phase_teacher_mask_frac = (
+                        active_phase_teacher.float().sum()
+                        / (
+                            batch.node_mask.float().sum().clamp(min=1.0)
+                            * max(len(t_list) - 2, 1)
+                        )
+                    ).detach()
+                    phase_teacher_t_error = phase_teacher_targets[
+                        'source_grid_error'
+                    ].mean().detach()
             elif boundary_residual_mode:
                 rigids_list, chi_list, t_list = self.boundary_residual_path(
                     batch,
@@ -3570,6 +3777,7 @@ class Stage2Trainer:
             'objective_fm_chi': self.config.w_fm_chi * stabilized(L_fm_chi),
             'objective_fm_rigid': self.config.w_fm_rigid * stabilized(L_fm_rigid),
             'objective_teacher_residual': self.config.w_teacher_residual * stabilized(L_teacher_residual),
+            'objective_phase_teacher': self.config.w_phase_teacher * stabilized(L_phase_teacher),
             'objective_bg': self.config.w_bg * stabilized(L_bg),
             'objective_phase_residual_magnitude': self.config.w_phase_residual_magnitude * stabilized(L_phase_residual_magnitude),
             'objective_phase_residual_temporal_smooth': self.config.w_phase_residual_temporal_smooth * stabilized(L_phase_residual_temporal_smooth),
@@ -3662,6 +3870,11 @@ class Stage2Trainer:
             'teacher_residual_t_error': teacher_residual_t_error,
             'teacher_residual_weight_mean': teacher_residual_weight_mean,
             'teacher_residual_mask_frac': teacher_residual_mask_frac,
+            'phase_teacher': L_phase_teacher,
+            'phase_teacher_tau_mae': phase_teacher_tau_mae,
+            'phase_teacher_weight_mean': phase_teacher_weight_mean,
+            'phase_teacher_mask_frac': phase_teacher_mask_frac,
+            'phase_teacher_t_error': phase_teacher_t_error,
             'bg': L_bg,
             'smooth': L_smooth,
             'clash': L_clash,
@@ -4033,6 +4246,13 @@ class Stage2Trainer:
             'w_phase_residual_magnitude': 0.01,
             'w_phase_residual_temporal_smooth': 0.01,
             'w_phase_residual_neighbor_smooth': 0.01,
+            'phase_teacher_cache_dir': None,
+            'w_phase_teacher': 0.0,
+            'phase_teacher_loss_type': 'huber',
+            'phase_teacher_huber_delta': 0.1,
+            'phase_teacher_mask_mode': 'contact_event',
+            'phase_teacher_min_confidence': 0.05,
+            'phase_teacher_missing_policy': 'error',
         }
         for field in strict_fields:
             old = self._config_value(ckpt_config, field)

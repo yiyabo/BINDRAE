@@ -139,6 +139,16 @@ class TrainingConfig:
     teacher_residual_clash_weight_threshold: float = 1e-4
     teacher_residual_missing_policy: str = "error"  # error | skip
 
+    # Optional phase-only pseudo-teacher distilled from a projected free-flow
+    # path. This is an experimental lane, not an MD trajectory target.
+    phase_teacher_cache_dir: Optional[str] = None
+    w_phase_teacher: float = 0.0
+    phase_teacher_loss_type: str = "huber"  # mse | huber
+    phase_teacher_huber_delta: float = 0.1
+    phase_teacher_mask_mode: str = "contact_event"  # contact_event | formed_contact | approach | active | pocket | node
+    phase_teacher_min_confidence: float = 0.05
+    phase_teacher_missing_policy: str = "error"  # error | skip
+
     # Loss weights
     w_fm_chi: float = 1.0
     w_fm_rigid: float = 1.0

@@ -143,6 +143,18 @@ def parse_args():
     parser.add_argument('--teacher_residual_missing_policy', type=str, default='error',
                         choices=['error', 'skip'],
                         help='How to handle samples missing teacher residual cache files')
+    parser.add_argument('--phase_teacher_cache_dir', type=str, default=None,
+                        help='Optional phase_teacher_v1 pseudo-label cache directory')
+    parser.add_argument('--w_phase_teacher', type=float, default=0.0,
+                        help='Loss weight for confidence-weighted phase pseudo-teacher distillation')
+    parser.add_argument('--phase_teacher_loss_type', type=str, default='huber',
+                        choices=['mse', 'huber'])
+    parser.add_argument('--phase_teacher_huber_delta', type=float, default=0.1)
+    parser.add_argument('--phase_teacher_mask_mode', type=str, default='contact_event',
+                        choices=['contact_event', 'formed_contact', 'approach', 'active', 'pocket', 'node'])
+    parser.add_argument('--phase_teacher_min_confidence', type=float, default=0.05)
+    parser.add_argument('--phase_teacher_missing_policy', type=str, default='error',
+                        choices=['error', 'skip'])
 
     # ESM representation adapter
     parser.add_argument('--esm_fusion_enabled', action='store_true',
@@ -424,6 +436,13 @@ def main():
         teacher_residual_mask_mode=args.teacher_residual_mask_mode,
         teacher_residual_clash_weight_threshold=args.teacher_residual_clash_weight_threshold,
         teacher_residual_missing_policy=args.teacher_residual_missing_policy,
+        phase_teacher_cache_dir=args.phase_teacher_cache_dir,
+        w_phase_teacher=args.w_phase_teacher,
+        phase_teacher_loss_type=args.phase_teacher_loss_type,
+        phase_teacher_huber_delta=args.phase_teacher_huber_delta,
+        phase_teacher_mask_mode=args.phase_teacher_mask_mode,
+        phase_teacher_min_confidence=args.phase_teacher_min_confidence,
+        phase_teacher_missing_policy=args.phase_teacher_missing_policy,
         esm_fusion_enabled=args.esm_fusion_enabled,
         esm_num_layers=args.esm_num_layers,
         esm_fusion_mode=args.esm_fusion_mode,
@@ -610,6 +629,8 @@ def main():
     print(f"  - init_from_checkpoint: {config.init_from_checkpoint or 'OFF'}")
     print(f"  - teacher_residual_cache_dir: {config.teacher_residual_cache_dir or 'OFF'}")
     print(f"  - w_teacher_residual: {config.w_teacher_residual}")
+    print(f"  - phase_teacher_cache_dir: {config.phase_teacher_cache_dir or 'OFF'}")
+    print(f"  - w_phase_teacher: {config.w_phase_teacher}")
     print(f"  - teacher_residual_loss_type: {config.teacher_residual_loss_type}")
     print(f"  - teacher_residual_huber_delta: {config.teacher_residual_huber_delta}")
     print(f"  - teacher_residual_t_range: {config.teacher_residual_t_min}-{config.teacher_residual_t_max}")

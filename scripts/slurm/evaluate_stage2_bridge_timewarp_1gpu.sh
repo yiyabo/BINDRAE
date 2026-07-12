@@ -64,6 +64,8 @@ CONTACT_DIST="${CONTACT_DIST:-4.5}"
 PATH_DIST_CAP="${PATH_DIST_CAP:-20.0}"
 LIGAND_CLASH_DIST="${LIGAND_CLASH_DIST:-2.2}"
 POCKET_THRESHOLD="${POCKET_THRESHOLD:-0.3}"
+PHASE_TEACHER_CACHE_DIR="${PHASE_TEACHER_CACHE_DIR:-}"
+PHASE_TEACHER_SKIP_EXISTING="${PHASE_TEACHER_SKIP_EXISTING:-0}"
 OUTPUT="${OUTPUT:-logs/stage2/bridge_timewarp/${TAG}_timewarp_maxb${MAX_BATCHES}_s${N_PATH_STEPS}_g${N_TAU_GRID}.json}"
 
 case "$SPLIT" in
@@ -113,6 +115,7 @@ echo "Batch size:         $BATCH_SIZE"
 echo "Path steps:         $N_PATH_STEPS"
 echo "Tau grid:           $N_TAU_GRID"
 echo "Tau transition wt:  $TAU_TRANSITION_WEIGHT"
+echo "Phase cache:         ${PHASE_TEACHER_CACHE_DIR:-OFF}"
 echo "Output:             $OUTPUT"
 echo "Start:              $(date)"
 echo "=============================================="
@@ -183,6 +186,12 @@ if [[ -n "$STAGE1V2_FEATURES" ]]; then
 fi
 if [[ -n "$STAGE1V2_FEATURE_SCALE" ]]; then
   ARGS+=(--stage1v2_posterior_feature_scale "$STAGE1V2_FEATURE_SCALE")
+fi
+if [[ -n "$PHASE_TEACHER_CACHE_DIR" ]]; then
+  ARGS+=(--phase_teacher_cache_dir "$PHASE_TEACHER_CACHE_DIR")
+fi
+if [[ "$PHASE_TEACHER_SKIP_EXISTING" == "1" ]]; then
+  ARGS+=(--phase_teacher_skip_existing)
 fi
 
 python scripts/evaluate_stage2_bridge_timewarp.py "${ARGS[@]}"

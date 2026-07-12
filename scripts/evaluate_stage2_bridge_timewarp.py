@@ -21,6 +21,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, Iterable, List, Optional, Tuple
 
+import numpy as np
 import torch
 from tqdm import tqdm
 
@@ -108,6 +109,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--path_dist_cap", type=float, default=20.0)
     parser.add_argument("--ligand_clash_dist", type=float, default=2.2)
     parser.add_argument("--pocket_threshold", type=float, default=0.3)
+    parser.add_argument(
+        "--phase_teacher_cache_dir",
+        default=None,
+        help=(
+            "Optional output directory for phase_teacher_v1 pseudo-label caches. "
+            "Requires freeflow_projected and stores projected tau plus confidence."
+        ),
+    )
+    parser.add_argument("--phase_teacher_skip_existing", action="store_true")
     parser.add_argument("--output", default=None)
     return parser.parse_args()
 
@@ -398,7 +408,7 @@ def load_model_for_checkpoint(args, ckpt_path: str, device: torch.device, split:
     return ckpt, config, model, interaction_settings, stage1v2_settings
 
 
-def build_free_flow_projected_tau(
+def build_free_flow_projection(
     args,
     model,
     fk_module,
@@ -413,7 +423,7 @@ def build_free_flow_projected_tau(
     stage1v2_settings: Dict[str, object],
     integration_clips: Dict[str, float],
     finite: torch.Tensor,
-) -> torch.Tensor:
+) -> Dict[str, torch.Tensor]:
     original_mode = getattr(args, "path_parameterization", "checkpoint")
     args.path_parameterization = args.free_flow_path_parameterization
     try:
@@ -457,7 +467,74 @@ def build_free_flow_projected_tau(
     )
     tau = tau_grid[idx]
     identity = identity_tau_seq(batch, n_steps)
-    return torch.where(finite[None], tau, identity)
+    tau = torch.where(finite[None], tau, identity)
+
+    selected_cost = torch.gather(proj_cost, dim=1, index=idx.unsqueeze(1)).squeeze(1)
+    identity_idx = torch.linspace(
+        0,
+        int(tau_grid.numel()) - 1,
+        steps=n_steps + 1,
+        device=tau_grid.device,
+    ).round().long()
+    identity_idx = identity_idx.view(-1, 1, 1).expand_as(idx)
+    identity_cost = torch.gather(
+        proj_cost,
+        dim=1,
+        index=identity_idx.unsqueeze(1),
+    ).squeeze(1)
+    relative_gain = (
+        (identity_cost - selected_cost).clamp(min=0.0)
+        / identity_cost.clamp(min=1e-6)
+    ).clamp(max=1.0)
+    phase_offset = (tau - identity).abs()
+    confidence = relative_gain * (
+        phase_offset / max(1.0 / max(n_steps, 1), 1e-6)
+    ).clamp(max=1.0)
+    confidence = confidence * finite.unsqueeze(0).float()
+    confidence[0] = 0.0
+    confidence[-1] = 0.0
+    return {
+        "tau": tau,
+        "confidence": confidence,
+        "projection_cost": selected_cost,
+        "identity_cost": identity_cost,
+        "teacher_rigids": teacher_rigids,
+        "teacher_chi": teacher_chi,
+    }
+
+
+def build_free_flow_projected_tau(
+    args,
+    model,
+    fk_module,
+    batch,
+    rigids_apo: Rigid,
+    rigids_holo: Rigid,
+    grid_rigids: List[Rigid],
+    grid_chi: List[torch.Tensor],
+    n_steps: int,
+    tau_grid: torch.Tensor,
+    interaction_settings: Dict[str, object],
+    stage1v2_settings: Dict[str, object],
+    integration_clips: Dict[str, float],
+    finite: torch.Tensor,
+) -> torch.Tensor:
+    return build_free_flow_projection(
+        args,
+        model,
+        fk_module,
+        batch,
+        rigids_apo,
+        rigids_holo,
+        grid_rigids,
+        grid_chi,
+        n_steps,
+        tau_grid,
+        interaction_settings,
+        stage1v2_settings,
+        integration_clips,
+        finite,
+    )["tau"]
 
 
 def class_masks(args, batch, d_apo: torch.Tensor, d_holo: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -624,6 +701,85 @@ def metrics_delta(metrics: Dict[str, Optional[float]], reference: Dict[str, Opti
     return out
 
 
+def _safe_sample_id(sample_id: str) -> str:
+    return str(sample_id).replace("/", "_").replace("\\", "_")
+
+
+def export_phase_teacher_batch(
+    args: argparse.Namespace,
+    batch,
+    projection: Dict[str, torch.Tensor],
+    class_map: Dict[str, torch.Tensor],
+    output_dir: Path,
+) -> List[Dict[str, object]]:
+    """Write explicit pseudo-teacher phase targets without changing legacy caches."""
+    tau = projection["tau"].detach().float().cpu()
+    confidence = projection["confidence"].detach().float().cpu()
+    projection_cost = projection["projection_cost"].detach().float().cpu()
+    identity_cost = projection["identity_cost"].detach().float().cpu()
+    t_values = np.linspace(0.0, 1.0, tau.shape[0], dtype=np.float32)
+    records: List[Dict[str, object]] = []
+
+    for b, sample_id in enumerate(batch.pdb_ids):
+        n_res = int(batch.n_residues[b])
+        output_path = output_dir / f"{_safe_sample_id(sample_id)}.npz"
+        if args.phase_teacher_skip_existing and output_path.is_file():
+            records.append({
+                "sample_id": str(sample_id),
+                "relative_path": output_path.name,
+                "n_residues": n_res,
+                "status": "exists",
+            })
+            continue
+
+        masks = {
+            name: class_map[name][b, :n_res].detach().bool().cpu().numpy()
+            for name in (
+                "all_pocket",
+                "active",
+                "approach",
+                "formed_contact",
+                "release",
+            )
+        }
+        confidence_np = confidence[:, b, :n_res].numpy().astype(np.float32)
+        np.savez_compressed(
+            output_path,
+            schema_version=np.array("phase_teacher_v1"),
+            source=np.array("free_flow_projected_pseudo_teacher"),
+            sample_id=np.array(str(sample_id)),
+            n_residues=np.array(n_res, dtype=np.int32),
+            teacher_checkpoint=np.array(str(args.free_flow_checkpoint or args.checkpoint)),
+            reference_bridge_mode=np.array(str(args.reference_bridge_mode)),
+            tau_transition_weight=np.array(float(args.tau_transition_weight), dtype=np.float32),
+            t_values=t_values,
+            tau_target=tau[:, b, :n_res].numpy().astype(np.float32),
+            phase_confidence=confidence_np,
+            projection_cost=projection_cost[:, b, :n_res].numpy().astype(np.float32),
+            identity_cost=identity_cost[:, b, :n_res].numpy().astype(np.float32),
+            node_mask=batch.node_mask[b, :n_res].detach().bool().cpu().numpy(),
+            w_res=batch.w_res[b, :n_res].detach().float().cpu().numpy().astype(np.float32),
+            pocket_mask=masks["all_pocket"],
+            active_mask=masks["active"],
+            approach_mask=masks["approach"],
+            formed_contact_mask=masks["formed_contact"],
+            release_mask=masks["release"],
+        )
+        contact_event = masks["approach"] | masks["formed_contact"]
+        weighted = confidence_np[:, contact_event]
+        records.append({
+            "sample_id": str(sample_id),
+            "relative_path": output_path.name,
+            "n_residues": n_res,
+            "contact_event_residues": int(contact_event.sum()),
+            "mean_contact_event_confidence": (
+                float(weighted.mean()) if weighted.size else 0.0
+            ),
+            "status": "written",
+        })
+    return records
+
+
 def main() -> None:
     args = parse_args()
     methods = parse_methods(args.methods)
@@ -635,6 +791,8 @@ def main() -> None:
         raise ValueError("--n_tau_grid must be >= 3")
     if float(args.tau_transition_weight) < 0.0:
         raise ValueError("--tau_transition_weight must be non-negative")
+    if args.phase_teacher_cache_dir and "freeflow_projected" not in methods:
+        raise ValueError("--phase_teacher_cache_dir requires freeflow_projected in --methods")
 
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
     ckpt, config, model, interaction_settings, stage1v2_settings = load_model_for_checkpoint(
@@ -680,6 +838,11 @@ def main() -> None:
     group_counts_total = defaultdict(int)
     total_batches = 0
     total_samples = 0
+    phase_teacher_records: List[Dict[str, object]] = []
+    phase_teacher_dir = None
+    if args.phase_teacher_cache_dir:
+        phase_teacher_dir = Path(args.phase_teacher_cache_dir)
+        phase_teacher_dir.mkdir(parents=True, exist_ok=True)
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(tqdm(loader, desc="Bridge time-warp", ncols=120)):
@@ -759,7 +922,7 @@ def main() -> None:
                 n_free_steps = int(args.n_free_flow_steps or n_steps)
                 if n_free_steps != n_steps:
                     raise ValueError("freeflow_projected currently requires n_free_flow_steps == n_path_steps")
-                tau = build_free_flow_projected_tau(
+                projection = build_free_flow_projection(
                     args,
                     free_model,
                     fk_module,
@@ -775,10 +938,21 @@ def main() -> None:
                     integration_clips,
                     finite,
                 )
+                tau = projection["tau"]
                 args.config = config
                 paths["freeflow_projected"] = build_tau_grid_path(
                     batch, rigids_apo, rigids_holo, tau, args.reference_bridge_mode
                 )
+                if phase_teacher_dir is not None:
+                    phase_teacher_records.extend(
+                        export_phase_teacher_batch(
+                            args,
+                            batch,
+                            projection,
+                            class_map,
+                            phase_teacher_dir,
+                        )
+                    )
 
             for method, path in paths.items():
                 stats, counts = evaluate_path(
@@ -830,8 +1004,18 @@ def main() -> None:
         "batches": total_batches,
         "samples": total_samples,
         "group_counts": dict(group_counts_total),
+        "phase_teacher_cache": {
+            "directory": str(phase_teacher_dir) if phase_teacher_dir else None,
+            "records": len(phase_teacher_records),
+            "written": sum(r["status"] == "written" for r in phase_teacher_records),
+        },
         "results": summaries,
     }
+    if phase_teacher_dir is not None:
+        manifest_path = phase_teacher_dir / "manifest.jsonl"
+        manifest_path.write_text(
+            "".join(json.dumps(record, sort_keys=True) + "\n" for record in phase_teacher_records)
+        )
     if args.output:
         out_path = Path(args.output)
         out_path.parent.mkdir(parents=True, exist_ok=True)

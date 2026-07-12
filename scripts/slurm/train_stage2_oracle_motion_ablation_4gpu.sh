@@ -95,6 +95,13 @@ TEACHER_RESIDUAL_T_MAX="${TEACHER_RESIDUAL_T_MAX:-0.92}"
 TEACHER_RESIDUAL_MASK_MODE="${TEACHER_RESIDUAL_MASK_MODE:-motion_active_or_pocket}"
 TEACHER_RESIDUAL_CLASH_WEIGHT_THRESHOLD="${TEACHER_RESIDUAL_CLASH_WEIGHT_THRESHOLD:-1e-4}"
 TEACHER_RESIDUAL_MISSING_POLICY="${TEACHER_RESIDUAL_MISSING_POLICY:-error}"
+PHASE_TEACHER_CACHE_DIR="${PHASE_TEACHER_CACHE_DIR:-}"
+W_PHASE_TEACHER="${W_PHASE_TEACHER:-0.0}"
+PHASE_TEACHER_LOSS_TYPE="${PHASE_TEACHER_LOSS_TYPE:-huber}"
+PHASE_TEACHER_HUBER_DELTA="${PHASE_TEACHER_HUBER_DELTA:-0.1}"
+PHASE_TEACHER_MASK_MODE="${PHASE_TEACHER_MASK_MODE:-contact_event}"
+PHASE_TEACHER_MIN_CONFIDENCE="${PHASE_TEACHER_MIN_CONFIDENCE:-0.05}"
+PHASE_TEACHER_MISSING_POLICY="${PHASE_TEACHER_MISSING_POLICY:-error}"
 ESM_FUSION_ENABLED="${ESM_FUSION_ENABLED:-0}"
 ESM_NUM_LAYERS="${ESM_NUM_LAYERS:-1}"
 ESM_FUSION_MODE="${ESM_FUSION_MODE:-sum}"
@@ -814,6 +821,17 @@ TEACHER_RESIDUAL_ARGS=(
 if [[ -n "$TEACHER_RESIDUAL_CACHE_DIR" ]]; then
   TEACHER_RESIDUAL_ARGS+=(--teacher_residual_cache_dir "$TEACHER_RESIDUAL_CACHE_DIR")
 fi
+PHASE_TEACHER_ARGS=(
+  --w_phase_teacher "$W_PHASE_TEACHER"
+  --phase_teacher_loss_type "$PHASE_TEACHER_LOSS_TYPE"
+  --phase_teacher_huber_delta "$PHASE_TEACHER_HUBER_DELTA"
+  --phase_teacher_mask_mode "$PHASE_TEACHER_MASK_MODE"
+  --phase_teacher_min_confidence "$PHASE_TEACHER_MIN_CONFIDENCE"
+  --phase_teacher_missing_policy "$PHASE_TEACHER_MISSING_POLICY"
+)
+if [[ -n "$PHASE_TEACHER_CACHE_DIR" ]]; then
+  PHASE_TEACHER_ARGS+=(--phase_teacher_cache_dir "$PHASE_TEACHER_CACHE_DIR")
+fi
 LENGTH_BUCKET_ARGS=()
 if [[ "$LENGTH_BUCKETED_TRAIN" == "1" ]]; then
   LENGTH_BUCKET_ARGS=(
@@ -890,6 +908,9 @@ echo "teacher t range: $TEACHER_RESIDUAL_T_MIN-$TEACHER_RESIDUAL_T_MAX"
 echo "teacher mask:    $TEACHER_RESIDUAL_MASK_MODE"
 echo "teacher cw thr:  $TEACHER_RESIDUAL_CLASH_WEIGHT_THRESHOLD"
 echo "teacher missing: $TEACHER_RESIDUAL_MISSING_POLICY"
+echo "phase teacher:   ${PHASE_TEACHER_CACHE_DIR:-OFF}"
+echo "w_phase_teacher: $W_PHASE_TEACHER"
+echo "phase teacher mask/conf: $PHASE_TEACHER_MASK_MODE/$PHASE_TEACHER_MIN_CONFIDENCE"
 echo "w_fm_chi:        $W_FM_CHI"
 echo "w_fm_rigid:      $W_FM_RIGID"
 echo "w_bg:            $W_BG"
@@ -972,6 +993,7 @@ python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA {torch.versio
   --phase_residual_min_tangent_norm "$PHASE_RESIDUAL_MIN_TANGENT_NORM" \
   --phase_residual_max_metric_norm "$PHASE_RESIDUAL_MAX_METRIC_NORM" \
   "${TEACHER_RESIDUAL_ARGS[@]}" \
+  "${PHASE_TEACHER_ARGS[@]}" \
   --val_split "$VAL_SPLIT" \
   --no_stage1_prior \
   --w_prior 0.0 \
