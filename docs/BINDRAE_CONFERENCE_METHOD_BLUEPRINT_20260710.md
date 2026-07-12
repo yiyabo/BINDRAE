@@ -635,7 +635,7 @@ The method claim should be weakened or abandoned if any of the following hold:
 | Local Cartesian-bridge tangent for normal projection | Implemented and tested |
 | Independent SE(3) reference-bridge ablation | Implemented |
 | Endpoint-only four-model screen | Completed; phase collapsed and full matched residual-only |
-| Confidence-weighted free-flow phase pseudo-teacher | Implemented as an experimental, non-MD lane |
+| Confidence-weighted free-flow phase pseudo-teacher | Tested; learnable but failed matched path evaluation |
 | Canonical full OracleMotion train cache | Re-export pending |
 | Controlled manifold benchmark | Not implemented |
 | Independent MD benchmark | Planned |
@@ -647,8 +647,8 @@ The method claim should be weakened or abandoned if any of the following hold:
 
 1. Keep residual-only as the endpoint-corpus reference after the failed
    endpoint-only phase-identification screen.
-2. Run a short confidence-weighted contact-event pseudo-teacher screen; report
-   it as distillation rather than trajectory supervision.
+2. Treat the completed pseudo-teacher experiment as a negative diagnostic; do
+   not tune it further without external timing evidence.
 3. Run the controlled manifold benchmark.
 4. Evaluate phase/event order on the independent MD benchmark.
 5. Freeze a deterministic APNB checkpoint only if supervised phase is

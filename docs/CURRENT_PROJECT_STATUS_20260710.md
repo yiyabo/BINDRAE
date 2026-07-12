@@ -23,17 +23,24 @@ It is not docking, apo-only holo prediction, or physical MD generation.
 
 ## Active Method
 
-Code parameterization:
+Validated endpoint-corpus baseline:
 
 ```text
 PATH_PARAMETERIZATION=phase_orthogonal_residual_v1
+PHASE_RESIDUAL_TAU_MODE=identity
+PHASE_RESIDUAL_BRIDGE_MODE=cartesian_backbone
 ```
 
-Manuscript working name:
+Research candidate retained for ground-truth path supervision:
 
 ```text
+PHASE_RESIDUAL_TAU_MODE=learned
 Asynchronous Phase-Normal Bridge (APNB)
 ```
+
+The learned-phase claim is currently unvalidated and must not be presented as
+an endpoint-only result. The normal-residual decomposition remains implemented;
+its scientific value must be judged against the synchronous Cartesian bridge.
 
 The path is
 
@@ -126,6 +133,14 @@ dynamics. The reported path MAE uses a linear apo-to-holo ligand-distance
 schedule as its reference. Consequently, free-flow phase labels are explicitly
 marked as pseudo-teacher targets and restricted to confidence-weighted contact
 events. Independent MD paths remain mandatory for scientific timing claims.
+
+The subsequent learnability and matched-path experiments are complete; see
+`PHASE_TEACHER_DIAGNOSTIC_20260712.md`. The phase target was learnable in a
+head-only setting (`0.1324` to `0.1087` validation tau MAE, lower is better),
+but did not improve matched path MAE over the synchronous Cartesian bridge on
+either the original 128-system validation set or the 14-system enriched set.
+The pseudo-teacher lane is therefore closed as a negative result rather than
+promoted to the active paper method.
 
 ## Deterministic Experiment Gate
 
@@ -223,13 +238,12 @@ Non-claims:
 
 ## Immediate Work Queue
 
-1. Export and smoke-test `phase_teacher_v1` caches on a small matched subset.
-2. Run a short residual-only versus confidence-weighted phase-teacher screen.
-3. Treat the pseudo-teacher lane as an ablation unless independent MD timing
-   confirms its event ordering.
-4. Build a controlled manifold benchmark with known path truth.
-5. Build the independent MD transition benchmark.
-6. Freeze the deterministic method before implementing stochastic multipath.
+1. Keep the synchronous Cartesian bridge and controlled normal residual as the
+   endpoint-corpus baselines.
+2. Build a controlled manifold benchmark with known path truth.
+3. Build the independent MD transition benchmark.
+4. Re-open learned phase only with ground-truth event/progress supervision.
+5. Freeze the deterministic method before implementing stochastic multipath.
 
 ## Repository Posture
 
