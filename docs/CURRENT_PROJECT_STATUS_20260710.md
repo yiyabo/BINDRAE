@@ -1,10 +1,12 @@
 # Current Project Status
 
-Date: 2026-07-12
+Date: 2026-07-13
 
 This is the operational source of truth for the current BINDRAE research track.
 For the method and manuscript logic, read
 `BINDRAE_CONFERENCE_METHOD_BLUEPRINT_20260710.md` first.
+For trajectory acquisition, evidence tiers, manifest fields, and the cluster MD
+pilot, read `MD_TRANSITION_CORPUS_PLAN_20260713.md`.
 
 ## Current Objective
 
@@ -240,10 +242,14 @@ Non-claims:
 
 1. Keep the synchronous Cartesian bridge and controlled normal residual as the
    endpoint-corpus baselines.
-2. Build a controlled manifold benchmark with known path truth.
-3. Build the independent MD transition benchmark.
-4. Re-open learned phase only with ground-truth event/progress supervision.
-5. Freeze the deterministic method before implementing stochastic multipath.
+2. Build the canonical MD-transition manifest and public-source metadata audit.
+3. Build a controlled manifold benchmark with known path truth.
+4. Obtain safe scratch allocation for MD trajectories; the installed 4.7-GB
+   `BINDRAE-MD` environment passed A100 CUDA smoke job `141483`, but the shared
+   GPFS remains 99% full.
+5. Build the independent MD transition benchmark and the 8-16-system MD pilot.
+6. Re-open learned phase only with ground-truth event/progress supervision.
+7. Freeze the deterministic method before implementing stochastic multipath.
 
 ## Repository Posture
 

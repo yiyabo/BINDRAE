@@ -1,0 +1,23 @@
+name: BINDRAE-MD
+
+channels:
+  - conda-forge
+
+dependencies:
+  - python=3.11
+  - cuda-version=12.4
+  - openmm
+  - pdbfixer
+  - openff-toolkit-base
+  - openff-interchange-base
+  - openmmforcefields
+  - ambertools
+  - rdkit
+  - parmed
+  - mdtraj
+  - mdanalysis
+  - h5py
+  - numpy
+  - pandas
+  - pyyaml
+  - scipy
