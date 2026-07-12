@@ -553,6 +553,10 @@ class Stage2Trainer:
             raise ValueError(
                 "phase teacher distillation requires phase_orthogonal_residual_v1"
             )
+        if config.phase_teacher_head_only and config.w_phase_teacher <= 0.0:
+            raise ValueError(
+                "phase_teacher_head_only requires w_phase_teacher > 0"
+            )
         allowed_projection_schedules = {'smoothstep', 'smootherstep', 'late_smoother', 'quadratic'}
         if config.terminal_projection_schedule not in allowed_projection_schedules:
             raise ValueError(
@@ -699,6 +703,21 @@ class Stage2Trainer:
             self._init_model_from_checkpoint(config.init_from_checkpoint)
         elif config.init_from_checkpoint and self.is_main_process:
             print("[Init] Skipping init_from_checkpoint because this run will resume from its own checkpoint")
+        if config.phase_teacher_head_only:
+            for name, parameter in self.model.named_parameters():
+                parameter.requires_grad_(name.startswith('time_warp_head.'))
+            trainable = sum(
+                parameter.numel()
+                for parameter in self.model.parameters()
+                if parameter.requires_grad
+            )
+            if trainable <= 0:
+                raise RuntimeError("phase_teacher_head_only left no trainable parameters")
+            if self.is_main_process:
+                print(
+                    "[PhaseTeacher] Head-only diagnostic: "
+                    f"{trainable:,} trainable time-warp parameters"
+                )
 
         # Stage-1 prior model
         self.stage1_model = None
@@ -4216,6 +4235,7 @@ class Stage2Trainer:
             'phase_teacher_mask_mode',
             'phase_teacher_min_confidence',
             'phase_teacher_missing_policy',
+            'phase_teacher_head_only',
             'w_smooth',
             'w_clash',
             'w_pep',
@@ -4253,6 +4273,7 @@ class Stage2Trainer:
             'phase_teacher_mask_mode': 'contact_event',
             'phase_teacher_min_confidence': 0.05,
             'phase_teacher_missing_policy': 'error',
+            'phase_teacher_head_only': False,
         }
         for field in strict_fields:
             old = self._config_value(ckpt_config, field)
