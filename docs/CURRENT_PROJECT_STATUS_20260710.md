@@ -53,6 +53,8 @@ Implemented properties:
 - residual magnitude, temporal, neighbor, and background controls;
 - atom14 endpoint-consistent FK decoding;
 - evaluator support for deterministic component ablations.
+- Cartesian `N/CA/C` endpoint bridge with locally differentiated tangents;
+- reproducible `se3_geodesic` reference-bridge ablation.
 
 ## What Has Been Validated
 
@@ -80,6 +82,21 @@ Job `140898` completed the matching transition-path evaluator smoke.
 These results establish implementation correctness only. They do not establish
 scientific superiority.
 
+### Backbone bridge correction (2026-07-12)
+
+The original independent per-residue SE(3) bridge had a severe heavy-tailed
+peptide-geometry failure. On a matched random-128 diagnostic, replacing it with
+the Cartesian backbone-triplet bridge improved pocket path MAE from 0.2467 to
+0.2107 and active path MAE from 0.8037 to 0.6898, while reducing maximum
+interior peptide loss from 1344.20 to 0.423.
+
+Four-GPU smoke job `141403` then validated the bridge inside the trainable APNB
+model. Relative to the matched old-bridge smoke, validation interior peptide
+mean fell from 31.41 to 0.0147, p95 from 0.348 to 0.0247, and maximum from
+1972.00 to 0.378. Contact direction accuracy remained 0.8125. Jobs `141404`,
+`141405`, and `141406` are the matched warp-only, residual-only, and full APNB
+three-epoch screen; the synchronous Cartesian bridge needs no training.
+
 ## Deterministic Experiment Gate
 
 Before full training, run the following on exactly matched data and compute:
@@ -90,6 +107,9 @@ Before full training, run the following on exactly matched data and compute:
 | Warp-only | learned | off |
 | Residual-only | identity | normal residual |
 | Full APNB | learned | normal residual |
+
+All four variants now use `phase_residual_bridge_mode=cartesian_backbone`.
+`se3_geodesic` is retained as a separate reference-bridge ablation.
 
 The full method advances only if it beats both learned single-component models
 and preserves controlled residual magnitude.

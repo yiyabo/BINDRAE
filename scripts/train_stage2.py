@@ -93,6 +93,10 @@ def parse_args():
     parser.add_argument('--phase_residual_tau_mode', type=str, default='learned',
                         choices=['learned', 'identity'],
                         help='Use learned residue phase or synchronous identity phase')
+    parser.add_argument('--phase_residual_bridge_mode', type=str,
+                        default='se3_geodesic',
+                        choices=['se3_geodesic', 'cartesian_backbone'],
+                        help='Reference backbone bridge used by the phase model')
     parser.add_argument('--phase_residual_envelope', type=str, default='poly',
                         choices=['poly', 'sin2'],
                         help='Endpoint-zero envelope for phase residuals')
@@ -402,6 +406,7 @@ def main():
         time_warp_rate_eps=args.time_warp_rate_eps,
         time_warp_rate_clip=args.time_warp_rate_clip,
         phase_residual_tau_mode=args.phase_residual_tau_mode,
+        phase_residual_bridge_mode=args.phase_residual_bridge_mode,
         phase_residual_envelope=args.phase_residual_envelope,
         phase_residual_scale=args.phase_residual_scale,
         phase_residual_rotation_metric_scale=args.phase_residual_rotation_metric_scale,
@@ -596,6 +601,7 @@ def main():
     print(f"  - time_warp_rate_eps: {config.time_warp_rate_eps}")
     print(f"  - time_warp_rate_clip: {config.time_warp_rate_clip}")
     print(f"  - phase_residual_tau_mode: {config.phase_residual_tau_mode}")
+    print(f"  - phase_residual_bridge_mode: {config.phase_residual_bridge_mode}")
     print(f"  - phase_residual_envelope: {config.phase_residual_envelope}")
     print(f"  - phase_residual_scale: {config.phase_residual_scale}")
     print(f"  - phase_residual_metric_scales: rot={config.phase_residual_rotation_metric_scale} trans={config.phase_residual_translation_metric_scale} chi={config.phase_residual_chi_metric_scale}")

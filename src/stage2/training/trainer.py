@@ -432,6 +432,13 @@ class Stage2Trainer:
             raise ValueError(
                 f"Unsupported phase_residual_tau_mode={config.phase_residual_tau_mode}"
             )
+        if config.phase_residual_bridge_mode not in {
+            'se3_geodesic', 'cartesian_backbone'
+        }:
+            raise ValueError(
+                "Unsupported phase_residual_bridge_mode="
+                f"{config.phase_residual_bridge_mode}"
+            )
         if config.phase_residual_envelope not in {'poly', 'sin2'}:
             raise ValueError(
                 f"Unsupported phase_residual_envelope={config.phase_residual_envelope}"
@@ -1610,6 +1617,24 @@ class Stage2Trainer:
         rigids_holo = self._build_rigids_from_backbone(
             batch.N_holo, batch.Ca_holo, batch.C_holo, batch.node_mask
         )
+        if (
+            self.config.path_parameterization == 'phase_orthogonal_residual_v1'
+            and self.config.phase_residual_bridge_mode == 'cartesian_backbone'
+        ):
+            tau = t.view(-1, 1).expand_as(batch.node_mask)
+            rigids_ref, chi_ref = self._phase_interpolate_endpoints_tensor(
+                batch, rigids_apo, rigids_holo, tau
+            )
+            zero_rigid_velocity = torch.zeros_like(batch.Ca_apo)
+            return (
+                chi_ref,
+                rigids_ref,
+                d_chi_ref.clamp(min=-5.0, max=5.0),
+                zero_rigid_velocity,
+                zero_rigid_velocity,
+                rigids_apo,
+                rigids_holo,
+            )
         R0, t0 = self._rigid_to_rt(rigids_apo)
         R1, t1 = self._rigid_to_rt(rigids_holo)
 
@@ -1623,7 +1648,6 @@ class Stage2Trainer:
         R_inc, t_inc = se3_exp(xi_t)
         R_t, t_t = rigid_compose(R0, t0, R_inc, t_inc)
         rigids_ref = self._rt_to_rigid(R_t, t_t)
-
         d_rot_ref = xi[..., :3] * dgamma
         d_trans_ref = xi[..., 3:] * dgamma
 
@@ -1682,6 +1706,78 @@ class Stage2Trainer:
         R_t, trans_t = rigid_compose(R0, t0, R_inc, t_inc)
         return self._rt_to_rigid(R_t, trans_t), chi_t
 
+    def _phase_interpolate_endpoints_tensor(
+        self,
+        batch,
+        rigids_apo: Rigid,
+        rigids_holo: Rigid,
+        tau: torch.Tensor,
+    ) -> Tuple[Rigid, torch.Tensor]:
+        """Interpolate the configured phase-model reference bridge."""
+        if self.config.phase_residual_bridge_mode == 'se3_geodesic':
+            return self._interpolate_endpoints_tensor(
+                batch, rigids_apo, rigids_holo, tau
+            )
+        if tau.ndim != 2:
+            raise ValueError(f"tau must have shape [B, N], got {tuple(tau.shape)}")
+        tau = tau.float().clamp(0.0, 1.0)
+        gamma = 3.0 * tau * tau - 2.0 * tau * tau * tau
+        gamma_coord = gamma.unsqueeze(-1)
+        n_coord = (1.0 - gamma_coord) * batch.N_apo + gamma_coord * batch.N_holo
+        ca_coord = (
+            (1.0 - gamma_coord) * batch.Ca_apo + gamma_coord * batch.Ca_holo
+        )
+        c_coord = (1.0 - gamma_coord) * batch.C_apo + gamma_coord * batch.C_holo
+        rigids_t = self._build_rigids_from_backbone(
+            n_coord, ca_coord, c_coord, batch.node_mask
+        )
+        chi0 = batch.torsion_apo[..., 3:7]
+        chi1 = batch.torsion_holo[..., 3:7]
+        chi_t = wrap_to_pi(
+            chi0 + gamma_coord * wrap_to_pi(chi1 - chi0)
+        )
+        return rigids_t, chi_t
+
+    def _phase_bridge_tangent(
+        self,
+        batch,
+        rigids_apo: Rigid,
+        rigids_holo: Rigid,
+        tau: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return the local body-frame tangent of the configured bridge."""
+        if self.config.phase_residual_bridge_mode == 'se3_geodesic':
+            R0, trans0 = self._rigid_to_rt(rigids_apo)
+            R1, trans1 = self._rigid_to_rt(rigids_holo)
+            R0_inv, trans0_inv = rigid_inverse(R0, trans0)
+            R_delta, trans_delta = rigid_compose(
+                R0_inv, trans0_inv, R1, trans1
+            )
+            return se3_log(R_delta, trans_delta)
+
+        epsilon = 1e-3
+        tau_low = (tau - epsilon).clamp(0.0, 1.0)
+        tau_high = (tau + epsilon).clamp(0.0, 1.0)
+        low_rigids, _ = self._phase_interpolate_endpoints_tensor(
+            batch, rigids_apo, rigids_holo, tau_low
+        )
+        high_rigids, _ = self._phase_interpolate_endpoints_tensor(
+            batch, rigids_apo, rigids_holo, tau_high
+        )
+        low_rotation, low_translation = self._rigid_to_rt(low_rigids)
+        high_rotation, high_translation = self._rigid_to_rt(high_rigids)
+        low_inverse_rotation, low_inverse_translation = rigid_inverse(
+            low_rotation, low_translation
+        )
+        delta_rotation, delta_translation = rigid_compose(
+            low_inverse_rotation,
+            low_inverse_translation,
+            high_rotation,
+            high_translation,
+        )
+        denominator = (tau_high - tau_low).unsqueeze(-1).clamp_min(1e-6)
+        return se3_log(delta_rotation, delta_translation) / denominator
+
     @staticmethod
     def _interpolate_backbone_torsions(batch, t_value: float) -> torch.Tensor:
         """Decode-only bridge for backbone torsions required by OpenFoldFK."""
@@ -1718,11 +1814,11 @@ class Stage2Trainer:
 
         for k in range(n_steps):
             t_mid = (k + 0.5) / n_steps
-            mid_rigids, mid_chi = self._interpolate_endpoints(
-                batch,
-                rigids_apo,
-                rigids_holo,
-                t_mid,
+            mid_tau = torch.full(
+                (bsz, n_res), t_mid, dtype=torch.float32, device=self.device
+            )
+            mid_rigids, mid_chi = self._phase_interpolate_endpoints_tensor(
+                batch, rigids_apo, rigids_holo, mid_tau
             )
             t_tensor = torch.full((bsz,), t_mid, device=device)
             out = self._model_forward(
@@ -1964,11 +2060,6 @@ class Stage2Trainer:
             esm_gate_context=esm_gate_context,
         )
 
-        R0, trans0 = self._rigid_to_rt(rigids_apo)
-        R1, trans1 = self._rigid_to_rt(rigids_holo)
-        R0_inv, trans0_inv = rigid_inverse(R0, trans0)
-        R_delta, trans_delta = rigid_compose(R0_inv, trans0_inv, R1, trans1)
-        bridge_tangent_rigid = se3_log(R_delta, trans_delta)
         bridge_tangent_chi = wrap_to_pi(
             batch.torsion_holo[..., 3:7] - batch.torsion_apo[..., 3:7]
         )
@@ -1985,11 +2076,14 @@ class Stage2Trainer:
                 tau_values[k],
                 torch.full_like(tau_values[k], t_value),
             )
-            bridge_rigids, bridge_chi = self._interpolate_endpoints_tensor(
+            bridge_rigids, bridge_chi = self._phase_interpolate_endpoints_tensor(
                 batch,
                 rigids_apo,
                 rigids_holo,
                 tau,
+            )
+            bridge_tangent_rigid = self._phase_bridge_tangent(
+                batch, rigids_apo, rigids_holo, tau
             )
             out = self._model_forward(
                 chi=bridge_chi,
@@ -3892,6 +3986,7 @@ class Stage2Trainer:
             'time_warp_rate_eps',
             'time_warp_rate_clip',
             'phase_residual_tau_mode',
+            'phase_residual_bridge_mode',
             'phase_residual_envelope',
             'phase_residual_scale',
             'phase_residual_rotation_metric_scale',
@@ -3927,6 +4022,7 @@ class Stage2Trainer:
             'time_warp_rate_eps': 1e-3,
             'time_warp_rate_clip': 10.0,
             'phase_residual_tau_mode': 'learned',
+            'phase_residual_bridge_mode': 'se3_geodesic',
             'phase_residual_envelope': 'poly',
             'phase_residual_scale': 1.0,
             'phase_residual_rotation_metric_scale': 1.0,

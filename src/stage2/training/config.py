@@ -115,6 +115,7 @@ class TrainingConfig:
     time_warp_rate_eps: float = 1e-3
     time_warp_rate_clip: float = 10.0
     phase_residual_tau_mode: str = "learned"  # learned | identity
+    phase_residual_bridge_mode: str = "se3_geodesic"  # se3_geodesic | cartesian_backbone
     phase_residual_envelope: str = "poly"  # poly | sin2
     phase_residual_scale: float = 1.0
     phase_residual_rotation_metric_scale: float = 1.0

@@ -72,6 +72,7 @@ class PhaseResidualPathTest(unittest.TestCase):
         trainer.config = SimpleNamespace(
             n_integration_steps=4,
             phase_residual_tau_mode=tau_mode,
+            phase_residual_bridge_mode="se3_geodesic",
             time_warp_logit_scale=1.0,
             time_warp_rate_eps=1e-3,
             time_warp_rate_clip=10.0,
@@ -91,6 +92,16 @@ class PhaseResidualPathTest(unittest.TestCase):
         torsion_apo = torch.zeros(batch_size, n_res, 7)
         torsion_holo = torsion_apo.clone()
         torsion_holo[..., 3] = torch.tensor([0.4, 0.2, 0.0])
+        ca_apo = torch.tensor(
+            [[[0.0, 0.0, 0.0], [3.8, 0.0, 0.0], [7.6, 0.0, 0.0]]]
+        )
+        n_apo = ca_apo + torch.tensor([-1.2, 0.5, 0.0])
+        c_apo = ca_apo + torch.tensor([1.3, 0.0, 0.0])
+        ca_holo = torch.tensor(
+            [[[0.0, 0.0, 0.0], [3.6, 0.6, 0.0], [7.0, 1.5, 0.2]]]
+        )
+        n_holo = ca_holo + torch.tensor([-1.1, 0.6, 0.1])
+        c_holo = ca_holo + torch.tensor([1.25, -0.1, 0.0])
         return SimpleNamespace(
             node_mask=torch.ones(batch_size, n_res, dtype=torch.bool),
             peptide_bond_mask=torch.ones(batch_size, n_res - 1, dtype=torch.bool),
@@ -103,6 +114,12 @@ class PhaseResidualPathTest(unittest.TestCase):
             lig_mask=torch.ones(batch_size, 1, dtype=torch.bool),
             w_res=torch.tensor([[1.0, 0.5, 0.0]]),
             nma_features=None,
+            N_apo=n_apo,
+            Ca_apo=ca_apo,
+            C_apo=c_apo,
+            N_holo=n_holo,
+            Ca_holo=ca_holo,
+            C_holo=c_holo,
         )
 
     def test_identity_phase_path_has_exact_endpoints_and_off_bridge_motion(self):
@@ -182,6 +199,28 @@ class PhaseResidualPathTest(unittest.TestCase):
                 torch.allclose(rigid_t.get_trans(), expected_rigid.get_trans(), atol=1e-7)
             )
             self.assertTrue(torch.allclose(chi_t, expected_chi, atol=1e-7))
+
+    def test_cartesian_bridge_rebuilds_frames_from_backbone_triplets(self):
+        trainer = self._trainer("identity")
+        trainer.config.phase_residual_bridge_mode = "cartesian_backbone"
+        trainer.model = _ZeroPhaseResidualModel()
+        batch = self._batch()
+        rigids_apo = trainer._build_rigids_from_backbone(
+            batch.N_apo, batch.Ca_apo, batch.C_apo, batch.node_mask
+        )
+        rigids_holo = trainer._build_rigids_from_backbone(
+            batch.N_holo, batch.Ca_holo, batch.C_holo, batch.node_mask
+        )
+        rigids, _, times = trainer.phase_orthogonal_residual_path(
+            batch, rigids_apo, rigids_holo
+        )
+        self.assertEqual(times, [0.0, 0.25, 0.5, 0.75, 1.0])
+        expected_mid_ca = 0.5 * (batch.Ca_apo + batch.Ca_holo)
+        self.assertTrue(
+            torch.allclose(rigids[2].get_trans(), expected_mid_ca, atol=1e-6)
+        )
+        self.assertTrue(torch.equal(rigids[0].get_trans(), batch.Ca_apo))
+        self.assertTrue(torch.equal(rigids[-1].get_trans(), batch.Ca_holo))
 
 
 if __name__ == "__main__":

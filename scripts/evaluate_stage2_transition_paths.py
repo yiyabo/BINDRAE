@@ -112,6 +112,11 @@ def parse_args() -> argparse.Namespace:
         choices=["learned", "identity"],
     )
     parser.add_argument(
+        "--phase_residual_bridge_mode",
+        default=None,
+        choices=["se3_geodesic", "cartesian_backbone"],
+    )
+    parser.add_argument(
         "--phase_residual_envelope",
         default=None,
         choices=["poly", "sin2"],
@@ -582,6 +587,74 @@ def interpolate_endpoints_tensor(
     return rt_to_rigid(R_t, trans_t), chi_t
 
 
+def phase_interpolate_endpoints_tensor(
+    batch,
+    rigids_apo: Rigid,
+    rigids_holo: Rigid,
+    tau: torch.Tensor,
+    bridge_mode: str,
+) -> Tuple[Rigid, torch.Tensor]:
+    if bridge_mode == "se3_geodesic":
+        return interpolate_endpoints_tensor(batch, rigids_apo, rigids_holo, tau)
+    if bridge_mode != "cartesian_backbone":
+        raise ValueError(f"Unsupported phase residual bridge_mode={bridge_mode}")
+    if tau.ndim != 2:
+        raise ValueError(f"tau must have shape [B, N], got {tuple(tau.shape)}")
+    tau = tau.float().clamp(0.0, 1.0)
+    gamma = 3.0 * tau * tau - 2.0 * tau * tau * tau
+    gamma_coord = gamma.unsqueeze(-1)
+    n_coord = (1.0 - gamma_coord) * batch.N_apo + gamma_coord * batch.N_holo
+    ca_coord = (1.0 - gamma_coord) * batch.Ca_apo + gamma_coord * batch.Ca_holo
+    c_coord = (1.0 - gamma_coord) * batch.C_apo + gamma_coord * batch.C_holo
+    rigids_t = build_rigids_from_backbone(
+        n_coord, ca_coord, c_coord, batch.node_mask
+    )
+    chi0 = batch.torsion_apo[..., 3:7]
+    chi1 = batch.torsion_holo[..., 3:7]
+    chi_t = wrap_to_pi(
+        chi0 + gamma_coord * wrap_to_pi(chi1 - chi0)
+    )
+    return rigids_t, chi_t
+
+
+def phase_bridge_tangent(
+    batch,
+    rigids_apo: Rigid,
+    rigids_holo: Rigid,
+    tau: torch.Tensor,
+    bridge_mode: str,
+) -> torch.Tensor:
+    if bridge_mode == "se3_geodesic":
+        R0, trans0 = rigid_to_rt(rigids_apo)
+        R1, trans1 = rigid_to_rt(rigids_holo)
+        R0_inv, trans0_inv = rigid_inverse(R0, trans0)
+        R_delta, trans_delta = rigid_compose(R0_inv, trans0_inv, R1, trans1)
+        return se3_log(R_delta, trans_delta)
+
+    epsilon = 1e-3
+    tau_low = (tau - epsilon).clamp(0.0, 1.0)
+    tau_high = (tau + epsilon).clamp(0.0, 1.0)
+    low_rigids, _ = phase_interpolate_endpoints_tensor(
+        batch, rigids_apo, rigids_holo, tau_low, bridge_mode
+    )
+    high_rigids, _ = phase_interpolate_endpoints_tensor(
+        batch, rigids_apo, rigids_holo, tau_high, bridge_mode
+    )
+    low_rotation, low_translation = rigid_to_rt(low_rigids)
+    high_rotation, high_translation = rigid_to_rt(high_rigids)
+    low_inverse_rotation, low_inverse_translation = rigid_inverse(
+        low_rotation, low_translation
+    )
+    delta_rotation, delta_translation = rigid_compose(
+        low_inverse_rotation,
+        low_inverse_translation,
+        high_rotation,
+        high_translation,
+    )
+    denominator = (tau_high - tau_low).unsqueeze(-1).clamp_min(1e-6)
+    return se3_log(delta_rotation, delta_translation) / denominator
+
+
 def min_sc_ligand_dist(
     atom14_pos: torch.Tensor,
     atom14_mask: torch.Tensor,
@@ -850,6 +923,7 @@ def phase_orthogonal_residual_path(
     esm_gate_context: Optional[torch.Tensor],
     *,
     tau_mode: str,
+    bridge_mode: str,
     logit_scale: float,
     rate_eps: float,
     rate_clip: float,
@@ -884,11 +958,11 @@ def phase_orthogonal_residual_path(
         rates: List[torch.Tensor] = []
         for k in range(n_steps):
             t_mid = (k + 0.5) / n_steps
-            mid_rigids, mid_chi = interpolate_endpoints(
-                batch,
-                rigids_apo,
-                rigids_holo,
-                t_mid,
+            mid_tau = torch.full(
+                (bsz, n_res), t_mid, dtype=torch.float32, device=device
+            )
+            mid_rigids, mid_chi = phase_interpolate_endpoints_tensor(
+                batch, rigids_apo, rigids_holo, mid_tau, bridge_mode
             )
             out = model(
                 chi=mid_chi,
@@ -922,11 +996,6 @@ def phase_orthogonal_residual_path(
     else:
         raise ValueError(f"Unsupported phase residual tau_mode={tau_mode}")
 
-    R0, trans0 = rigid_to_rt(rigids_apo)
-    R1, trans1 = rigid_to_rt(rigids_holo)
-    R0_inv, trans0_inv = rigid_inverse(R0, trans0)
-    R_delta, trans_delta = rigid_compose(R0_inv, trans0_inv, R1, trans1)
-    bridge_tangent_rigid = se3_log(R_delta, trans_delta)
     bridge_tangent_chi = wrap_to_pi(
         batch.torsion_holo[..., 3:7] - batch.torsion_apo[..., 3:7]
     )
@@ -941,11 +1010,15 @@ def phase_orthogonal_residual_path(
             tau_values[k],
             torch.full_like(tau_values[k], t_value),
         )
-        bridge_rigids, bridge_chi = interpolate_endpoints_tensor(
+        bridge_rigids, bridge_chi = phase_interpolate_endpoints_tensor(
             batch,
             rigids_apo,
             rigids_holo,
             tau,
+            bridge_mode,
+        )
+        bridge_tangent_rigid = phase_bridge_tangent(
+            batch, rigids_apo, rigids_holo, tau, bridge_mode
         )
         out = model(
             chi=bridge_chi,
@@ -1407,6 +1480,9 @@ def construct_path(
                 interaction_prior=interaction_prior,
                 esm_gate_context=esm_gate_context,
                 tau_mode=str(resolve_value("phase_residual_tau_mode", "learned")),
+                bridge_mode=str(
+                    resolve_value("phase_residual_bridge_mode", "se3_geodesic")
+                ),
                 logit_scale=float(resolve_value("time_warp_logit_scale", 1.0)),
                 rate_eps=float(resolve_value("time_warp_rate_eps", 1e-3)),
                 rate_clip=float(resolve_value("time_warp_rate_clip", 10.0)),
@@ -2045,6 +2121,11 @@ def main() -> None:
             args.phase_residual_tau_mode
             if args.phase_residual_tau_mode is not None
             else getattr(config, "phase_residual_tau_mode", None)
+        ),
+        "phase_residual_bridge_mode": (
+            args.phase_residual_bridge_mode
+            if args.phase_residual_bridge_mode is not None
+            else getattr(config, "phase_residual_bridge_mode", "se3_geodesic")
         ),
         "phase_residual_envelope": (
             args.phase_residual_envelope

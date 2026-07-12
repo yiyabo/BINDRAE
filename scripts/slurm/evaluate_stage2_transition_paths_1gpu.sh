@@ -43,6 +43,7 @@ TIME_WARP_LOGIT_SCALE="${TIME_WARP_LOGIT_SCALE:-}"
 TIME_WARP_RATE_EPS="${TIME_WARP_RATE_EPS:-}"
 TIME_WARP_RATE_CLIP="${TIME_WARP_RATE_CLIP:-}"
 PHASE_RESIDUAL_TAU_MODE="${PHASE_RESIDUAL_TAU_MODE:-}"
+PHASE_RESIDUAL_BRIDGE_MODE="${PHASE_RESIDUAL_BRIDGE_MODE:-}"
 PHASE_RESIDUAL_ENVELOPE="${PHASE_RESIDUAL_ENVELOPE:-}"
 PHASE_RESIDUAL_SCALE="${PHASE_RESIDUAL_SCALE:-}"
 PHASE_RESIDUAL_MAX_METRIC_NORM="${PHASE_RESIDUAL_MAX_METRIC_NORM:-}"
@@ -114,6 +115,15 @@ if [[ -n "$PHASE_RESIDUAL_TAU_MODE" ]]; then
       ;;
   esac
 fi
+if [[ -n "$PHASE_RESIDUAL_BRIDGE_MODE" ]]; then
+  case "$PHASE_RESIDUAL_BRIDGE_MODE" in
+    se3_geodesic|cartesian_backbone) ;;
+    *)
+      echo "ERROR: PHASE_RESIDUAL_BRIDGE_MODE must be se3_geodesic or cartesian_backbone"
+      exit 1
+      ;;
+  esac
+fi
 if [[ -n "$PHASE_RESIDUAL_ENVELOPE" ]]; then
   case "$PHASE_RESIDUAL_ENVELOPE" in
     poly|sin2) ;;
@@ -171,6 +181,7 @@ echo "Timewarp logit:    ${TIME_WARP_LOGIT_SCALE:-checkpoint_default}"
 echo "Timewarp eps:      ${TIME_WARP_RATE_EPS:-checkpoint_default}"
 echo "Timewarp clip:     ${TIME_WARP_RATE_CLIP:-checkpoint_default}"
 echo "Phase tau mode:    ${PHASE_RESIDUAL_TAU_MODE:-checkpoint_default}"
+echo "Phase bridge mode: ${PHASE_RESIDUAL_BRIDGE_MODE:-checkpoint_default}"
 echo "Phase envelope:    ${PHASE_RESIDUAL_ENVELOPE:-checkpoint_default}"
 echo "Phase scale:       ${PHASE_RESIDUAL_SCALE:-checkpoint_default}"
 echo "Phase max norm:    ${PHASE_RESIDUAL_MAX_METRIC_NORM:-checkpoint_default}"
@@ -248,6 +259,9 @@ if [[ -n "$TIME_WARP_RATE_CLIP" ]]; then
 fi
 if [[ -n "$PHASE_RESIDUAL_TAU_MODE" ]]; then
   ARGS+=(--phase_residual_tau_mode "$PHASE_RESIDUAL_TAU_MODE")
+fi
+if [[ -n "$PHASE_RESIDUAL_BRIDGE_MODE" ]]; then
+  ARGS+=(--phase_residual_bridge_mode "$PHASE_RESIDUAL_BRIDGE_MODE")
 fi
 if [[ -n "$PHASE_RESIDUAL_ENVELOPE" ]]; then
   ARGS+=(--phase_residual_envelope "$PHASE_RESIDUAL_ENVELOPE")

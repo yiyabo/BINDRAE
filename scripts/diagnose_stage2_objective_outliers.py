@@ -48,6 +48,11 @@ def parse_args():
         choices=["learned", "identity"],
         default=None,
     )
+    parser.add_argument(
+        "--phase_residual_bridge_mode",
+        choices=["se3_geodesic", "cartesian_backbone"],
+        default=None,
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--output", required=True)
     return parser.parse_args()
@@ -90,6 +95,8 @@ def main():
     config.max_epochs = 0
     config.save_dir = str(Path(args.output).parent / ".objective_outlier_tmp_ckpt")
     config.log_dir = str(Path(args.output).parent / ".objective_outlier_tmp_log")
+    if not hasattr(config, "phase_residual_bridge_mode"):
+        config.phase_residual_bridge_mode = "se3_geodesic"
     if args.valid_samples_file:
         config.val_samples_file = args.valid_samples_file
         config.trust_prechecked_samples = True
@@ -99,6 +106,8 @@ def main():
         config.phase_residual_scale = float(args.phase_residual_scale)
     if args.phase_residual_tau_mode is not None:
         config.phase_residual_tau_mode = args.phase_residual_tau_mode
+    if args.phase_residual_bridge_mode is not None:
+        config.phase_residual_bridge_mode = args.phase_residual_bridge_mode
 
     trainer = Stage2Trainer(config)
     trainer.model.eval()
@@ -136,6 +145,7 @@ def main():
         "valid_samples_file": config.val_samples_file,
         "phase_residual_scale": config.phase_residual_scale,
         "phase_residual_tau_mode": config.phase_residual_tau_mode,
+        "phase_residual_bridge_mode": config.phase_residual_bridge_mode,
         "samples": len(records),
         "summary": summarize(records),
         "top_objective_pep": records[: int(args.top_k)],

@@ -118,15 +118,25 @@ paper must center the path parameterization, not feature fusion.
 
 ### Reference endpoint bridge
 
-For each residue, let
+For each residue, first interpolate the endpoint backbone triplet:
+
+\[
+N_i(u)=(1-s(u))N_i^A+s(u)N_i^H,
+\]
+
+with the same expression for `CA_i(u)` and `C_i(u)`, where
+`s(u)=3u^2-2u^3`. Rebuild the residue frame from the interpolated triplet and
+combine it with wrapped chi interpolation. This defines
 
 \[
 \gamma_i:[0,1]\rightarrow
 \mathrm{SE}(3)\times\mathbb T^{k_i}
 \]
 
-be an analytic endpoint bridge from apo to holo. Rigid frames use Lie-group
-interpolation and chi angles use wrapped shortest-arc interpolation.
+from apo to holo. Explicit endpoint insertion preserves the experimental
+boundaries exactly. Independent per-residue Lie-group interpolation is retained
+as an ablation; it produced severe heavy-tailed peptide breaks because adjacent
+frame rotations were interpolated independently.
 
 The synchronous baseline is simply `x_i(t)=gamma_i(t)`.
 
@@ -159,7 +169,7 @@ still complete the endpoint transition.
 
 ### Product-manifold tangent-normal decomposition
 
-Let `v_i` be the endpoint-bridge tangent in the local product tangent space
+Let `v_i(u)` be the local endpoint-bridge tangent in the product tangent space
 
 \[
 T_{\gamma_i}\mathcal M_i
@@ -176,6 +186,10 @@ the along-bridge component is removed:
 \frac{\langle\Delta_i,v_i\rangle_g}
      {\langle v_i,v_i\rangle_g}v_i.
 \]
+
+For the Cartesian backbone bridge, the rigid tangent is evaluated from a local
+central difference of neighboring rebuilt frames. It therefore follows the
+actual curved frame path rather than reusing the endpoint SE(3) logarithm.
 
 Residues with near-zero endpoint tangent are disabled because an off-bridge
 direction is not identifiable for a stationary endpoint pair.
@@ -617,6 +631,9 @@ The method claim should be weakened or abandoned if any of the following hold:
 | Dedicated zero-initialized residual heads | Implemented |
 | Residual magnitude/temporal/neighbor/background controls | Implemented |
 | Atom14 endpoint-consistent decoding | Implemented |
+| Cartesian backbone-triplet reference bridge | Implemented and smoke-validated |
+| Local Cartesian-bridge tangent for normal projection | Implemented and tested |
+| Independent SE(3) reference-bridge ablation | Implemented |
 | Four-model launcher/evaluation support | Implemented in code paths; formal run pending |
 | Canonical full OracleMotion train cache | Re-export pending |
 | Controlled manifold benchmark | Not implemented |

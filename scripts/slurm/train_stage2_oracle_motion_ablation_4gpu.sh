@@ -77,6 +77,7 @@ TIME_WARP_LOGIT_SCALE="${TIME_WARP_LOGIT_SCALE:-1.0}"
 TIME_WARP_RATE_EPS="${TIME_WARP_RATE_EPS:-1e-3}"
 TIME_WARP_RATE_CLIP="${TIME_WARP_RATE_CLIP:-10.0}"
 PHASE_RESIDUAL_TAU_MODE="${PHASE_RESIDUAL_TAU_MODE:-learned}"
+PHASE_RESIDUAL_BRIDGE_MODE="${PHASE_RESIDUAL_BRIDGE_MODE:-se3_geodesic}"
 PHASE_RESIDUAL_ENVELOPE="${PHASE_RESIDUAL_ENVELOPE:-poly}"
 PHASE_RESIDUAL_SCALE="${PHASE_RESIDUAL_SCALE:-1.0}"
 PHASE_RESIDUAL_ROTATION_METRIC_SCALE="${PHASE_RESIDUAL_ROTATION_METRIC_SCALE:-1.0}"
@@ -278,6 +279,13 @@ case "$PHASE_RESIDUAL_TAU_MODE" in
   learned|identity) ;;
   *)
     echo "ERROR: PHASE_RESIDUAL_TAU_MODE must be learned or identity"
+    exit 1
+    ;;
+esac
+case "$PHASE_RESIDUAL_BRIDGE_MODE" in
+  se3_geodesic|cartesian_backbone) ;;
+  *)
+    echo "ERROR: PHASE_RESIDUAL_BRIDGE_MODE must be se3_geodesic or cartesian_backbone"
     exit 1
     ;;
 esac
@@ -867,6 +875,7 @@ echo "timewarp logit:  $TIME_WARP_LOGIT_SCALE"
 echo "timewarp eps:    $TIME_WARP_RATE_EPS"
 echo "timewarp clip:   $TIME_WARP_RATE_CLIP"
 echo "phase tau mode:  $PHASE_RESIDUAL_TAU_MODE"
+echo "phase bridge:    $PHASE_RESIDUAL_BRIDGE_MODE"
 echo "phase envelope:  $PHASE_RESIDUAL_ENVELOPE"
 echo "phase scale:     $PHASE_RESIDUAL_SCALE"
 echo "phase metric:    rot=$PHASE_RESIDUAL_ROTATION_METRIC_SCALE trans=$PHASE_RESIDUAL_TRANSLATION_METRIC_SCALE chi=$PHASE_RESIDUAL_CHI_METRIC_SCALE"
@@ -954,6 +963,7 @@ python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA {torch.versio
   --time_warp_rate_eps "$TIME_WARP_RATE_EPS" \
   --time_warp_rate_clip "$TIME_WARP_RATE_CLIP" \
   --phase_residual_tau_mode "$PHASE_RESIDUAL_TAU_MODE" \
+  --phase_residual_bridge_mode "$PHASE_RESIDUAL_BRIDGE_MODE" \
   --phase_residual_envelope "$PHASE_RESIDUAL_ENVELOPE" \
   --phase_residual_scale "$PHASE_RESIDUAL_SCALE" \
   --phase_residual_rotation_metric_scale "$PHASE_RESIDUAL_ROTATION_METRIC_SCALE" \

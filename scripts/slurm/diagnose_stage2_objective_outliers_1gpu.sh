@@ -32,6 +32,7 @@ MAX_BATCHES="${MAX_BATCHES:-}"
 TOP_K="${TOP_K:-32}"
 PHASE_RESIDUAL_SCALE="${PHASE_RESIDUAL_SCALE:-}"
 PHASE_RESIDUAL_TAU_MODE="${PHASE_RESIDUAL_TAU_MODE:-}"
+PHASE_RESIDUAL_BRIDGE_MODE="${PHASE_RESIDUAL_BRIDGE_MODE:-}"
 OUTPUT="${OUTPUT:-logs/stage2/objective_outliers/$(basename "$(dirname "$CHECKPOINT")").json}"
 
 ARGS=(
@@ -52,6 +53,9 @@ if [[ -n "$PHASE_RESIDUAL_SCALE" ]]; then
 fi
 if [[ -n "$PHASE_RESIDUAL_TAU_MODE" ]]; then
   ARGS+=(--phase_residual_tau_mode "$PHASE_RESIDUAL_TAU_MODE")
+fi
+if [[ -n "$PHASE_RESIDUAL_BRIDGE_MODE" ]]; then
+  ARGS+=(--phase_residual_bridge_mode "$PHASE_RESIDUAL_BRIDGE_MODE")
 fi
 
 python scripts/diagnose_stage2_objective_outliers.py "${ARGS[@]}"
