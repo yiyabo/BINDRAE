@@ -1,6 +1,6 @@
 # Current Project Status
 
-Date: 2026-07-10
+Date: 2026-07-12
 
 This is the operational source of truth for the current BINDRAE research track.
 For the method and manuscript logic, read
@@ -93,9 +93,39 @@ interior peptide loss from 1344.20 to 0.423.
 Four-GPU smoke job `141403` then validated the bridge inside the trainable APNB
 model. Relative to the matched old-bridge smoke, validation interior peptide
 mean fell from 31.41 to 0.0147, p95 from 0.348 to 0.0247, and maximum from
-1972.00 to 0.378. Contact direction accuracy remained 0.8125. Jobs `141404`,
-`141405`, and `141406` are the matched warp-only, residual-only, and full APNB
-three-epoch screen; the synchronous Cartesian bridge needs no training.
+1972.00 to 0.378. Contact direction accuracy remained 0.8125.
+
+### Matched four-model result (2026-07-12)
+
+Jobs `141404`, `141405`, and `141406` completed the matched warp-only,
+residual-only, and full APNB three-epoch screen; the synchronous Cartesian
+bridge required no training. The result falsified phase identifiability under
+endpoint-only aggregate losses:
+
+- warp-only phase deviation was `1.68e-5` (identity collapse; larger is not
+  inherently better, but this value shows the head was unused);
+- full APNB phase deviation was `6.99e-6`;
+- residual-only and full APNB had effectively identical validation objectives
+  (`0.004347` versus `0.004346`, lower is better);
+- full APNB did not improve path MAE or clash metrics over residual-only.
+
+The Cartesian bridge correction remains validated, but asynchronous phase is
+not a supported claim from endpoint-only training. The next phase experiment
+therefore uses explicit supervision rather than another loss-weight sweep.
+
+### Free-flow pseudo-teacher diagnostic (2026-07-12)
+
+Job `141422` projected a previously validated free-flow model onto the
+Cartesian bridge for 128 validation systems with transition regularization
+`0.5`. Relative to the synchronous bridge, the projected schedule improved
+formed-contact path MAE from `0.6342` to `0.5334` (lower is better) and approach
+path MAE from `0.4284` to `0.3864`, but worsened active and release path MAE.
+
+This establishes a nontrivial candidate contact-formation schedule, not true
+dynamics. The reported path MAE uses a linear apo-to-holo ligand-distance
+schedule as its reference. Consequently, free-flow phase labels are explicitly
+marked as pseudo-teacher targets and restricted to confidence-weighted contact
+events. Independent MD paths remain mandatory for scientific timing claims.
 
 ## Deterministic Experiment Gate
 
@@ -111,8 +141,10 @@ Before full training, run the following on exactly matched data and compute:
 All four variants now use `phase_residual_bridge_mode=cartesian_backbone`.
 `se3_geodesic` is retained as a separate reference-bridge ablation.
 
-The full method advances only if it beats both learned single-component models
-and preserves controlled residual magnitude.
+The first endpoint-only screen did not pass this gate: full APNB matched
+residual-only and phase collapsed to identity. Phase development continues only
+through explicit pseudo-teacher or MD supervision; residual-only remains the
+honest endpoint-corpus baseline.
 
 ## Canonical Data State
 
@@ -191,12 +223,12 @@ Non-claims:
 
 ## Immediate Work Queue
 
-1. Complete and verify the canonical OracleMotion retry shards.
-2. Merge the full training cache.
-3. Run 5-10 epoch deterministic four-model screening.
-4. Evaluate phase use, residual use, contact order, path error, and external
-   geometry.
-5. Build a controlled manifold benchmark with known path truth.
+1. Export and smoke-test `phase_teacher_v1` caches on a small matched subset.
+2. Run a short residual-only versus confidence-weighted phase-teacher screen.
+3. Treat the pseudo-teacher lane as an ablation unless independent MD timing
+   confirms its event ordering.
+4. Build a controlled manifold benchmark with known path truth.
+5. Build the independent MD transition benchmark.
 6. Freeze the deterministic method before implementing stochastic multipath.
 
 ## Repository Posture

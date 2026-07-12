@@ -634,7 +634,8 @@ The method claim should be weakened or abandoned if any of the following hold:
 | Cartesian backbone-triplet reference bridge | Implemented and smoke-validated |
 | Local Cartesian-bridge tangent for normal projection | Implemented and tested |
 | Independent SE(3) reference-bridge ablation | Implemented |
-| Four-model launcher/evaluation support | Implemented in code paths; formal run pending |
+| Endpoint-only four-model screen | Completed; phase collapsed and full matched residual-only |
+| Confidence-weighted free-flow phase pseudo-teacher | Implemented as an experimental, non-MD lane |
 | Canonical full OracleMotion train cache | Re-export pending |
 | Controlled manifold benchmark | Not implemented |
 | Independent MD benchmark | Planned |
@@ -644,11 +645,14 @@ The method claim should be weakened or abandoned if any of the following hold:
 
 ## Execution Order
 
-1. Finish canonical OracleMotion cache export and merge.
-2. Run deterministic four-model screening for 5-10 epochs.
-3. Select stable phase/residual scales and integration resolution.
-4. Run the controlled manifold benchmark.
-5. Freeze a deterministic APNB checkpoint and evaluate on the MD benchmark.
+1. Keep residual-only as the endpoint-corpus reference after the failed
+   endpoint-only phase-identification screen.
+2. Run a short confidence-weighted contact-event pseudo-teacher screen; report
+   it as distillation rather than trajectory supervision.
+3. Run the controlled manifold benchmark.
+4. Evaluate phase/event order on the independent MD benchmark.
+5. Freeze a deterministic APNB checkpoint only if supervised phase is
+   complementary to residual-only.
 6. Implement the global stochastic path latent only after deterministic
    component identification succeeds.
 7. Fine-tune stochastic APNB on MD path ensembles and evaluate coverage versus
