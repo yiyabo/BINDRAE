@@ -34,6 +34,11 @@ from src.stage1.models.interaction_prior import (  # noqa: E402
 )
 from src.stage2.datasets import create_stage2_dataloader  # noqa: E402
 from src.stage2.models import TorsionFlowNet, TorsionFlowNetConfig  # noqa: E402
+from src.stage2.modules.chain_internal import (  # noqa: E402
+    interpolate_backbone_internal,
+    project_anchored_pose_graph,
+    project_peptide_frame_translations,
+)
 from src.stage2.modules import (  # noqa: E402
     endpoint_zero_envelope,
     project_product_tangent_normal,
@@ -70,6 +75,11 @@ def parse_args() -> argparse.Namespace:
             "boundary_residual_v1",
             "boundary_residual",
             "pure_bridge",
+            "cartesian_backbone_bridge_v1",
+            "cartesian_peptide_projected_bridge_v1",
+            "chain_internal_bridge_v1",
+            "peptide_projected_bridge_v1",
+            "pose_graph_projected_bridge_v1",
             "bridge_timewarp_v1",
             "phase_orthogonal_residual_v1",
         ],
@@ -112,6 +122,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--phase_residual_chi_metric_scale", type=float, default=None)
     parser.add_argument("--phase_residual_min_tangent_norm", type=float, default=None)
     parser.add_argument("--phase_residual_max_metric_norm", type=float, default=None)
+    parser.add_argument("--peptide_projection_iterations", type=int, default=12)
+    parser.add_argument("--peptide_projection_relaxation", type=float, default=0.75)
+    parser.add_argument("--peptide_projection_anchor_strength", type=float, default=0.02)
+    parser.add_argument("--peptide_projection_max_translation", type=float, default=2.0)
+    parser.add_argument(
+        "--peptide_projection_activation_loss_threshold", type=float, default=0.0
+    )
+    parser.add_argument("--pose_graph_iterations", type=int, default=20)
+    parser.add_argument("--pose_graph_learning_rate", type=float, default=0.05)
+    parser.add_argument("--pose_graph_edge_weight", type=float, default=1.0)
+    parser.add_argument("--pose_graph_anchor_weight", type=float, default=0.1)
+    parser.add_argument("--pose_graph_rotation_metric_scale", type=float, default=1.5)
+    parser.add_argument("--pose_graph_max_rotation", type=float, default=0.5)
+    parser.add_argument("--pose_graph_max_translation", type=float, default=2.0)
     parser.add_argument("--n_integration_steps", type=int, default=None)
     parser.add_argument("--integration_chi_clip", type=float, default=None)
     parser.add_argument("--integration_rot_clip", type=float, default=None)
@@ -175,6 +199,7 @@ def batch_to_device(batch, device: torch.device):
         "bb_mask",
         "chi_mask",
         "node_mask",
+        "peptide_bond_mask",
         "N_apo",
         "Ca_apo",
         "C_apo",
@@ -400,6 +425,11 @@ def resolve_path_parameterization(args, config) -> str:
         "boundary_residual_v1",
         "boundary_residual",
         "pure_bridge",
+        "cartesian_backbone_bridge_v1",
+        "cartesian_peptide_projected_bridge_v1",
+        "chain_internal_bridge_v1",
+        "peptide_projected_bridge_v1",
+        "pose_graph_projected_bridge_v1",
         "bridge_timewarp_v1",
         "phase_orthogonal_residual_v1",
     }
@@ -470,6 +500,39 @@ def interpolate_backbone_torsions(batch, t_value: float) -> torch.Tensor:
     torsion_holo = batch.torsion_holo[..., :3]
     return wrap_to_pi(
         torsion_apo + gamma * wrap_to_pi(torsion_holo - torsion_apo)
+    )
+
+
+def peptide_geometry_targets(
+    n_coord: torch.Tensor,
+    ca_coord: torch.Tensor,
+    c_coord: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return C-N lengths and the two peptide angles for adjacent residues."""
+    c_to_n = n_coord[:, 1:] - c_coord[:, :-1]
+    ca_to_c = ca_coord[:, :-1] - c_coord[:, :-1]
+    n_to_ca = ca_coord[:, 1:] - n_coord[:, 1:]
+    direction = F.normalize(c_to_n, dim=-1)
+    left_direction = F.normalize(ca_to_c, dim=-1)
+    right_direction = F.normalize(n_to_ca, dim=-1)
+    length = torch.linalg.norm(c_to_n, dim=-1)
+    angle_cacn = torch.acos(
+        (left_direction * direction).sum(dim=-1).clamp(-1.0, 1.0)
+    )
+    angle_cnca = torch.acos(
+        (right_direction * -direction).sum(dim=-1).clamp(-1.0, 1.0)
+    )
+    return length, angle_cacn, angle_cnca
+
+
+def interpolate_peptide_geometry_targets(batch, t_value: float):
+    t_scalar = min(max(float(t_value), 0.0), 1.0)
+    gamma = 3.0 * t_scalar * t_scalar - 2.0 * t_scalar * t_scalar * t_scalar
+    apo_targets = peptide_geometry_targets(batch.N_apo, batch.Ca_apo, batch.C_apo)
+    holo_targets = peptide_geometry_targets(batch.N_holo, batch.Ca_holo, batch.C_holo)
+    return tuple(
+        (1.0 - gamma) * apo_value + gamma * holo_value
+        for apo_value, holo_value in zip(apo_targets, holo_targets)
     )
 
 
@@ -942,6 +1005,230 @@ def phase_orthogonal_residual_path(
     return rigids_list, chi_list, t_list
 
 
+def chain_internal_bridge_path(
+    batch,
+    rigids_apo: Rigid,
+    rigids_holo: Rigid,
+    n_steps: int,
+) -> Tuple[List[Rigid], List[torch.Tensor], List[float]]:
+    """Construct an endpoint-exact, peptide-connected backbone bridge."""
+    if int(n_steps) < 2:
+        raise ValueError("chain_internal_bridge_v1 requires n_steps >= 2")
+    rigids_list: List[Rigid] = [rigids_apo]
+    chi_list: List[torch.Tensor] = [batch.torsion_apo[..., 3:7]]
+    t_list: List[float] = [0.0]
+    for step in range(1, int(n_steps)):
+        t_value = step / int(n_steps)
+        n_coord, ca_coord, c_coord = interpolate_backbone_internal(
+            batch.N_apo,
+            batch.Ca_apo,
+            batch.C_apo,
+            batch.N_holo,
+            batch.Ca_holo,
+            batch.C_holo,
+            batch.node_mask,
+            batch.peptide_bond_mask,
+            batch.N_apo.new_tensor(t_value),
+        )
+        rigids_list.append(
+            build_rigids_from_backbone(
+                n_coord, ca_coord, c_coord, batch.node_mask
+            )
+        )
+        chi_list.append(
+            interpolate_endpoints(
+                batch, rigids_apo, rigids_holo, t_value
+            )[1]
+        )
+        t_list.append(t_value)
+    rigids_list.append(rigids_holo)
+    chi_list.append(batch.torsion_holo[..., 3:7])
+    t_list.append(1.0)
+    return rigids_list, chi_list, t_list
+
+
+def cartesian_backbone_bridge_path(
+    batch,
+    rigids_apo: Rigid,
+    rigids_holo: Rigid,
+    n_steps: int,
+) -> Tuple[List[Rigid], List[torch.Tensor], List[float]]:
+    """Interpolate endpoint backbone triplets before rebuilding residue frames."""
+    if int(n_steps) < 2:
+        raise ValueError("cartesian_backbone_bridge_v1 requires n_steps >= 2")
+    rigids_list: List[Rigid] = [rigids_apo]
+    chi_list: List[torch.Tensor] = [batch.torsion_apo[..., 3:7]]
+    t_list: List[float] = [0.0]
+    for step in range(1, int(n_steps)):
+        t_value = step / int(n_steps)
+        gamma = 3.0 * t_value * t_value - 2.0 * t_value * t_value * t_value
+        n_coord = (1.0 - gamma) * batch.N_apo + gamma * batch.N_holo
+        ca_coord = (1.0 - gamma) * batch.Ca_apo + gamma * batch.Ca_holo
+        c_coord = (1.0 - gamma) * batch.C_apo + gamma * batch.C_holo
+        rigids_list.append(
+            build_rigids_from_backbone(
+                n_coord, ca_coord, c_coord, batch.node_mask
+            )
+        )
+        chi_list.append(
+            interpolate_endpoints(
+                batch, rigids_apo, rigids_holo, t_value
+            )[1]
+        )
+        t_list.append(t_value)
+    rigids_list.append(rigids_holo)
+    chi_list.append(batch.torsion_holo[..., 3:7])
+    t_list.append(1.0)
+    return rigids_list, chi_list, t_list
+
+
+def peptide_projected_bridge_path(
+    batch,
+    rigids_apo: Rigid,
+    rigids_holo: Rigid,
+    n_steps: int,
+    fk_module,
+    n_iterations: int,
+    relaxation: float,
+    anchor_strength: float,
+    max_translation: float,
+    activation_loss_threshold: float,
+) -> Tuple[List[Rigid], List[torch.Tensor], List[float]]:
+    """Project local peptide geometry while retaining the global SE(3) bridge."""
+    return project_peptide_geometry_onto_path(
+        batch,
+        *pure_bridge_path(batch, rigids_apo, rigids_holo, n_steps),
+        fk_module=fk_module,
+        n_iterations=n_iterations,
+        relaxation=relaxation,
+        anchor_strength=anchor_strength,
+        max_translation=max_translation,
+        activation_loss_threshold=activation_loss_threshold,
+    )
+
+
+def project_peptide_geometry_onto_path(
+    batch,
+    rigids_list: List[Rigid],
+    chi_list: List[torch.Tensor],
+    t_list: List[float],
+    fk_module,
+    n_iterations: int,
+    relaxation: float,
+    anchor_strength: float,
+    max_translation: float,
+    activation_loss_threshold: float,
+) -> Tuple[List[Rigid], List[torch.Tensor], List[float]]:
+    """Apply bounded local peptide projection to an endpoint-exact guide path."""
+    projected_rigids: List[Rigid] = [rigids_list[0]]
+    for rigids_t, chi_t, t_value in zip(
+        rigids_list[1:-1], chi_list[1:-1], t_list[1:-1]
+    ):
+        atom14_t = torsions_to_atom14(
+            fk_module,
+            interpolate_backbone_torsions(batch, t_value),
+            chi_t,
+            rigids_t,
+            batch.aatype,
+        )
+        target_length, target_cacn, target_cnca = (
+            interpolate_peptide_geometry_targets(batch, t_value)
+        )
+        translation = project_peptide_frame_translations(
+            atom14_t["atom14_pos"].float(),
+            atom14_t["atom14_mask"].bool(),
+            batch.node_mask.bool(),
+            batch.peptide_bond_mask.bool(),
+            n_iterations=n_iterations,
+            relaxation=relaxation,
+            anchor_strength=anchor_strength,
+            bond_length=target_length,
+            angle_cacn=target_cacn,
+            angle_cnca=target_cnca,
+            max_translation=max_translation,
+            activation_loss_threshold=activation_loss_threshold,
+        )
+        rotation, guide_translation = rigid_to_rt(rigids_t)
+        projected_rigids.append(
+            rt_to_rigid(rotation, guide_translation + translation)
+        )
+    projected_rigids.append(rigids_list[-1])
+    return projected_rigids, chi_list, t_list
+
+
+def cartesian_peptide_projected_bridge_path(
+    batch,
+    rigids_apo: Rigid,
+    rigids_holo: Rigid,
+    n_steps: int,
+    fk_module,
+    n_iterations: int,
+    relaxation: float,
+    anchor_strength: float,
+    max_translation: float,
+    activation_loss_threshold: float,
+) -> Tuple[List[Rigid], List[torch.Tensor], List[float]]:
+    """Combine the Cartesian backbone guide with bounded local projection."""
+    return project_peptide_geometry_onto_path(
+        batch,
+        *cartesian_backbone_bridge_path(
+            batch, rigids_apo, rigids_holo, n_steps
+        ),
+        fk_module=fk_module,
+        n_iterations=n_iterations,
+        relaxation=relaxation,
+        anchor_strength=anchor_strength,
+        max_translation=max_translation,
+        activation_loss_threshold=activation_loss_threshold,
+    )
+
+
+def pose_graph_projected_bridge_path(
+    batch,
+    rigids_apo: Rigid,
+    rigids_holo: Rigid,
+    n_steps: int,
+    n_iterations: int,
+    learning_rate: float,
+    edge_weight: float,
+    anchor_weight: float,
+    rotation_metric_scale: float,
+    max_rotation: float,
+    max_translation: float,
+) -> Tuple[List[Rigid], List[torch.Tensor], List[float]]:
+    """Project adjacent frame transforms while anchored to the global bridge."""
+    rigids_list, chi_list, t_list = pure_bridge_path(
+        batch, rigids_apo, rigids_holo, n_steps
+    )
+    apo_rotation, apo_translation = rigid_to_rt(rigids_apo)
+    holo_rotation, holo_translation = rigid_to_rt(rigids_holo)
+    projected_rigids: List[Rigid] = [rigids_list[0]]
+    for guide_rigids, t_value in zip(rigids_list[1:-1], t_list[1:-1]):
+        guide_rotation, guide_translation = rigid_to_rt(guide_rigids)
+        gamma = 3.0 * t_value * t_value - 2.0 * t_value * t_value * t_value
+        rotation, translation, _ = project_anchored_pose_graph(
+            guide_rotation,
+            guide_translation,
+            apo_rotation,
+            apo_translation,
+            holo_rotation,
+            holo_translation,
+            batch.node_mask,
+            batch.peptide_bond_mask,
+            progress=gamma,
+            n_iterations=n_iterations,
+            learning_rate=learning_rate,
+            edge_weight=edge_weight,
+            anchor_weight=anchor_weight,
+            rotation_metric_scale=rotation_metric_scale,
+            max_rotation=max_rotation,
+            max_translation=max_translation,
+        )
+        projected_rigids.append(rt_to_rigid(rotation, translation))
+    projected_rigids.append(rigids_list[-1])
+    return projected_rigids, chi_list, t_list
+
+
 def project_terminal_path(
     rigids_list: List[Rigid],
     chi_list: List[torch.Tensor],
@@ -997,11 +1284,83 @@ def construct_path(
     interaction_prior: Optional[torch.Tensor],
     esm_gate_context: Optional[torch.Tensor],
     integration_clips: Dict[str, float],
+    fk_module=None,
 ) -> Tuple[List[Rigid], List[torch.Tensor], List[float], Dict[str, torch.Tensor]]:
     path_mode = resolve_path_parameterization(args, config)
     correction: Dict[str, torch.Tensor] = {}
     if path_mode == "pure_bridge":
         return (*pure_bridge_path(batch, rigids_apo, rigids_holo, n_steps), correction)
+    if path_mode == "cartesian_backbone_bridge_v1":
+        return (
+            *cartesian_backbone_bridge_path(
+                batch, rigids_apo, rigids_holo, n_steps
+            ),
+            correction,
+        )
+    if path_mode == "cartesian_peptide_projected_bridge_v1":
+        if fk_module is None:
+            raise ValueError(
+                "cartesian_peptide_projected_bridge_v1 requires an FK module"
+            )
+        return (
+            *cartesian_peptide_projected_bridge_path(
+                batch,
+                rigids_apo,
+                rigids_holo,
+                n_steps,
+                fk_module,
+                n_iterations=int(args.peptide_projection_iterations),
+                relaxation=float(args.peptide_projection_relaxation),
+                anchor_strength=float(args.peptide_projection_anchor_strength),
+                max_translation=float(args.peptide_projection_max_translation),
+                activation_loss_threshold=float(
+                    args.peptide_projection_activation_loss_threshold
+                ),
+            ),
+            correction,
+        )
+    if path_mode == "chain_internal_bridge_v1":
+        return (
+            *chain_internal_bridge_path(batch, rigids_apo, rigids_holo, n_steps),
+            correction,
+        )
+    if path_mode == "peptide_projected_bridge_v1":
+        if fk_module is None:
+            raise ValueError("peptide_projected_bridge_v1 requires an FK module")
+        return (
+            *peptide_projected_bridge_path(
+                batch,
+                rigids_apo,
+                rigids_holo,
+                n_steps,
+                fk_module,
+                n_iterations=int(args.peptide_projection_iterations),
+                relaxation=float(args.peptide_projection_relaxation),
+                anchor_strength=float(args.peptide_projection_anchor_strength),
+                max_translation=float(args.peptide_projection_max_translation),
+                activation_loss_threshold=float(
+                    args.peptide_projection_activation_loss_threshold
+                ),
+            ),
+            correction,
+        )
+    if path_mode == "pose_graph_projected_bridge_v1":
+        return (
+            *pose_graph_projected_bridge_path(
+                batch,
+                rigids_apo,
+                rigids_holo,
+                n_steps,
+                n_iterations=int(args.pose_graph_iterations),
+                learning_rate=float(args.pose_graph_learning_rate),
+                edge_weight=float(args.pose_graph_edge_weight),
+                anchor_weight=float(args.pose_graph_anchor_weight),
+                rotation_metric_scale=float(args.pose_graph_rotation_metric_scale),
+                max_rotation=float(args.pose_graph_max_rotation),
+                max_translation=float(args.pose_graph_max_translation),
+            ),
+            correction,
+        )
     if path_mode == "bridge_timewarp_v1":
         logit_scale = (
             float(args.time_warp_logit_scale)
@@ -1325,6 +1684,7 @@ def evaluate_batch(
         prior_features,
         gate_context,
         integration_clips,
+        fk_module=fk_module,
     )
     bridge_rigids_list, bridge_chi_list, bridge_t_list = pure_bridge_path(
         batch, rigids_apo, rigids_holo, n_steps
