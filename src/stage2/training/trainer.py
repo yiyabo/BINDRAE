@@ -59,9 +59,44 @@ from src.stage1.modules.losses import clash_penalty, fape_loss
 class Stage2Trainer:
     """Stage-2 trainer."""
 
+    _OBJECTIVE_KEYS = (
+        'objective_fm_chi',
+        'objective_fm_rigid',
+        'objective_teacher_residual',
+        'objective_bg',
+        'objective_phase_residual_magnitude',
+        'objective_phase_residual_temporal_smooth',
+        'objective_phase_residual_neighbor_smooth',
+        'objective_smooth',
+        'objective_clash',
+        'objective_ligand_clearance',
+        'objective_bridge_anchor',
+        'objective_pep',
+        'objective_contact',
+        'objective_stage1v2_guidance',
+        'objective_prior',
+        'objective_interaction_prior',
+        'objective_end',
+        'objective_repa',
+        'objective_esm_entropy',
+    )
+
+    _VALIDATION_DISTRIBUTION_KEYS = (
+        'total_no_repa',
+        'pep',
+        'pep_interior',
+        'clash',
+        'clash_interior',
+        'contact',
+        'objective_pep',
+        'objective_clash',
+        'objective_contact',
+    )
+
     _LOSS_KEYS = (
         'total',
         'total_no_repa',
+        *_OBJECTIVE_KEYS,
         'fm_chi',
         'fm_rigid',
         'teacher_residual',
@@ -75,6 +110,7 @@ class Stage2Trainer:
         'bg',
         'smooth',
         'clash',
+        'clash_interior',
         'ligand_clearance',
         'ligand_clearance_active_frac',
         'ligand_clearance_min_dist',
@@ -95,6 +131,7 @@ class Stage2Trainer:
         'phase_residual_raw_parallel_cos',
         'phase_residual_projected_parallel_cos',
         'pep',
+        'pep_interior',
         'contact',
         'stage1v2_guidance',
         'repa',
@@ -896,6 +933,37 @@ class Stage2Trainer:
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
         reduced = {k: float(tensor[i].item()) for i, k in enumerate(self._LOSS_KEYS)}
         return reduced, int(tensor[-1].item())
+
+    @staticmethod
+    def _scalar_distribution_summary(
+        values_by_key: Dict[str, List[float]],
+    ) -> Dict[str, float]:
+        summary: Dict[str, float] = {}
+        for key, values in values_by_key.items():
+            finite = np.asarray(values, dtype=np.float64)
+            finite = finite[np.isfinite(finite)]
+            if finite.size == 0:
+                continue
+            for label, percentile in (('p50', 50), ('p95', 95), ('p99', 99)):
+                summary[f'{key}_batch_{label}'] = float(np.percentile(finite, percentile))
+            summary[f'{key}_batch_max'] = float(finite.max())
+        return summary
+
+    def _gather_validation_distributions(
+        self,
+        local_values: Dict[str, List[float]],
+    ) -> Dict[str, float]:
+        if not self.distributed:
+            return self._scalar_distribution_summary(local_values)
+        gathered: List[Optional[Dict[str, List[float]]]] = [None] * self.world_size
+        dist.all_gather_object(gathered, local_values)
+        merged = {key: [] for key in self._VALIDATION_DISTRIBUTION_KEYS}
+        for rank_values in gathered:
+            if rank_values is None:
+                continue
+            for key in merged:
+                merged[key].extend(rank_values.get(key, ()))
+        return self._scalar_distribution_summary(merged)
 
     @property
     def _raw_model(self):
@@ -2793,6 +2861,8 @@ class Stage2Trainer:
         phase_residual_raw_parallel_cos = chi_ref.new_tensor(0.0)
         phase_residual_projected_parallel_cos = chi_ref.new_tensor(0.0)
         L_pep = chi_ref.new_tensor(0.0)
+        L_pep_interior = chi_ref.new_tensor(0.0)
+        L_clash_interior = chi_ref.new_tensor(0.0)
         L_contact = chi_ref.new_tensor(0.0)
         L_stage1v2_guidance = chi_ref.new_tensor(0.0)
         L_repa = self._repa_alignment_loss(out, batch)
@@ -2822,6 +2892,7 @@ class Stage2Trainer:
         bridge_anchor_terms = 0
         bridge_anchor_mask_terms = []
         bridge_anchor_residual_terms = []
+        interior_geometry_frames = 0
 
         # Initialize endpoint losses to zero
         L_end = chi_ref.new_tensor(0.0)
@@ -3017,12 +3088,13 @@ class Stage2Trainer:
                 valid_atom = atom14_mask & batch.node_mask.unsqueeze(-1)
                 flat_atoms = atom14_pos.reshape(atom14_pos.shape[0], -1, 3)
                 flat_atom_mask = valid_atom.reshape(valid_atom.shape[0], -1)
-                L_clash = L_clash + clash_penalty(
+                clash_value = clash_penalty(
                     flat_atoms,
                     clash_threshold=2.2,
                     aatype=batch.aatype,
                     atom_mask=flat_atom_mask,
                 )
+                L_clash = L_clash + clash_value
 
                 clearance_time_active = (
                     float(self.config.ligand_clearance_t_min)
@@ -3131,7 +3203,7 @@ class Stage2Trainer:
                         bridge_anchor_terms += 1
 
                 # Peptide geometry
-                L_pep = L_pep + compute_peptide_loss(
+                peptide_value = compute_peptide_loss(
                     atom14_pos,
                     atom14_mask,
                     batch.node_mask,
@@ -3141,6 +3213,11 @@ class Stage2Trainer:
                     angle_weight=self.config.pep_angle_weight,
                     peptide_bond_mask=batch.peptide_bond_mask,
                 )
+                L_pep = L_pep + peptide_value
+                if 1e-6 < float(t_val) < 1.0 - 1e-6:
+                    L_clash_interior = L_clash_interior + clash_value
+                    L_pep_interior = L_pep_interior + peptide_value
+                    interior_geometry_frames += 1
 
                 # Contact score
                 C_t = compute_contact_score(
@@ -3200,6 +3277,9 @@ class Stage2Trainer:
             L_clash = L_clash / geometry_frame_count
             L_pep = L_pep / geometry_frame_count
             L_smooth = L_smooth / geometry_interval_count
+            if interior_geometry_frames > 0:
+                L_clash_interior = L_clash_interior / interior_geometry_frames
+                L_pep_interior = L_pep_interior / interior_geometry_frames
 
             # Endpoint loss
             # Precompute holo atom14 for FAPE
@@ -3392,29 +3472,32 @@ class Stage2Trainer:
                 return 100.0 * torch.log1p(value.clamp_min(0.0) / 100.0)
             return value.clamp(max=100.0)
 
-        total_no_repa = (
-            self.config.w_fm_chi * stabilized(L_fm_chi) +
-            self.config.w_fm_rigid * stabilized(L_fm_rigid) +
-            self.config.w_teacher_residual * stabilized(L_teacher_residual) +
-            self.config.w_bg * stabilized(L_bg) +
-            self.config.w_phase_residual_magnitude * stabilized(L_phase_residual_magnitude) +
-            self.config.w_phase_residual_temporal_smooth * stabilized(L_phase_residual_temporal_smooth) +
-            self.config.w_phase_residual_neighbor_smooth * stabilized(L_phase_residual_neighbor_smooth) +
-            self.config.w_smooth * stabilized(L_smooth) +
-            self.config.w_clash * stabilized(L_clash) +
-            self.config.w_ligand_clearance * stabilized(L_ligand_clearance) +
-            self.config.w_bridge_anchor * stabilized(L_bridge_anchor) +
-            self.config.w_pep * stabilized(L_pep) +
-            self.config.w_contact * stabilized(L_contact) +
-            self.config.w_stage1v2_guidance * stabilized(L_stage1v2_guidance) +
-            self.config.w_prior * stabilized(L_prior) +
-            self.config.w_interaction_prior * stabilized(L_interaction_prior) +
-            self.config.w_end * stabilized(L_end)
-        )
-        total = total_no_repa + self.config.repa_weight * L_repa.clamp(max=100.0)
+        objective_terms = {
+            'objective_fm_chi': self.config.w_fm_chi * stabilized(L_fm_chi),
+            'objective_fm_rigid': self.config.w_fm_rigid * stabilized(L_fm_rigid),
+            'objective_teacher_residual': self.config.w_teacher_residual * stabilized(L_teacher_residual),
+            'objective_bg': self.config.w_bg * stabilized(L_bg),
+            'objective_phase_residual_magnitude': self.config.w_phase_residual_magnitude * stabilized(L_phase_residual_magnitude),
+            'objective_phase_residual_temporal_smooth': self.config.w_phase_residual_temporal_smooth * stabilized(L_phase_residual_temporal_smooth),
+            'objective_phase_residual_neighbor_smooth': self.config.w_phase_residual_neighbor_smooth * stabilized(L_phase_residual_neighbor_smooth),
+            'objective_smooth': self.config.w_smooth * stabilized(L_smooth),
+            'objective_clash': self.config.w_clash * stabilized(L_clash),
+            'objective_ligand_clearance': self.config.w_ligand_clearance * stabilized(L_ligand_clearance),
+            'objective_bridge_anchor': self.config.w_bridge_anchor * stabilized(L_bridge_anchor),
+            'objective_pep': self.config.w_pep * stabilized(L_pep),
+            'objective_contact': self.config.w_contact * stabilized(L_contact),
+            'objective_stage1v2_guidance': self.config.w_stage1v2_guidance * stabilized(L_stage1v2_guidance),
+            'objective_prior': self.config.w_prior * stabilized(L_prior),
+            'objective_interaction_prior': self.config.w_interaction_prior * stabilized(L_interaction_prior),
+            'objective_end': self.config.w_end * stabilized(L_end),
+        }
+        total_no_repa = sum(objective_terms.values(), chi_ref.new_tensor(0.0))
+        objective_repa = self.config.repa_weight * L_repa.clamp(max=100.0)
+        total = total_no_repa + objective_repa
 
         zero = chi_ref.new_tensor(0.0)
         L_esm_entropy = zero
+        objective_esm_entropy = zero
         esm_layer_weight_entropy_raw = zero
         esm_layer_weight_max = zero
         esm_gate_mean = zero
@@ -3435,7 +3518,8 @@ class Stage2Trainer:
                 esm_layer_weight_logs[f'esm_layer_weight_{idx}'] = esm_lw_flat[idx].detach()
             if self.config.esm_layer_entropy_weight > 0.0:
                 L_esm_entropy = self.config.esm_layer_entropy_weight * entropy
-                total = total + L_esm_entropy
+                objective_esm_entropy = L_esm_entropy
+                total = total + objective_esm_entropy
 
         esm_gates = out.get("esm_layer_gates")
         if esm_gates is not None:
@@ -3471,6 +3555,9 @@ class Stage2Trainer:
         return {
             'total': total,
             'total_no_repa': total_no_repa,
+            **objective_terms,
+            'objective_repa': objective_repa,
+            'objective_esm_entropy': objective_esm_entropy,
             'fm_chi': L_fm_chi,
             'fm_rigid': L_fm_rigid,
             'teacher_residual': L_teacher_residual,
@@ -3484,6 +3571,7 @@ class Stage2Trainer:
             'bg': L_bg,
             'smooth': L_smooth,
             'clash': L_clash,
+            'clash_interior': L_clash_interior,
             'ligand_clearance': L_ligand_clearance,
             'ligand_clearance_active_frac': ligand_clearance_active_frac,
             'ligand_clearance_min_dist': ligand_clearance_min_dist,
@@ -3504,6 +3592,7 @@ class Stage2Trainer:
             'phase_residual_raw_parallel_cos': phase_residual_raw_parallel_cos,
             'phase_residual_projected_parallel_cos': phase_residual_projected_parallel_cos,
             'pep': L_pep,
+            'pep_interior': L_pep_interior,
             'contact': L_contact,
             'stage1v2_guidance': L_stage1v2_guidance,
             'repa': L_repa,
@@ -3692,6 +3781,9 @@ class Stage2Trainer:
     def validate(self) -> Dict[str, float]:
         self.model.eval()
         val_losses = {key: 0.0 for key in self._LOSS_KEYS}
+        distribution_values = {
+            key: [] for key in self._VALIDATION_DISTRIBUTION_KEYS
+        }
         n_batches = 0
 
         with torch.no_grad():
@@ -3705,11 +3797,15 @@ class Stage2Trainer:
                 self._check_finite_losses(losses, "validation")
                 for k in val_losses:
                     val_losses[k] += losses[k].item()
+                for key in distribution_values:
+                    distribution_values[key].append(float(losses[key].item()))
                 n_batches += 1
 
         val_losses, n_batches = self._all_reduce_loss_sums(val_losses, n_batches)
         denom = max(n_batches, 1)
-        return {k: v / denom for k, v in val_losses.items()}
+        results = {k: v / denom for k, v in val_losses.items()}
+        results.update(self._gather_validation_distributions(distribution_values))
+        return results
 
     def save_checkpoint(self, filepath: str, verbose: bool = True):
         path = Path(filepath)
@@ -3952,7 +4048,9 @@ class Stage2Trainer:
                         f"IPrior:{val_results['interaction_prior']:.2f} "
                         f"REPA:{val_results['repa']:.3f} "
                         f"End:{val_results['end']:.2f} "
-                        f"Contact:{val_results['contact']:.3f}"
+                        f"Contact:{val_results['contact']:.3f} "
+                        f"PepI:{val_results['pep_interior']:.2f} "
+                        f"ObjPepP95:{val_results['objective_pep_batch_p95']:.3f}"
                     )
                     print(val_info)
                     metrics_path = Path(self.config.log_dir) / 'metrics.jsonl'

@@ -42,6 +42,10 @@ TERMINAL_PROJECTION_SCHEDULE="${TERMINAL_PROJECTION_SCHEDULE:-}"
 TIME_WARP_LOGIT_SCALE="${TIME_WARP_LOGIT_SCALE:-}"
 TIME_WARP_RATE_EPS="${TIME_WARP_RATE_EPS:-}"
 TIME_WARP_RATE_CLIP="${TIME_WARP_RATE_CLIP:-}"
+PHASE_RESIDUAL_TAU_MODE="${PHASE_RESIDUAL_TAU_MODE:-}"
+PHASE_RESIDUAL_ENVELOPE="${PHASE_RESIDUAL_ENVELOPE:-}"
+PHASE_RESIDUAL_SCALE="${PHASE_RESIDUAL_SCALE:-}"
+PHASE_RESIDUAL_MAX_METRIC_NORM="${PHASE_RESIDUAL_MAX_METRIC_NORM:-}"
 INTERACTION_PRIOR_FEATURE_MODE="${INTERACTION_PRIOR_FEATURE_MODE:-}"
 INTERACTION_PRIOR_CKPT="${INTERACTION_PRIOR_CKPT:-}"
 INTERACTION_PRIOR_TEMPERATURE="${INTERACTION_PRIOR_TEMPERATURE:-}"
@@ -74,9 +78,9 @@ case "$TRUST_PRECHECKED_SAMPLES" in
     ;;
 esac
 case "$PATH_PARAMETERIZATION" in
-  checkpoint|flow|projected_flow|boundary_residual_v1|boundary_residual|pure_bridge|bridge_timewarp_v1) ;;
+  checkpoint|flow|projected_flow|boundary_residual_v1|boundary_residual|pure_bridge|bridge_timewarp_v1|phase_orthogonal_residual_v1) ;;
   *)
-    echo "ERROR: PATH_PARAMETERIZATION must be checkpoint, flow, projected_flow, boundary_residual_v1, boundary_residual, pure_bridge, or bridge_timewarp_v1"
+    echo "ERROR: unsupported PATH_PARAMETERIZATION=$PATH_PARAMETERIZATION"
     exit 1
     ;;
 esac
@@ -88,6 +92,31 @@ if [[ -n "$BOUNDARY_RESIDUAL_ENVELOPE" ]]; then
       exit 1
       ;;
   esac
+fi
+if [[ -n "$PHASE_RESIDUAL_TAU_MODE" ]]; then
+  case "$PHASE_RESIDUAL_TAU_MODE" in
+    learned|identity) ;;
+    *)
+      echo "ERROR: PHASE_RESIDUAL_TAU_MODE must be learned or identity"
+      exit 1
+      ;;
+  esac
+fi
+if [[ -n "$PHASE_RESIDUAL_ENVELOPE" ]]; then
+  case "$PHASE_RESIDUAL_ENVELOPE" in
+    poly|sin2) ;;
+    *)
+      echo "ERROR: PHASE_RESIDUAL_ENVELOPE must be poly or sin2"
+      exit 1
+      ;;
+  esac
+fi
+if [[ -n "$PHASE_RESIDUAL_MAX_METRIC_NORM" ]]; then
+  python - <<PY
+value = float("$PHASE_RESIDUAL_MAX_METRIC_NORM")
+if value < 0.0:
+    raise SystemExit("ERROR: PHASE_RESIDUAL_MAX_METRIC_NORM must be >= 0")
+PY
 fi
 if [[ -n "$TERMINAL_PROJECTION_SCHEDULE" ]]; then
   case "$TERMINAL_PROJECTION_SCHEDULE" in
@@ -129,6 +158,10 @@ echo "Projection sched:  ${TERMINAL_PROJECTION_SCHEDULE:-checkpoint_default}"
 echo "Timewarp logit:    ${TIME_WARP_LOGIT_SCALE:-checkpoint_default}"
 echo "Timewarp eps:      ${TIME_WARP_RATE_EPS:-checkpoint_default}"
 echo "Timewarp clip:     ${TIME_WARP_RATE_CLIP:-checkpoint_default}"
+echo "Phase tau mode:    ${PHASE_RESIDUAL_TAU_MODE:-checkpoint_default}"
+echo "Phase envelope:    ${PHASE_RESIDUAL_ENVELOPE:-checkpoint_default}"
+echo "Phase scale:       ${PHASE_RESIDUAL_SCALE:-checkpoint_default}"
+echo "Phase max norm:    ${PHASE_RESIDUAL_MAX_METRIC_NORM:-checkpoint_default}"
 echo "Feature mode:      ${INTERACTION_PRIOR_FEATURE_MODE:-checkpoint_default}"
 echo "Interaction prior: ${INTERACTION_PRIOR_CKPT:-checkpoint_default}"
 echo "Prior temperature: ${INTERACTION_PRIOR_TEMPERATURE:-checkpoint_default}"
@@ -179,6 +212,18 @@ if [[ -n "$TIME_WARP_RATE_EPS" ]]; then
 fi
 if [[ -n "$TIME_WARP_RATE_CLIP" ]]; then
   ARGS+=(--time_warp_rate_clip "$TIME_WARP_RATE_CLIP")
+fi
+if [[ -n "$PHASE_RESIDUAL_TAU_MODE" ]]; then
+  ARGS+=(--phase_residual_tau_mode "$PHASE_RESIDUAL_TAU_MODE")
+fi
+if [[ -n "$PHASE_RESIDUAL_ENVELOPE" ]]; then
+  ARGS+=(--phase_residual_envelope "$PHASE_RESIDUAL_ENVELOPE")
+fi
+if [[ -n "$PHASE_RESIDUAL_SCALE" ]]; then
+  ARGS+=(--phase_residual_scale "$PHASE_RESIDUAL_SCALE")
+fi
+if [[ -n "$PHASE_RESIDUAL_MAX_METRIC_NORM" ]]; then
+  ARGS+=(--phase_residual_max_metric_norm "$PHASE_RESIDUAL_MAX_METRIC_NORM")
 fi
 if [[ -n "$INTERACTION_PRIOR_FEATURE_MODE" ]]; then
   ARGS+=(--interaction_prior_feature_mode "$INTERACTION_PRIOR_FEATURE_MODE")

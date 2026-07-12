@@ -55,6 +55,14 @@ def _rigid(translations):
 
 
 class PhaseResidualPathTest(unittest.TestCase):
+    def test_scalar_distribution_summary_reports_tail(self):
+        summary = Stage2Trainer._scalar_distribution_summary(
+            {"pep_interior": [0.0, 1.0, 2.0, 100.0, float("nan")]}
+        )
+        self.assertAlmostEqual(summary["pep_interior_batch_p50"], 1.5)
+        self.assertEqual(summary["pep_interior_batch_max"], 100.0)
+        self.assertGreater(summary["pep_interior_batch_p95"], 80.0)
+
     def _trainer(self, tau_mode):
         trainer = Stage2Trainer.__new__(Stage2Trainer)
         trainer.device = torch.device("cpu")

@@ -111,6 +111,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--phase_residual_translation_metric_scale", type=float, default=None)
     parser.add_argument("--phase_residual_chi_metric_scale", type=float, default=None)
     parser.add_argument("--phase_residual_min_tangent_norm", type=float, default=None)
+    parser.add_argument("--phase_residual_max_metric_norm", type=float, default=None)
     parser.add_argument("--n_integration_steps", type=int, default=None)
     parser.add_argument("--integration_chi_clip", type=float, default=None)
     parser.add_argument("--integration_rot_clip", type=float, default=None)
@@ -795,6 +796,7 @@ def phase_orthogonal_residual_path(
     translation_metric_scale: float,
     chi_metric_scale: float,
     min_tangent_norm: float,
+    max_metric_norm: float,
 ) -> Tuple[List[Rigid], List[torch.Tensor], List[float]]:
     """Evaluate the endpoint-exact phase plus normal-residual path family."""
     n_steps = int(n_steps)
@@ -911,6 +913,7 @@ def phase_orthogonal_residual_path(
             translation_scale=translation_metric_scale,
             chi_scale=chi_metric_scale,
             min_tangent_norm=min_tangent_norm,
+            max_metric_norm=max_metric_norm,
         )
         envelope = endpoint_zero_envelope(
             torch.full((bsz,), t_value, device=device),
@@ -1061,6 +1064,9 @@ def construct_path(
                 ),
                 min_tangent_norm=float(
                     resolve_value("phase_residual_min_tangent_norm", 1e-3)
+                ),
+                max_metric_norm=float(
+                    resolve_value("phase_residual_max_metric_norm", 0.0)
                 ),
             ),
             correction,
@@ -1392,10 +1398,17 @@ def evaluate_batch(
     improvement = (d_apo - d_holo).abs() - (d_final - d_holo).abs()
 
     path_mae = d_final.new_zeros(d_final.shape)
+    path_mae_interior = d_final.new_zeros(d_final.shape)
+    interior_path_frames = 0
     for d_t, t_val in zip(path_dists, t_list):
         target_t = d_apo + float(t_val) * delta_target
-        path_mae = path_mae + (d_t.clamp(max=cap) - target_t.clamp(max=cap)).abs()
+        frame_error = (d_t.clamp(max=cap) - target_t.clamp(max=cap)).abs()
+        path_mae = path_mae + frame_error
+        if 1e-6 < float(t_val) < 1.0 - 1e-6:
+            path_mae_interior = path_mae_interior + frame_error
+            interior_path_frames += 1
     path_mae = path_mae / max(len(path_dists), 1)
+    path_mae_interior = path_mae_interior / max(interior_path_frames, 1)
     path_dist_stack = torch.stack(path_dists, dim=0)
     path_min_ligand_dist = path_dist_stack.min(dim=0).values
     ligand_clash_severity = torch.relu(
@@ -1530,6 +1543,7 @@ def evaluate_batch(
         counts[name] = int(mask.sum().item())
         stats[f"{name}/endpoint_abs_dist"].add(endpoint_abs, mask)
         stats[f"{name}/path_mae_dist"].add(path_mae, mask)
+        stats[f"{name}/path_mae_dist_interior"].add(path_mae_interior, mask)
         stats[f"{name}/improvement_to_holo"].add(improvement, mask)
         add_direction(stats, f"{name}/direction_acc", delta_actual, delta_target, mask)
         stats[f"{name}/path_min_ligand_dist"].add(path_min_ligand_dist, mask)
@@ -1696,6 +1710,11 @@ def main() -> None:
             args.phase_residual_chi_metric_scale
             if args.phase_residual_chi_metric_scale is not None
             else getattr(config, "phase_residual_chi_metric_scale", None)
+        ),
+        "phase_residual_max_metric_norm": (
+            args.phase_residual_max_metric_norm
+            if args.phase_residual_max_metric_norm is not None
+            else getattr(config, "phase_residual_max_metric_norm", None)
         ),
         "phase_residual_min_tangent_norm": (
             args.phase_residual_min_tangent_norm

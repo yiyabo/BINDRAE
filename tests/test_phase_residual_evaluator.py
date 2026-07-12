@@ -83,6 +83,7 @@ class PhaseResidualEvaluatorTest(unittest.TestCase):
             translation_metric_scale=1.0,
             chi_metric_scale=1.0,
             min_tangent_norm=1e-4,
+            max_metric_norm=0.5,
         )
         self.assertEqual(times, [0.0, 0.25, 0.5, 0.75, 1.0])
         self.assertTrue(torch.equal(rigids[0].get_trans(), apo_trans))
