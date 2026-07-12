@@ -465,13 +465,6 @@ class Stage2Trainer:
             'w_phase_residual_magnitude',
             'w_phase_residual_temporal_smooth',
             'w_phase_residual_neighbor_smooth',
-            'phase_teacher_cache_dir',
-            'w_phase_teacher',
-            'phase_teacher_loss_type',
-            'phase_teacher_huber_delta',
-            'phase_teacher_mask_mode',
-            'phase_teacher_min_confidence',
-            'phase_teacher_missing_policy',
         ):
             if float(getattr(config, name)) < 0.0:
                 raise ValueError(f"{name} must be >= 0")
@@ -4216,6 +4209,13 @@ class Stage2Trainer:
             'w_phase_residual_magnitude',
             'w_phase_residual_temporal_smooth',
             'w_phase_residual_neighbor_smooth',
+            'phase_teacher_cache_dir',
+            'w_phase_teacher',
+            'phase_teacher_loss_type',
+            'phase_teacher_huber_delta',
+            'phase_teacher_mask_mode',
+            'phase_teacher_min_confidence',
+            'phase_teacher_missing_policy',
             'w_smooth',
             'w_clash',
             'w_pep',
