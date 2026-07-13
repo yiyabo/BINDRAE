@@ -326,11 +326,40 @@ warnings. Every record remains `context_equilibrium` with
 
 The first global CA-RMSD collective-variable pull, job `141665`, was numerically
 stable but correctly failed the transition gate: 5,000 kJ/mol/nm^2 was too weak
-and apo CA RMSD improved only from 1.374 to 1.313 A. Job `141670` tests a
-tenfold stronger global CV over a longer pull. This is still biased atomistic
-sampling (`silver_enhanced_sampling`), not kinetics evidence. No generated path
-is admitted for even low-weight geometry supervision until path, event-order,
-and physical-validity audits pass.
+and apo CA RMSD improved only from 1.374 to 1.313 A. Job `141670` at 50,000
+kJ/mol/nm^2 also remained more holo-like. Job `141671` fixed the pilot protocol
+at 200,000 kJ/mol/nm^2, a 0.25 A target, 20 ps pull, and 4 ps endpoint hold. It
+reached 0.628 A apo CA RMSD, crossed into the apo basin, and passed path and
+atomistic audits: no severe heavy-atom clash, maximum peptide C-N distance
+1.434 A, and 0.132 maximum heavy-bond relative deviation.
+
+The same fixed protocol was applied without per-system retuning to three more
+systems. `4tts-A-6DD-401` and `2zd8-A-MER-401` passed both the transition and
+atomistic gates. `1daf-A-DSD-225` remained a recorded failure: its target-gap
+progress was 0.420, and a longer 30 ps retry improved this only to 0.464, below
+the declared 0.5 gate. The current fixed-protocol yield is therefore 3/4, not a
+silently curated 100%.
+
+The accepted paths are still biased atomistic sampling
+(`silver_enhanced_sampling`), not kinetics evidence. Target extraction reverses
+the generated holo-to-apo path, aligns the stable protein core, applies a
+21-frame circular/coordinate low-pass filter, and retains only residues with
+endpoint product-metric motion at least 0.5. A monotone dynamic program then
+estimates `tau_i`; the product-manifold residual is projected normal to the
+Cartesian-backbone bridge and divided by the endpoint-zero polynomial envelope
+only where that operation is well conditioned. Phase and residual supervision
+must each cover at least 5% of their eligible points.
+
+Three systems passed this full target gate. Their canonical cache at
+`processed_data/md_transition/phase_normal_cache_pilot3_20260713_v1` contains
+303 frames, 796 mapped residues, and 2,111 valid normal-residual targets. The
+per-system phase supervision densities are 5.10%, 7.85%, and 5.75%. These sparse
+targets are appropriate for a low-weight training smoke, not a standalone
+performance claim. Trainer support uses a dedicated `phase_normal_residual`
+objective so MD head-coordinate targets are not confused with the historical
+free-flow boundary-residual cache. One-GPU diagnostic job `141736` is the first
+end-to-end training smoke; train and validation deliberately reuse the same
+three systems and therefore measure pipeline health only.
 
 Operationally, code-level trajectory-supervised training can start as soon as
 the first silver paths pass those audits, without waiting for the entire corpus.
@@ -405,10 +434,10 @@ alone is not evidence of a better path model.
 
 ## Immediate Execution Queue
 
-1. Finish and audit the global-RMSD/path-CV silver protocol on four pilot
-   systems; retain failed paths as protocol evidence.
-2. Implement progress alignment plus `tau/normal-residual` target export, then
-   start a one-to-four-system training smoke with explicit low evidence weight.
+1. Complete the three-system low-weight phase/normal-residual training smoke
+   and verify nonzero gradients, finite losses, and cache coverage.
+2. Add independent replicas for the three successful systems before treating
+   the learned phase as a repeatable signal; keep the two `1daf` failures.
 3. Expand endpoint preparation and independent path replicas from four to
    8-16 systems only after the first transition yield is acceptable.
 4. Export GPCRmd metadata through its public search/API surface and cross-match

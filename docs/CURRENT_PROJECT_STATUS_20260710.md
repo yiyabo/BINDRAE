@@ -242,13 +242,17 @@ Non-claims:
 
 1. Keep the synchronous Cartesian bridge and controlled normal residual as the
    endpoint-corpus baselines.
-2. Build the canonical MD-transition manifest and public-source metadata audit.
-3. Build a controlled manifold benchmark with known path truth.
+2. Finish the three-system `md_phase_normal_v1` training smoke; this cache is
+   silver biased-path supervision and is not a held-out benchmark.
+3. Add independent replicas and a controlled manifold benchmark with known
+   path truth before interpreting learned phase as repeatable event order.
 4. Obtain safe scratch allocation for MD trajectories; the installed 4.7-GB
    `BINDRAE-MD` environment passed A100 CUDA smoke job `141483`, but the shared
    GPFS remains 99% full.
-5. Build the independent MD transition benchmark and the 8-16-system MD pilot.
-6. Re-open learned phase only with ground-truth event/progress supervision.
+5. Expand the current 3/4 fixed-protocol silver-path yield into the 8-16-system
+   MD pilot while preserving failed attempts.
+6. Reserve gold atomistic transitions for independent validation and final
+   scientific timing claims.
 7. Freeze the deterministic method before implementing stochastic multipath.
 
 ## Repository Posture

@@ -28,6 +28,9 @@ records, not templates.
 - `train_stage2_oracle_motion_ablation_4gpu.sh` - active Stage-2 OracleMotion / ESM last-K / REPA ablation launcher; legacy filename, defaults to 2xA100 on the current cluster and supports matched plus REPA-target-shuffled controls.
 - `submit_stage2_24k_resumable.sh` - fixed-tag submitter for the 24k OracleMotion / ESM7 / REPA matrix; reuses the interrupted run directories and keeps `AUTO_RESUME=1` so resubmission continues from `last_checkpoint.pt`.
 - `evaluate_stage2_transition_paths_1gpu.sh` - residue-level transition evaluator.
+- `run_md_global_rmsd_pull_cpu.sh` - biased silver-path pilot; it is not a kinetics workflow.
+- `audit_md_rmsd_pull_cpu.sh` / `audit_md_atomistic_path_cpu.sh` - path and atomistic admission audits.
+- `export_md_phase_normal_targets_cpu.sh` - export audited phase/normal-residual targets on CPU.
 - `evaluate_stage2_bridge_timewarp_1gpu.sh` - endpoint-exact bridge time-warp headroom evaluator before training a time-warp model.
 - `evaluate_stage2_trajectory_reliability_1gpu.sh` - internal physical/contact trajectory reliability benchmark against cubic interpolation.
 - `generate_stage2_trajectories_1gpu.sh` - trajectory export wrapper for visualization.
