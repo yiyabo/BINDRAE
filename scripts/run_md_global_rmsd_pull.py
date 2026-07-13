@@ -45,6 +45,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--final-target-rmsd-nm", type=float, default=0.05)
     parser.add_argument("--max-final-apo-ca-rmsd-a", type=float, default=1.0)
     parser.add_argument("--max-final-ligand-rmsd-a", type=float, default=5.0)
+    parser.add_argument("--min-target-progress-fraction", type=float, default=0.5)
     return parser.parse_args()
 
 
@@ -258,15 +259,19 @@ def run_pull(args: argparse.Namespace) -> Dict[str, Any]:
     metrics_handle.close()
 
     final_row = records[-1]
-    progress_fraction = 1.0 - float(final_row["apo_ca_rmsd_angstrom"]) / max(
-        float(records[0]["apo_ca_rmsd_angstrom"]), 1e-8
+    initial_apo_rmsd = float(records[0]["apo_ca_rmsd_angstrom"])
+    final_apo_rmsd = float(final_row["apo_ca_rmsd_angstrom"])
+    final_target_angstrom = final_target_nm * 10.0
+    target_progress_fraction = (initial_apo_rmsd - final_apo_rmsd) / max(
+        initial_apo_rmsd - final_target_angstrom, 1e-8
     )
     passed = (
-        float(final_row["apo_ca_rmsd_angstrom"]) <= args.max_final_apo_ca_rmsd_a
+        final_apo_rmsd <= args.max_final_apo_ca_rmsd_a
+        and final_apo_rmsd < float(final_row["holo_ca_rmsd_angstrom"])
         and float(final_row["ligand_heavy_rmsd_angstrom"])
         <= args.max_final_ligand_rmsd_a
         and 200.0 <= float(final_row["temperature_k"]) <= 400.0
-        and progress_fraction > 0.5
+        and target_progress_fraction >= args.min_target_progress_fraction
     )
     with (args.output_dir / "final_pulled.pdb").open("w") as handle:
         app.PDBFile.writeFile(pdb.topology, final_state.getPositions(), handle, keepIds=True)
@@ -291,17 +296,19 @@ def run_pull(args: argparse.Namespace) -> Dict[str, Any]:
             "endpoint_hold": args.endpoint_hold_steps,
             "total": total_step,
         },
-        "initial_apo_ca_rmsd_angstrom": float(records[0]["apo_ca_rmsd_angstrom"]),
+        "initial_apo_ca_rmsd_angstrom": initial_apo_rmsd,
         "final": {
-            "apo_ca_rmsd_angstrom": float(final_row["apo_ca_rmsd_angstrom"]),
+            "apo_ca_rmsd_angstrom": final_apo_rmsd,
             "holo_ca_rmsd_angstrom": float(final_row["holo_ca_rmsd_angstrom"]),
             "ligand_heavy_rmsd_angstrom": float(final_row["ligand_heavy_rmsd_angstrom"]),
             "temperature_k": float(final_row["temperature_k"]),
-            "progress_fraction": progress_fraction,
+            "target_progress_fraction": target_progress_fraction,
         },
         "gates": {
             "max_final_apo_ca_rmsd_angstrom": args.max_final_apo_ca_rmsd_a,
             "max_final_ligand_rmsd_angstrom": args.max_final_ligand_rmsd_a,
+            "min_target_progress_fraction": args.min_target_progress_fraction,
+            "requires_apo_closer_than_holo": True,
             "passed": passed,
         },
         "usage": {

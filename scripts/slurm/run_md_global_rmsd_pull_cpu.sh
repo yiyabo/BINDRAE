@@ -22,6 +22,7 @@ PRE_EQUILIBRATION_STEPS="${PRE_EQUILIBRATION_STEPS:-500}"
 PULLING_STEPS="${PULLING_STEPS:-5000}"
 ENDPOINT_HOLD_STEPS="${ENDPOINT_HOLD_STEPS:-1000}"
 RMSD_K_KJ_MOL_NM2="${RMSD_K_KJ_MOL_NM2:-5000}"
+FINAL_TARGET_RMSD_NM="${FINAL_TARGET_RMSD_NM:-0.05}"
 
 cd "$ROOT"
 mkdir -p logs/slurm "$OUTPUT_DIR"
@@ -42,4 +43,5 @@ python scripts/run_md_global_rmsd_pull.py \
   --pre-equilibration-steps "$PRE_EQUILIBRATION_STEPS" \
   --pulling-steps "$PULLING_STEPS" \
   --endpoint-hold-steps "$ENDPOINT_HOLD_STEPS" \
-  --rmsd-k-kj-mol-nm2 "$RMSD_K_KJ_MOL_NM2"
+  --rmsd-k-kj-mol-nm2 "$RMSD_K_KJ_MOL_NM2" \
+  --final-target-rmsd-nm "$FINAL_TARGET_RMSD_NM"
