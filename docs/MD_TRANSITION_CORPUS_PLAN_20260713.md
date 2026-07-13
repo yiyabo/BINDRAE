@@ -227,13 +227,16 @@ spread over all 24 GPUs.
 
 ### Readiness audit (2026-07-13)
 
-The current cluster is not yet software- or storage-ready for production MD:
+The cluster is software-ready for the one-system OpenMM pilot, but not yet
+storage-ready for a production trajectory corpus:
 
-- the active `BINDRAE` conda environment has no OpenMM, GROMACS, MDAnalysis,
-  MDTraj, ParmEd, OpenFF, PLUMED, or WESTPA installation;
+- the isolated `BINDRAE-MD` environment is installed and validated on A100;
 - the shared `/mnt/inaisfs` GPFS reports 400 TB total, 395 TB used, about 5.8 TB
   available, and 99% capacity utilization;
-- the GPU partition exposes 22 nodes with 8 A100 GPUs per node.
+- the GPU partition exposes 22 nodes with 8 A100 GPUs per node;
+- PLUMED/WESTPA and a production scratch/staging policy remain intentionally
+  deferred until the one-system setup, minimization, and short-equilibration
+  gates pass.
 
 Create a separate versioned `BINDRAE-MD` environment instead of mutating the
 training environment. Before the pilot, obtain a project scratch allocation or
@@ -270,6 +273,45 @@ OpenFF recommends an isolated conda-forge environment at
 4. Compare ordinary endpoint equilibration with one explicit transition method
    such as string/path-CV or weighted ensemble.
 5. Retain every failed transition attempt in the run manifest.
+
+#### Current execution status
+
+The endpoint screen is implemented by
+`scripts/select_md_pilot_candidates.py` and its CPU Slurm wrapper. It checks
+raw endpoint correspondence, sequence identity, ligand sanitization and
+parameterization risk, aligned global and pocket motion, contact changes, and
+candidate diversity. It writes a complete endpoint audit, ranked candidates,
+selected IDs, and canonical transition-manifest records.
+
+Job `141563` screened 8,000 deterministic samples in 70 seconds and found 481
+initially eligible endpoint pairs. A stricter second pass, job `141565`,
+excluded common cofactors and extreme endpoint mismatches; it found 319
+eligible pairs and selected 16 across contact-switch, local-pocket,
+domain-motion, and moderate-motion categories. The canonical manifest passed
+with zero errors and zero warnings. These records remain
+`context_equilibrium`: endpoint selection does not create transition evidence.
+
+The first setup target is `6vba-A-QU4-901`: 223 protein residues, a single
+31-heavy-atom organic ligand, 1.02 A aligned global CA RMSD, 0.69 A pocket CA
+RMSD, and 11.49 A maximum local displacement. CPU jobs `141568`, `141573`, and
+`141575` established the full protein-repair, OpenFF 2.2.1 ligand
+parameterization, explicit-solvation, and minimization chain. They also exposed
+that a raw per-atom force threshold is not a valid convergence gate for rigid
+TIP3P water because constrained O/H forces cancel at the molecular level.
+
+Job `141579` used deterministic solvent placement and staged minimization:
+1,000 iterations with protein/ligand heavy-atom restraints followed by 1,000
+unrestrained iterations. The resulting 35,144-atom system reached
+`-569771.5 kJ/mol`; maximum residue/molecule net forces were 172.5 for protein,
+128.4 for ligand, 119.5 for water, and 15.5 kJ/mol/nm for ions. This passes the
+500 kJ/mol/nm setup gate and is ready for a short restrained heating/NVT
+stability smoke. The delayed duplicate A100 job `141566` was canceled rather
+than consuming a GPU for the same setup check.
+
+This result establishes a usable molecular system, not a transition trajectory.
+Short NVT/NPT endpoint stability, replica preparation, and rare-event protocol
+tests follow separately. No generated path is admitted for phase supervision
+until the frame-level transition and manifest gates above pass.
 
 ### Scale-out
 
