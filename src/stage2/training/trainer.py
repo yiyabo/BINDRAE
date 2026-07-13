@@ -64,6 +64,7 @@ class Stage2Trainer:
         'objective_fm_rigid',
         'objective_teacher_residual',
         'objective_phase_teacher',
+        'objective_phase_normal_residual',
         'objective_bg',
         'objective_phase_residual_magnitude',
         'objective_phase_residual_temporal_smooth',
@@ -113,6 +114,13 @@ class Stage2Trainer:
         'phase_teacher_weight_mean',
         'phase_teacher_mask_frac',
         'phase_teacher_t_error',
+        'phase_normal_residual',
+        'phase_normal_residual_rigid',
+        'phase_normal_residual_chi',
+        'phase_normal_residual_mae',
+        'phase_normal_residual_weight_mean',
+        'phase_normal_residual_mask_frac',
+        'phase_normal_residual_t_error',
         'bg',
         'smooth',
         'clash',
@@ -568,6 +576,32 @@ class Stage2Trainer:
             raise ValueError(
                 "phase_teacher_head_only and phase_teacher_residual_heads_only "
                 "are mutually exclusive"
+            )
+        if config.w_phase_normal_residual < 0.0:
+            raise ValueError("w_phase_normal_residual must be >= 0")
+        if config.phase_normal_residual_loss_type not in {'mse', 'huber'}:
+            raise ValueError(
+                "Unsupported phase_normal_residual_loss_type="
+                f"{config.phase_normal_residual_loss_type}"
+            )
+        if config.phase_normal_residual_huber_delta <= 0.0:
+            raise ValueError("phase_normal_residual_huber_delta must be > 0")
+        if config.phase_normal_missing_policy not in {'error', 'skip'}:
+            raise ValueError(
+                "Unsupported phase_normal_missing_policy="
+                f"{config.phase_normal_missing_policy}"
+            )
+        if config.w_phase_normal_residual > 0.0 and not config.phase_normal_cache_dir:
+            raise ValueError(
+                "w_phase_normal_residual > 0 requires phase_normal_cache_dir"
+            )
+        if (
+            config.w_phase_normal_residual > 0.0
+            and config.path_parameterization != 'phase_orthogonal_residual_v1'
+        ):
+            raise ValueError(
+                "phase-normal residual supervision requires "
+                "phase_orthogonal_residual_v1"
             )
         allowed_projection_schedules = {'smoothstep', 'smootherstep', 'late_smoother', 'quadratic'}
         if config.terminal_projection_schedule not in allowed_projection_schedules:
@@ -2423,6 +2457,11 @@ class Stage2Trainer:
             raise RuntimeError("phase_teacher_cache_dir is not set")
         return Path(self.config.phase_teacher_cache_dir) / f"{self._safe_sample_id(sample_id)}.npz"
 
+    def _phase_normal_cache_path(self, sample_id: str) -> Path:
+        if not self.config.phase_normal_cache_dir:
+            raise RuntimeError("phase_normal_cache_dir is not set")
+        return Path(self.config.phase_normal_cache_dir) / f"{self._safe_sample_id(sample_id)}.npz"
+
     def _load_phase_teacher_targets(
         self,
         batch,
@@ -2448,8 +2487,12 @@ class Stage2Trainer:
                 continue
             with np.load(path, allow_pickle=False) as data:
                 schema = str(data['schema_version'].item())
-                if schema != 'phase_teacher_v1':
-                    raise ValueError(f"{path} schema_version={schema!r}, expected 'phase_teacher_v1'")
+                allowed_schemas = {'phase_teacher_v1', 'md_phase_normal_v1'}
+                if schema not in allowed_schemas:
+                    raise ValueError(
+                        f"{path} schema_version={schema!r}, expected one of "
+                        f"{sorted(allowed_schemas)}"
+                    )
                 cached_id = str(data['sample_id'].item())
                 if cached_id != str(sample_id):
                     raise ValueError(f"{path} sample_id={cached_id!r}, expected {sample_id!r}")
@@ -2529,6 +2572,166 @@ class Stage2Trainer:
             'source_grid_error': source_grid_error.to(self.device),
         }
 
+    def _load_phase_normal_residual_targets(
+        self,
+        batch,
+        model_t_values: List[float],
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        """Load audited MD targets in phase-normal head coordinates."""
+        if (
+            not self.config.phase_normal_cache_dir
+            or self.config.w_phase_normal_residual <= 0.0
+        ):
+            return None
+
+        n_t = len(model_t_values)
+        bsz, max_n = batch.node_mask.shape
+        target_rigid = torch.zeros((n_t, bsz, max_n, 6), dtype=torch.float32)
+        target_chi = torch.zeros((n_t, bsz, max_n, 4), dtype=torch.float32)
+        target_mask = torch.zeros((n_t, bsz, max_n), dtype=torch.bool)
+        target_weight = torch.zeros((n_t, bsz, max_n), dtype=torch.float32)
+        target_chi_mask = torch.zeros((n_t, bsz, max_n, 4), dtype=torch.bool)
+        source_grid_error = torch.zeros((bsz,), dtype=torch.float32)
+        missing = []
+        loaded = 0
+
+        for b, sample_id in enumerate(getattr(batch, 'pdb_ids', [])):
+            n_res = int(batch.n_residues[b])
+            path = self._phase_normal_cache_path(str(sample_id))
+            if not path.is_file():
+                missing.append(str(path))
+                continue
+            with np.load(path, allow_pickle=False) as data:
+                schema = str(data['schema_version'].item())
+                if schema != 'md_phase_normal_v1':
+                    raise ValueError(
+                        f"{path} schema_version={schema!r}, expected "
+                        "'md_phase_normal_v1'"
+                    )
+                cached_id = str(data['sample_id'].item())
+                if cached_id != str(sample_id):
+                    raise ValueError(
+                        f"{path} sample_id={cached_id!r}, expected {sample_id!r}"
+                    )
+                cached_n = int(data['n_residues'].item())
+                if cached_n != n_res:
+                    raise ValueError(
+                        f"{path} n_residues={cached_n}, expected {n_res}"
+                    )
+                bridge_mode = (
+                    str(data['bridge_mode'].item())
+                    if 'bridge_mode' in data
+                    else 'cartesian_backbone'
+                )
+                envelope = (
+                    str(data['residual_envelope'].item())
+                    if 'residual_envelope' in data
+                    else 'poly'
+                )
+                if bridge_mode != self.config.phase_residual_bridge_mode:
+                    raise ValueError(
+                        f"{path} bridge_mode={bridge_mode!r}, expected "
+                        f"{self.config.phase_residual_bridge_mode!r}"
+                    )
+                if envelope != self.config.phase_residual_envelope:
+                    raise ValueError(
+                        f"{path} residual_envelope={envelope!r}, expected "
+                        f"{self.config.phase_residual_envelope!r}"
+                    )
+                metric_contract = {
+                    'rotation_metric_scale': float(
+                        self.config.phase_residual_rotation_metric_scale
+                    ),
+                    'translation_metric_scale': float(
+                        self.config.phase_residual_translation_metric_scale
+                    ),
+                    'chi_metric_scale': float(
+                        self.config.phase_residual_chi_metric_scale
+                    ),
+                }
+                for key, expected in metric_contract.items():
+                    cached = float(data[key].item()) if key in data else 1.0
+                    if not math.isclose(cached, expected, rel_tol=1e-6, abs_tol=1e-8):
+                        raise ValueError(
+                            f"{path} {key}={cached}, expected {expected}"
+                        )
+
+                source_t = np.asarray(data['t_values'], dtype=np.float32)
+                residual_rot = np.asarray(data['residual_rot'], dtype=np.float32)
+                residual_trans = np.asarray(data['residual_trans'], dtype=np.float32)
+                residual_chi = np.asarray(data['residual_chi'], dtype=np.float32)
+                residual_valid = np.asarray(data['residual_valid_mask']).astype(bool)
+                residual_confidence = np.asarray(
+                    data['residual_confidence'], dtype=np.float32
+                )
+                expected_rigid_shape = (source_t.size, n_res, 3)
+                expected_mask_shape = (source_t.size, n_res)
+                if residual_rot.shape != expected_rigid_shape:
+                    raise ValueError(f"{path} has invalid residual_rot shape")
+                if residual_trans.shape != expected_rigid_shape:
+                    raise ValueError(f"{path} has invalid residual_trans shape")
+                if residual_chi.shape != (source_t.size, n_res, 4):
+                    raise ValueError(f"{path} has invalid residual_chi shape")
+                if residual_valid.shape != expected_mask_shape:
+                    raise ValueError(f"{path} has invalid residual_valid_mask shape")
+                if residual_confidence.shape != expected_mask_shape:
+                    raise ValueError(f"{path} has invalid residual_confidence shape")
+                node = np.asarray(data['node_mask'][:n_res]).astype(bool)
+                chi_mask = np.asarray(data['chi_mask'][:n_res]).astype(bool)
+
+                nearest_errors = []
+                for k, t_value in enumerate(model_t_values):
+                    index = int(np.abs(source_t - float(t_value)).argmin())
+                    nearest_errors.append(abs(float(source_t[index]) - float(t_value)))
+                    target_rigid[k, b, :n_res, :3] = torch.from_numpy(
+                        residual_rot[index].copy()
+                    )
+                    target_rigid[k, b, :n_res, 3:] = torch.from_numpy(
+                        residual_trans[index].copy()
+                    )
+                    target_chi[k, b, :n_res] = torch.from_numpy(
+                        residual_chi[index].copy()
+                    )
+                    valid = node & residual_valid[index]
+                    target_mask[k, b, :n_res] = torch.from_numpy(valid)
+                    target_weight[k, b, :n_res] = torch.from_numpy(
+                        np.nan_to_num(
+                            residual_confidence[index],
+                            nan=0.0,
+                            posinf=0.0,
+                            neginf=0.0,
+                        ).clip(0.0, 1.0)
+                    )
+                    target_chi_mask[k, b, :n_res] = torch.from_numpy(
+                        chi_mask & valid[:, None]
+                    )
+                source_grid_error[b] = max(nearest_errors, default=0.0)
+                loaded += 1
+
+        if missing and self.config.phase_normal_missing_policy == 'error':
+            shown = ", ".join(missing[:3])
+            extra = "" if len(missing) <= 3 else f" ... (+{len(missing) - 3})"
+            raise FileNotFoundError(f"Missing phase-normal cache: {shown}{extra}")
+        if loaded == 0:
+            return None
+
+        target_mask = target_mask.to(self.device) & batch.node_mask.bool().unsqueeze(0)
+        target_weight = target_weight.to(self.device).clamp(0.0, 1.0)
+        target_weight = target_weight * target_mask.float()
+        target_chi_mask = (
+            target_chi_mask.to(self.device)
+            & batch.chi_mask.bool().unsqueeze(0)
+            & target_mask.unsqueeze(-1)
+        )
+        return {
+            'rigid': target_rigid.to(self.device),
+            'chi': target_chi.to(self.device),
+            'mask': target_mask,
+            'weight': target_weight,
+            'chi_mask': target_chi_mask,
+            'source_grid_error': source_grid_error.to(self.device),
+        }
+
     def _load_teacher_residual_targets(
         self,
         batch,
@@ -2566,6 +2769,17 @@ class Stage2Trainer:
                 continue
 
             with np.load(path, allow_pickle=False) as data:
+                if "schema_version" in data:
+                    schema = str(data["schema_version"].item())
+                    allowed_schemas = {
+                        "stage2_teacher_residual_v1",
+                        "stage2_teacher_residual_v2",
+                    }
+                    if schema not in allowed_schemas:
+                        raise ValueError(
+                            f"{path} schema_version={schema!r}, expected one of "
+                            f"{sorted(allowed_schemas)}"
+                        )
                 cached_id = str(data["sample_id"].item()) if "sample_id" in data else str(sample_id)
                 if cached_id != str(sample_id):
                     raise ValueError(f"{path} sample_id={cached_id!r}, expected {sample_id!r}")
@@ -3149,6 +3363,13 @@ class Stage2Trainer:
         phase_teacher_weight_mean = chi_ref.new_tensor(0.0)
         phase_teacher_mask_frac = chi_ref.new_tensor(0.0)
         phase_teacher_t_error = chi_ref.new_tensor(0.0)
+        L_phase_normal_residual = chi_ref.new_tensor(0.0)
+        L_phase_normal_residual_rigid = chi_ref.new_tensor(0.0)
+        L_phase_normal_residual_chi = chi_ref.new_tensor(0.0)
+        phase_normal_residual_mae = chi_ref.new_tensor(0.0)
+        phase_normal_residual_weight_mean = chi_ref.new_tensor(0.0)
+        phase_normal_residual_mask_frac = chi_ref.new_tensor(0.0)
+        phase_normal_residual_t_error = chi_ref.new_tensor(0.0)
         phase_residual_active_frac = chi_ref.new_tensor(0.0)
         phase_residual_norm_mean = chi_ref.new_tensor(0.0)
         phase_residual_norm_max = chi_ref.new_tensor(0.0)
@@ -3293,6 +3514,92 @@ class Stage2Trainer:
                         )
                     ).detach()
                     phase_teacher_t_error = phase_teacher_targets[
+                        'source_grid_error'
+                    ].mean().detach()
+                phase_normal_targets = self._load_phase_normal_residual_targets(
+                    batch,
+                    t_list[1:-1],
+                )
+                if phase_normal_targets is not None:
+                    records = self._last_phase_residual_records
+                    if len(records) != len(t_list) - 2:
+                        raise RuntimeError(
+                            "Phase-normal residual record/time mismatch: "
+                            f"records={len(records)} times={len(t_list) - 2}"
+                        )
+                    pred_rigid = torch.stack(
+                        [record['projected_rigid'] for record in records], dim=0
+                    ).float()
+                    pred_chi = torch.stack(
+                        [record['projected_chi'] for record in records], dim=0
+                    ).float()
+                    residual_scale = max(
+                        float(self.config.phase_residual_scale), 1e-8
+                    )
+                    target_rigid = phase_normal_targets['rigid'].float() / residual_scale
+                    target_chi = phase_normal_targets['chi'].float() / residual_scale
+                    target_weight = phase_normal_targets['weight'].float()
+                    target_mask = phase_normal_targets['mask']
+                    target_chi_mask = phase_normal_targets['chi_mask'].float()
+                    rigid_delta = pred_rigid - target_rigid
+                    chi_delta = pred_chi - target_chi
+                    if self.config.phase_normal_residual_loss_type == 'huber':
+                        beta = float(
+                            self.config.phase_normal_residual_huber_delta
+                        )
+                        rigid_component_loss = F.smooth_l1_loss(
+                            rigid_delta,
+                            torch.zeros_like(rigid_delta),
+                            reduction='none',
+                            beta=beta,
+                        )
+                        chi_component_loss = F.smooth_l1_loss(
+                            chi_delta,
+                            torch.zeros_like(chi_delta),
+                            reduction='none',
+                            beta=beta,
+                        )
+                    else:
+                        rigid_component_loss = rigid_delta.square()
+                        chi_component_loss = chi_delta.square()
+
+                    rigid_denom = (
+                        target_weight.sum() * pred_rigid.shape[-1]
+                    ).clamp(min=1.0)
+                    L_phase_normal_residual_rigid = (
+                        rigid_component_loss * target_weight.unsqueeze(-1)
+                    ).sum() / rigid_denom
+                    chi_weight = target_weight.unsqueeze(-1) * target_chi_mask
+                    chi_denom = chi_weight.sum().clamp(min=1.0)
+                    L_phase_normal_residual_chi = (
+                        chi_component_loss * chi_weight
+                    ).sum() / chi_denom
+                    L_phase_normal_residual = (
+                        L_phase_normal_residual_rigid
+                        + L_phase_normal_residual_chi
+                    )
+                    rigid_mae = (
+                        rigid_delta.abs() * target_weight.unsqueeze(-1)
+                    ).sum() / rigid_denom
+                    chi_mae = (
+                        chi_delta.abs() * chi_weight
+                    ).sum() / chi_denom
+                    phase_normal_residual_mae = (
+                        rigid_mae + chi_mae
+                    ).detach()
+                    active_phase_normal = target_mask & (target_weight > 0.0)
+                    if active_phase_normal.any():
+                        phase_normal_residual_weight_mean = target_weight[
+                            active_phase_normal
+                        ].mean().detach()
+                    phase_normal_residual_mask_frac = (
+                        active_phase_normal.float().sum()
+                        / (
+                            batch.node_mask.float().sum().clamp(min=1.0)
+                            * max(len(records), 1)
+                        )
+                    ).detach()
+                    phase_normal_residual_t_error = phase_normal_targets[
                         'source_grid_error'
                     ].mean().detach()
             elif boundary_residual_mode:
@@ -3812,6 +4119,7 @@ class Stage2Trainer:
             'objective_fm_rigid': self.config.w_fm_rigid * stabilized(L_fm_rigid),
             'objective_teacher_residual': self.config.w_teacher_residual * stabilized(L_teacher_residual),
             'objective_phase_teacher': self.config.w_phase_teacher * stabilized(L_phase_teacher),
+            'objective_phase_normal_residual': self.config.w_phase_normal_residual * stabilized(L_phase_normal_residual),
             'objective_bg': self.config.w_bg * stabilized(L_bg),
             'objective_phase_residual_magnitude': self.config.w_phase_residual_magnitude * stabilized(L_phase_residual_magnitude),
             'objective_phase_residual_temporal_smooth': self.config.w_phase_residual_temporal_smooth * stabilized(L_phase_residual_temporal_smooth),
@@ -3909,6 +4217,13 @@ class Stage2Trainer:
             'phase_teacher_weight_mean': phase_teacher_weight_mean,
             'phase_teacher_mask_frac': phase_teacher_mask_frac,
             'phase_teacher_t_error': phase_teacher_t_error,
+            'phase_normal_residual': L_phase_normal_residual,
+            'phase_normal_residual_rigid': L_phase_normal_residual_rigid,
+            'phase_normal_residual_chi': L_phase_normal_residual_chi,
+            'phase_normal_residual_mae': phase_normal_residual_mae,
+            'phase_normal_residual_weight_mean': phase_normal_residual_weight_mean,
+            'phase_normal_residual_mask_frac': phase_normal_residual_mask_frac,
+            'phase_normal_residual_t_error': phase_normal_residual_t_error,
             'bg': L_bg,
             'smooth': L_smooth,
             'clash': L_clash,
@@ -4259,6 +4574,11 @@ class Stage2Trainer:
             'phase_teacher_missing_policy',
             'phase_teacher_head_only',
             'phase_teacher_residual_heads_only',
+            'phase_normal_cache_dir',
+            'w_phase_normal_residual',
+            'phase_normal_residual_loss_type',
+            'phase_normal_residual_huber_delta',
+            'phase_normal_missing_policy',
             'w_smooth',
             'w_clash',
             'w_pep',
@@ -4298,6 +4618,11 @@ class Stage2Trainer:
             'phase_teacher_missing_policy': 'error',
             'phase_teacher_head_only': False,
             'phase_teacher_residual_heads_only': False,
+            'phase_normal_cache_dir': None,
+            'w_phase_normal_residual': 0.0,
+            'phase_normal_residual_loss_type': 'huber',
+            'phase_normal_residual_huber_delta': 0.25,
+            'phase_normal_missing_policy': 'error',
         }
         for field in strict_fields:
             old = self._config_value(ckpt_config, field)

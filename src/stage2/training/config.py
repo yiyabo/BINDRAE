@@ -151,6 +151,15 @@ class TrainingConfig:
     phase_teacher_head_only: bool = False
     phase_teacher_residual_heads_only: bool = False
 
+    # Audited atomistic path targets for the phase-normal residual heads.
+    # Unlike teacher_residual_cache_dir, this cache is defined in the
+    # phase_orthogonal_residual_v1 parameterization itself.
+    phase_normal_cache_dir: Optional[str] = None
+    w_phase_normal_residual: float = 0.0
+    phase_normal_residual_loss_type: str = "huber"  # mse | huber
+    phase_normal_residual_huber_delta: float = 0.25
+    phase_normal_missing_policy: str = "error"  # error | skip
+
     # Loss weights
     w_fm_chi: float = 1.0
     w_fm_rigid: float = 1.0

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Select samples with usable phase_teacher_v1 supervision.
+"""Select samples with usable phase or MD phase-normal supervision.
 
 The resulting manifest is an enriched diagnostic subset. It must not replace
 evaluation on the original validation distribution.
@@ -71,8 +71,12 @@ def summarize_cache_file(
 ) -> Dict[str, object]:
     with np.load(path, allow_pickle=False) as data:
         schema = str(data["schema_version"].item())
-        if schema != "phase_teacher_v1":
-            raise ValueError(f"{path} schema_version={schema!r}, expected phase_teacher_v1")
+        allowed_schemas = {"phase_teacher_v1", "md_phase_normal_v1"}
+        if schema not in allowed_schemas:
+            raise ValueError(
+                f"{path} schema_version={schema!r}, expected one of "
+                f"{sorted(allowed_schemas)}"
+            )
         mask = selected_mask(data, mask_mode)
         target_t = np.linspace(0.0, 1.0, n_model_steps + 1, dtype=np.float32)[1:-1]
         confidence = interpolate_rows(

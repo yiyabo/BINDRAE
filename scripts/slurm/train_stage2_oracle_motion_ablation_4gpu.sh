@@ -104,6 +104,11 @@ PHASE_TEACHER_MIN_CONFIDENCE="${PHASE_TEACHER_MIN_CONFIDENCE:-0.05}"
 PHASE_TEACHER_MISSING_POLICY="${PHASE_TEACHER_MISSING_POLICY:-error}"
 PHASE_TEACHER_HEAD_ONLY="${PHASE_TEACHER_HEAD_ONLY:-0}"
 PHASE_TEACHER_RESIDUAL_HEADS_ONLY="${PHASE_TEACHER_RESIDUAL_HEADS_ONLY:-0}"
+PHASE_NORMAL_CACHE_DIR="${PHASE_NORMAL_CACHE_DIR:-}"
+W_PHASE_NORMAL_RESIDUAL="${W_PHASE_NORMAL_RESIDUAL:-0.0}"
+PHASE_NORMAL_RESIDUAL_LOSS_TYPE="${PHASE_NORMAL_RESIDUAL_LOSS_TYPE:-huber}"
+PHASE_NORMAL_RESIDUAL_HUBER_DELTA="${PHASE_NORMAL_RESIDUAL_HUBER_DELTA:-0.25}"
+PHASE_NORMAL_MISSING_POLICY="${PHASE_NORMAL_MISSING_POLICY:-error}"
 ESM_FUSION_ENABLED="${ESM_FUSION_ENABLED:-0}"
 ESM_NUM_LAYERS="${ESM_NUM_LAYERS:-1}"
 ESM_FUSION_MODE="${ESM_FUSION_MODE:-sum}"
@@ -331,6 +336,32 @@ if [[ "$PATH_PARAMETERIZATION" == "phase_orthogonal_residual_v1" && "$GEOM_EVERY
   echo "ERROR: phase_orthogonal_residual_v1 requires GEOM_EVERY=1"
   exit 1
 fi
+case "$PHASE_NORMAL_RESIDUAL_LOSS_TYPE" in
+  mse|huber) ;;
+  *)
+    echo "ERROR: PHASE_NORMAL_RESIDUAL_LOSS_TYPE must be mse or huber"
+    exit 1
+    ;;
+esac
+case "$PHASE_NORMAL_MISSING_POLICY" in
+  error|skip) ;;
+  *)
+    echo "ERROR: PHASE_NORMAL_MISSING_POLICY must be error or skip"
+    exit 1
+    ;;
+esac
+python - <<PY
+weight = float("$W_PHASE_NORMAL_RESIDUAL")
+delta = float("$PHASE_NORMAL_RESIDUAL_HUBER_DELTA")
+if weight < 0.0:
+    raise SystemExit("ERROR: W_PHASE_NORMAL_RESIDUAL must be >= 0")
+if delta <= 0.0:
+    raise SystemExit("ERROR: PHASE_NORMAL_RESIDUAL_HUBER_DELTA must be > 0")
+if weight > 0.0 and not "$PHASE_NORMAL_CACHE_DIR":
+    raise SystemExit("ERROR: positive MD residual weight requires PHASE_NORMAL_CACHE_DIR")
+if weight > 0.0 and "$PATH_PARAMETERIZATION" != "phase_orthogonal_residual_v1":
+    raise SystemExit("ERROR: MD phase-normal residual supervision requires phase_orthogonal_residual_v1")
+PY
 case "$LIGAND_CLEARANCE_MASK_MODE" in
   pocket|node|motion_active|pocket_or_motion_active) ;;
   *)
@@ -840,6 +871,15 @@ fi
 if [[ "$PHASE_TEACHER_RESIDUAL_HEADS_ONLY" == "1" ]]; then
   PHASE_TEACHER_ARGS+=(--phase_teacher_residual_heads_only)
 fi
+PHASE_NORMAL_ARGS=(
+  --w_phase_normal_residual "$W_PHASE_NORMAL_RESIDUAL"
+  --phase_normal_residual_loss_type "$PHASE_NORMAL_RESIDUAL_LOSS_TYPE"
+  --phase_normal_residual_huber_delta "$PHASE_NORMAL_RESIDUAL_HUBER_DELTA"
+  --phase_normal_missing_policy "$PHASE_NORMAL_MISSING_POLICY"
+)
+if [[ -n "$PHASE_NORMAL_CACHE_DIR" ]]; then
+  PHASE_NORMAL_ARGS+=(--phase_normal_cache_dir "$PHASE_NORMAL_CACHE_DIR")
+fi
 LENGTH_BUCKET_ARGS=()
 if [[ "$LENGTH_BUCKETED_TRAIN" == "1" ]]; then
   LENGTH_BUCKET_ARGS=(
@@ -921,6 +961,8 @@ echo "w_phase_teacher: $W_PHASE_TEACHER"
 echo "phase teacher mask/conf: $PHASE_TEACHER_MASK_MODE/$PHASE_TEACHER_MIN_CONFIDENCE"
 echo "phase head only: $PHASE_TEACHER_HEAD_ONLY"
 echo "phase/resid heads only: $PHASE_TEACHER_RESIDUAL_HEADS_ONLY"
+echo "phase-normal cache: ${PHASE_NORMAL_CACHE_DIR:-OFF}"
+echo "w_phase_normal_residual: $W_PHASE_NORMAL_RESIDUAL"
 echo "w_fm_chi:        $W_FM_CHI"
 echo "w_fm_rigid:      $W_FM_RIGID"
 echo "w_bg:            $W_BG"
@@ -1004,6 +1046,7 @@ python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA {torch.versio
   --phase_residual_max_metric_norm "$PHASE_RESIDUAL_MAX_METRIC_NORM" \
   "${TEACHER_RESIDUAL_ARGS[@]}" \
   "${PHASE_TEACHER_ARGS[@]}" \
+  "${PHASE_NORMAL_ARGS[@]}" \
   --val_split "$VAL_SPLIT" \
   --no_stage1_prior \
   --w_prior 0.0 \
