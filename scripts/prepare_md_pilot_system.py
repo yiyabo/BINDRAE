@@ -158,6 +158,15 @@ def _force_summary(
         "solvent": norms[solute_atoms:],
         "all": norms,
     }
+    return {
+        name: {
+            "max_kj_mol_nm": float(component.max()),
+            "p99_kj_mol_nm": float(np.quantile(component, 0.99)),
+            "mean_kj_mol_nm": float(component.mean()),
+        }
+        for name, component in slices.items()
+        if len(component) > 0
+    }
 
 
 def _residue_net_force_summary(
@@ -195,17 +204,6 @@ def _residue_net_force_summary(
         for name, component in grouped.items()
         if component
     }
-    return {
-        name: {
-            "max_kj_mol_nm": float(component.max()),
-            "p99_kj_mol_nm": float(np.quantile(component, 0.99)),
-            "mean_kj_mol_nm": float(component.mean()),
-        }
-        for name, component in slices.items()
-        if len(component) > 0
-    }
-
-
 def prepare_and_minimize(record: Mapping[str, Any], args: argparse.Namespace) -> Dict[str, Any]:
     from openff.toolkit import Molecule
     from openmm import (

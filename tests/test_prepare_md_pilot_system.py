@@ -35,6 +35,22 @@ class PrepareMDPilotSystemTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 MODULE.load_candidate(path, candidate_index=0, transition_id="a")
 
+    def test_force_summary_returns_component_statistics(self):
+        try:
+            from openmm import unit
+        except ImportError:
+            self.skipTest("OpenMM is only required in the BINDRAE-MD environment")
+        import numpy as np
+
+        forces = unit.Quantity(
+            np.asarray([[3.0, 4.0, 0.0], [0.0, 0.0, 2.0], [0.0, 6.0, 8.0]]),
+            unit.kilojoule_per_mole / unit.nanometer,
+        )
+        summary = MODULE._force_summary(forces, protein_atoms=1, solute_atoms=2)
+        self.assertEqual(summary["protein"]["max_kj_mol_nm"], 5.0)
+        self.assertEqual(summary["ligand"]["max_kj_mol_nm"], 2.0)
+        self.assertEqual(summary["solvent"]["max_kj_mol_nm"], 10.0)
+
 
 if __name__ == "__main__":
     unittest.main()

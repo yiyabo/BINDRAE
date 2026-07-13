@@ -304,14 +304,40 @@ Job `141579` used deterministic solvent placement and staged minimization:
 unrestrained iterations. The resulting 35,144-atom system reached
 `-569771.5 kJ/mol`; maximum residue/molecule net forces were 172.5 for protein,
 128.4 for ligand, 119.5 for water, and 15.5 kJ/mol/nm for ions. This passes the
-500 kJ/mol/nm setup gate and is ready for a short restrained heating/NVT
-stability smoke. The delayed duplicate A100 job `141566` was canceled rather
-than consuming a GPU for the same setup check.
+500 kJ/mol/nm setup gate. The delayed duplicate A100 job `141566` was canceled
+rather than consuming a GPU for the same setup check.
 
-This result establishes a usable molecular system, not a transition trajectory.
-Short NVT/NPT endpoint stability, replica preparation, and rare-event protocol
-tests follow separately. No generated path is admitted for phase supervision
-until the frame-level transition and manifest gates above pass.
+Job `141603` then passed restrained heating and short NVT: final temperature was
+292.5 K, protein CA RMSD was 0.716 A, and ligand heavy-atom RMSD was 0.958 A.
+After fixing explicit periodic-box transfer between OpenMM contexts and making
+ligand RMSD minimum-image aware, job `141615` passed short NPT at 302.1 K,
+1.016 g/mL mean density, 0.006 volume coefficient of variation, 0.777 A protein
+CA RMSD, and 1.121 A ligand RMSD.
+
+The same setup/NVT/NPT lane was then expanded to `4tts-A-6DD-401`,
+`2zd8-A-MER-401`, and `1daf-A-DSD-225`. All three passed system preparation and
+NVT/NPT stability. Their final NPT protein CA RMSDs were 0.872, 0.669, and
+0.700 A; ligand RMSDs were 0.935, 2.593, and 2.461 A; mean densities were
+1.011, 1.020, and 1.018 g/mL. The four endpoint-equilibrium replicas are merged
+under `processed_data/md_transition/context_manifests/ahoj_context_pilot4_npt0.jsonl`.
+The combined manifest passes schema and file audits with zero errors and zero
+warnings. Every record remains `context_equilibrium` with
+`phase_supervision=false`.
+
+The first global CA-RMSD collective-variable pull, job `141665`, was numerically
+stable but correctly failed the transition gate: 5,000 kJ/mol/nm^2 was too weak
+and apo CA RMSD improved only from 1.374 to 1.313 A. Job `141670` tests a
+tenfold stronger global CV over a longer pull. This is still biased atomistic
+sampling (`silver_enhanced_sampling`), not kinetics evidence. No generated path
+is admitted for even low-weight geometry supervision until path, event-order,
+and physical-validity audits pass.
+
+Operationally, code-level trajectory-supervised training can start as soon as
+the first silver paths pass those audits, without waiting for the entire corpus.
+A realistic target is 1-2 days for a one-to-four-system training smoke, 3-7 days
+for the first useful multi-system silver screen, and one-to-two weeks for the
+8-16-system multi-replica pilot. Rare-event yield can lengthen this schedule;
+gold held-out transition evidence remains a separate final-selection gate.
 
 ### Scale-out
 
@@ -379,16 +405,18 @@ alone is not evidence of a better path model.
 
 ## Immediate Execution Queue
 
-1. Validate the canonical JSONL schema with the repository audit CLI.
-2. Export GPCRmd metadata through its public search/API surface and cross-match
+1. Finish and audit the global-RMSD/path-CV silver protocol on four pilot
+   systems; retain failed paths as protocol evidence.
+2. Implement progress alignment plus `tau/normal-residual` target export, then
+   start a one-to-four-system training smoke with explicit low evidence weight.
+3. Expand endpoint preparation and independent path replicas from four to
+   8-16 systems only after the first transition yield is acceptable.
+4. Export GPCRmd metadata through its public search/API surface and cross-match
    PDB/UniProt identifiers with AHoJ-DB.
-3. Request or recover a TransAtlas metadata/data archive without blocking the
+5. Request or recover a TransAtlas metadata/data archive without blocking the
    live-source pipeline.
-4. Inspect and download 20-50 high-quality matched candidates across available
+6. Inspect and download 20-50 high-quality matched candidates across available
    sources.
-5. Build topology/trajectory preprocessing and residue-mapping checks.
-6. Create the separate MD environment and pass the one-system infrastructure
-   smoke after storage is allocated.
-7. Implement progress alignment and `tau/residual` target export.
-8. Run the 8-16-system cluster MD pilot for atomistic evidence gaps.
-9. Re-open learned-phase training only after the targets pass Gate 2.
+7. Promote only verified endpoint-crossing trajectories into phase supervision;
+   keep context-equilibrium and failed pulls in separate manifests.
+8. Run Gate 2 before formal learned-phase hyperparameter selection.
