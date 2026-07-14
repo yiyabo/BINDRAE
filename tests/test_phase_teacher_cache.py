@@ -11,6 +11,31 @@ from scripts.build_stage2_phase_teacher_subset import summarize_cache_file
 
 
 class PhaseTeacherCacheTest(unittest.TestCase):
+    def test_replica_cache_rotates_deterministically_by_epoch(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            for replica in range(3):
+                (root / f"sample_1__silver_r{replica:02d}.npz").touch()
+
+            trainer = Stage2Trainer.__new__(Stage2Trainer)
+            trainer.current_epoch = 0
+            first = trainer._replicated_supervision_cache_path(tmpdir, "sample/1")
+            trainer.current_epoch = 4
+            second = trainer._replicated_supervision_cache_path(tmpdir, "sample/1")
+
+            self.assertEqual(first.name, "sample_1__silver_r00.npz")
+            self.assertEqual(second.name, "sample_1__silver_r01.npz")
+            self.assertTrue(
+                trainer._cache_sample_id_matches(
+                    "sample/1", "sample/1__silver_r01"
+                )
+            )
+            self.assertFalse(
+                trainer._cache_sample_id_matches(
+                    "sample/1", "different__silver_r01"
+                )
+            )
+
     def test_loads_interpolated_contact_event_targets(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             cache_path = Path(tmpdir) / "sample_1.npz"

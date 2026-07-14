@@ -2452,15 +2452,40 @@ class Stage2Trainer:
             raise RuntimeError("teacher_residual_cache_dir is not set")
         return Path(self.config.teacher_residual_cache_dir) / f"{self._safe_sample_id(sample_id)}.npz"
 
+    def _replicated_supervision_cache_path(
+        self, cache_dir: str, sample_id: str
+    ) -> Path:
+        root = Path(cache_dir)
+        safe_id = self._safe_sample_id(sample_id)
+        direct = root / f"{safe_id}.npz"
+        if direct.is_file():
+            return direct
+
+        replicas = sorted(root.glob(f"{safe_id}__silver_r*.npz"))
+        if not replicas:
+            return direct
+        epoch = int(getattr(self, 'current_epoch', 0))
+        return replicas[epoch % len(replicas)]
+
+    @staticmethod
+    def _cache_sample_id_matches(requested_id: str, cached_id: str) -> bool:
+        return cached_id == requested_id or re.fullmatch(
+            rf"{re.escape(requested_id)}__silver_r\d+", cached_id
+        ) is not None
+
     def _phase_teacher_cache_path(self, sample_id: str) -> Path:
         if not self.config.phase_teacher_cache_dir:
             raise RuntimeError("phase_teacher_cache_dir is not set")
-        return Path(self.config.phase_teacher_cache_dir) / f"{self._safe_sample_id(sample_id)}.npz"
+        return self._replicated_supervision_cache_path(
+            self.config.phase_teacher_cache_dir, sample_id
+        )
 
     def _phase_normal_cache_path(self, sample_id: str) -> Path:
         if not self.config.phase_normal_cache_dir:
             raise RuntimeError("phase_normal_cache_dir is not set")
-        return Path(self.config.phase_normal_cache_dir) / f"{self._safe_sample_id(sample_id)}.npz"
+        return self._replicated_supervision_cache_path(
+            self.config.phase_normal_cache_dir, sample_id
+        )
 
     def _load_phase_teacher_targets(
         self,
@@ -2494,7 +2519,7 @@ class Stage2Trainer:
                         f"{sorted(allowed_schemas)}"
                     )
                 cached_id = str(data['sample_id'].item())
-                if cached_id != str(sample_id):
+                if not self._cache_sample_id_matches(str(sample_id), cached_id):
                     raise ValueError(f"{path} sample_id={cached_id!r}, expected {sample_id!r}")
                 cached_n = int(data['n_residues'].item())
                 if cached_n != n_res:
@@ -2609,7 +2634,7 @@ class Stage2Trainer:
                         "'md_phase_normal_v1'"
                     )
                 cached_id = str(data['sample_id'].item())
-                if cached_id != str(sample_id):
+                if not self._cache_sample_id_matches(str(sample_id), cached_id):
                     raise ValueError(
                         f"{path} sample_id={cached_id!r}, expected {sample_id!r}"
                     )
