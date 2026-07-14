@@ -434,12 +434,14 @@ alone is not evidence of a better path model.
 
 ## Immediate Execution Queue
 
-1. Complete the three-system low-weight phase/normal-residual training smoke
-   and verify nonzero gradients, finite losses, and cache coverage.
-2. Add independent replicas for the three successful systems before treating
-   the learned phase as a repeatable signal; keep the two `1daf` failures.
-3. Expand endpoint preparation and independent path replicas from four to
-   8-16 systems only after the first transition yield is acceptable.
+1. Complete the seven-system, 29-path low-weight phase/normal-residual training
+   smoke and verify nonzero gradients, finite losses, replica rotation, and
+   cache coverage.
+2. Diagnose setup failures separately from transition failures. Do not weaken
+   force, endpoint-crossing, mapping, or supervision-density gates to increase
+   apparent yield.
+3. Expand endpoint preparation and independent path replicas toward 20-50
+   systems after the seven-system smoke confirms the training interface.
 4. Export GPCRmd metadata through its public search/API surface and cross-match
    PDB/UniProt identifiers with AHoJ-DB.
 5. Request or recover a TransAtlas metadata/data archive without blocking the
@@ -449,3 +451,77 @@ alone is not evidence of a better path model.
 7. Promote only verified endpoint-crossing trajectories into phase supervision;
    keep context-equilibrium and failed pulls in separate manifests.
 8. Run Gate 2 before formal learned-phase hyperparameter selection.
+
+## Pilot Scale-Out Launch (2026-07-14)
+
+The first scale-out batch is deliberately split into two auditable lanes rather
+than launching the full 16-by-5 target as one opaque job set.
+
+1. `silver_replica_pilot4_r1to4_20260714_v1` adds replicas 1-4 to the four
+   systems with passed endpoint NPT contexts. The 16 matrix rows use unique
+   seeds, resample Maxwell-Boltzmann velocities from the shared endpoint state,
+   and lock the fixed pilot protocol: 500 pre-equilibration steps, 10,000 pull
+   steps, 2,000 endpoint-hold steps, 100-step reporting,
+   `k=200000 kJ/mol/nm^2`, and a `0.025 nm` target. Every row runs pull, path
+   audit, atomistic audit, and phase-normal target export as a resumable
+   pipeline. A failed transition remains a recorded outcome and does not block
+   other replicas.
+2. `context_pilot12_20260714_v1` prepares the remaining 12 systems from the
+   strict 16-system selection. Each row independently runs setup/minimization,
+   restrained-to-unrestrained NVT, NPT, and canonical context registration.
+   Only a passed context may enter a later transition-replica matrix.
+
+Slurm jobs `141911` and `141913` implement the first lane; job `141917`
+implements the second. These are CPU arrays so they can exploit fragmented
+cluster capacity while the one-A100 trajectory-supervised training smoke
+remains queued. The resulting paths are still `silver_enhanced_sampling`, not
+kinetics evidence or gold atomistic transitions.
+
+Both lanes use `afterany` scientific continuations rather than `afterok`.
+Failure to cross a transition or stability gate is an experimental outcome,
+not an orchestration failure that should block unrelated systems. Replica
+finalization records every outcome and assembles only targets that pass pull,
+path, atomistic, and phase-normal target gates. Context continuation admits only
+passed NPT contexts, then submits five independent pull replicas per admitted
+new system and a second after-any finalization job. No training job is launched
+automatically from these caches; model training remains a separate decision
+after corpus quality and yield are inspected.
+
+## Replica Pilot Outcome (2026-07-14)
+
+The two replica lanes attempted 51 fixed-protocol paths. Twenty-nine paths
+passed pull, path, atomistic, residue-mapping, phase-identifiability, and
+normal-residual gates, for a path-level yield of 56.9%. These paths span seven
+endpoint systems rather than 29 independent systems. Their immutable merged
+cache is
+`processed_data/md_transition/phase_normal_cache_silver29_20260714_v2` and
+contains 2,929 frames, 6,055 residue instances, and 58,925 valid
+normal-residual supervision points. Aggregate phase and residual supervision
+densities are 15.5% and 15.4%, respectively.
+
+The successful systems and replica counts are `1c3i` (5), `1qvt` (5), `2zd8`
+(4), `3ef2` (5), `4tts` (1), `5hy8` (5), and `8czn` (4). `1daf`, `3x2h`, and
+`7dw8` failed the fixed transition gate. Three physically accepted `6vba`
+paths remained below the predeclared 5% target-identifiability threshold and
+were not promoted. Five additional systems failed setup or minimization gates
+and require chemistry/topology diagnosis rather than blind retries.
+
+The initial `1qvt` target export failure was an identity-interface bug, not a
+trajectory failure: the single-chain apo endpoint used chain `D`, while the
+holo endpoint and prepared MD topology used chain `A`. All 186 numbered
+residues and residue names matched. The exporter now follows the repository's
+canonical identity contract: chain aliases are allowed only when apo, holo,
+and MD topology are all single-chain; multi-chain systems retain strict chain
+identity, duplicate aligned identities hard-fail, and residue-name mismatches
+hard-fail. All five existing `1qvt` trajectories then passed every target gate
+without rerunning MD.
+
+The Stage-2 supervision loader now treats replicas as repeated observations of
+one endpoint system. Direct single-cache files retain precedence. If only
+`<sample>__silver_rXX.npz` files exist, training deterministically rotates over
+sorted replicas by epoch, and phase and normal-residual loaders resolve the
+same replica. This uses all accepted paths without pretending correlated
+replicas are independent endpoint systems. Job `142152` is the first two-GPU,
+two-epoch end-to-end smoke over the seven systems and 29-path cache; train and
+validation deliberately reuse the same systems, so its purpose is pipeline
+health rather than model selection or performance reporting.
