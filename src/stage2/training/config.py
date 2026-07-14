@@ -123,6 +123,12 @@ class TrainingConfig:
     phase_residual_chi_metric_scale: float = 1.0
     phase_residual_min_tangent_norm: float = 1e-3
     phase_residual_max_metric_norm: float = 0.0
+    phase_residual_peptide_retraction: bool = False
+    phase_residual_peptide_retraction_iterations: int = 8
+    phase_residual_peptide_retraction_relaxation: float = 0.75
+    phase_residual_peptide_retraction_anchor_strength: float = 0.02
+    phase_residual_peptide_retraction_max_translation: float = 1.0
+    phase_residual_peptide_retraction_activation_loss_threshold: float = 0.0
     init_from_checkpoint: Optional[str] = None
 
     # Boundary-residual teacher distillation. The cache stores free-flow

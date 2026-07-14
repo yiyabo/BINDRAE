@@ -112,6 +112,13 @@ def parse_args():
                         help='Disable spatial residuals below this endpoint-motion norm')
     parser.add_argument('--phase_residual_max_metric_norm', type=float, default=0.0,
                         help='Per-residue product-metric residual cap; <=0 disables the cap')
+    parser.add_argument('--phase_residual_peptide_retraction', action='store_true',
+                        help='Apply differentiable bounded peptide retraction to interior phase-normal frames')
+    parser.add_argument('--phase_residual_peptide_retraction_iterations', type=int, default=8)
+    parser.add_argument('--phase_residual_peptide_retraction_relaxation', type=float, default=0.75)
+    parser.add_argument('--phase_residual_peptide_retraction_anchor_strength', type=float, default=0.02)
+    parser.add_argument('--phase_residual_peptide_retraction_max_translation', type=float, default=1.0)
+    parser.add_argument('--phase_residual_peptide_retraction_activation_loss_threshold', type=float, default=0.0)
     parser.add_argument('--init_from_checkpoint', type=str, default=None,
                         help='Warm-start model weights only; does not restore optimizer, scheduler, or epoch')
     parser.add_argument('--teacher_residual_cache_dir', type=str, default=None,
@@ -439,6 +446,12 @@ def main():
         phase_residual_chi_metric_scale=args.phase_residual_chi_metric_scale,
         phase_residual_min_tangent_norm=args.phase_residual_min_tangent_norm,
         phase_residual_max_metric_norm=args.phase_residual_max_metric_norm,
+        phase_residual_peptide_retraction=args.phase_residual_peptide_retraction,
+        phase_residual_peptide_retraction_iterations=args.phase_residual_peptide_retraction_iterations,
+        phase_residual_peptide_retraction_relaxation=args.phase_residual_peptide_retraction_relaxation,
+        phase_residual_peptide_retraction_anchor_strength=args.phase_residual_peptide_retraction_anchor_strength,
+        phase_residual_peptide_retraction_max_translation=args.phase_residual_peptide_retraction_max_translation,
+        phase_residual_peptide_retraction_activation_loss_threshold=args.phase_residual_peptide_retraction_activation_loss_threshold,
         init_from_checkpoint=args.init_from_checkpoint,
         teacher_residual_cache_dir=args.teacher_residual_cache_dir,
         w_teacher_residual=args.w_teacher_residual,
@@ -646,6 +659,9 @@ def main():
     print(f"  - phase_residual_metric_scales: rot={config.phase_residual_rotation_metric_scale} trans={config.phase_residual_translation_metric_scale} chi={config.phase_residual_chi_metric_scale}")
     print(f"  - phase_residual_min_tangent_norm: {config.phase_residual_min_tangent_norm}")
     print(f"  - phase_residual_max_metric_norm: {config.phase_residual_max_metric_norm}")
+    print(f"  - phase_residual_peptide_retraction: {config.phase_residual_peptide_retraction}")
+    print(f"  - phase_residual_peptide_retraction_iterations: {config.phase_residual_peptide_retraction_iterations}")
+    print(f"  - phase_residual_peptide_retraction_max_translation: {config.phase_residual_peptide_retraction_max_translation}")
     print(f"  - init_from_checkpoint: {config.init_from_checkpoint or 'OFF'}")
     print(f"  - teacher_residual_cache_dir: {config.teacher_residual_cache_dir or 'OFF'}")
     print(f"  - w_teacher_residual: {config.w_teacher_residual}")

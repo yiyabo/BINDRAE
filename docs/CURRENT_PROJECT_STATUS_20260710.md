@@ -118,6 +118,43 @@ endpoint-only aggregate losses:
   (`0.004347` versus `0.004346`, lower is better);
 - full APNB did not improve path MAE or clash metrics over residual-only.
 
+### MD-supervised capacity and geometry diagnostic (2026-07-15)
+
+The first audited MD cache contains 29 accepted paths from seven endpoint
+systems. These runs use the same seven systems for training and validation, so
+they are capacity and optimization diagnostics only, not generalization
+evidence.
+
+Isolated 100-epoch tests showed that both supervised components are learnable:
+
+- phase-only tau MAE decreased from 0.1905 to 0.1146;
+- residual-only normal MAE decreased from 0.5166 to 0.2428.
+
+The initial mixed run undertrained both heads. Increasing the peptide loss
+reduced geometry violations but suppressed asynchronous phase. A differentiable
+violation-gated peptide retraction and stronger graph-neighbor penalties were
+then tested. The table reports validation means over the last ten epochs of
+matched 60-epoch runs; lower is better for every error/loss column.
+
+| Variant | Phase tau MAE | Normal MAE | Peptide interior | Smoothness | Contact loss | Mean retraction |
+|---|---:|---:|---:|---:|---:|---:|
+| Base: neighbor 0.01, no retraction | **0.1193** | **0.3426** | 0.01192 | **0.9011** | **0.00292** | 0 |
+| Neighbor 0.1 | 0.1081 | 0.3634 | 0.01236 | 0.9009 | 0.00337 | 0 |
+| Neighbor 1.0 | **0.1049** | 0.4228 | 0.01083 | 0.9119 | 0.00376 | 0 |
+| Retraction gate 0.005 | 0.1178 | 0.3679 | 0.00686 | 0.9693 | 0.00307 | 0.117 A |
+| Retraction gate 0.01 | 0.1235 | 0.3687 | **0.00565** | 0.9616 | 0.00334 | 0.090 A |
+
+Decision:
+
+- keep neighbor weight 0.01 and soft peptide weight 0.1 as the balanced main
+  training configuration;
+- keep gated peptide retraction as an optional validity-layer ablation, off by
+  default, because it improves peptide geometry but harms normal fitting,
+  temporal smoothness, and contact loss;
+- do not promote stronger neighbor smoothing: it improves phase supervision by
+  shrinking spatial residuals, but sacrifices the complementary normal branch;
+- repeat selection on a family/scaffold-separated MD set after data expansion.
+
 The Cartesian bridge correction remains validated, but asynchronous phase is
 not a supported claim from endpoint-only training. The next phase experiment
 therefore uses explicit supervision rather than another loss-weight sweep.

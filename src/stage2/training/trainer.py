@@ -44,6 +44,7 @@ from ..modules import (
     compute_w_eff,
     endpoint_zero_envelope,
     project_product_tangent_normal,
+    project_peptide_frame_translations,
 )
 from src.stage1.models import Stage1Model, Stage1ModelConfig
 from src.stage1.models.fk_openfold import create_openfold_fk, reorder_torsions_to_openfold
@@ -144,6 +145,9 @@ class Stage2Trainer:
         'phase_residual_norm_max',
         'phase_residual_raw_parallel_cos',
         'phase_residual_projected_parallel_cos',
+        'phase_peptide_retraction_mean',
+        'phase_peptide_retraction_max',
+        'phase_peptide_retraction_active_frac',
         'pep',
         'pep_interior',
         'contact',
@@ -469,6 +473,40 @@ class Stage2Trainer:
             raise ValueError("phase_residual_min_tangent_norm must be >= 0")
         if float(config.phase_residual_max_metric_norm) < 0.0:
             raise ValueError("phase_residual_max_metric_norm must be >= 0")
+        if int(config.phase_residual_peptide_retraction_iterations) < 0:
+            raise ValueError(
+                "phase_residual_peptide_retraction_iterations must be >= 0"
+            )
+        if not (
+            0.0
+            < float(config.phase_residual_peptide_retraction_relaxation)
+            <= 1.0
+        ):
+            raise ValueError(
+                "phase_residual_peptide_retraction_relaxation must be in (0, 1]"
+            )
+        if not (
+            0.0
+            <= float(config.phase_residual_peptide_retraction_anchor_strength)
+            < 1.0
+        ):
+            raise ValueError(
+                "phase_residual_peptide_retraction_anchor_strength must be in [0, 1)"
+            )
+        if float(config.phase_residual_peptide_retraction_max_translation) <= 0.0:
+            raise ValueError(
+                "phase_residual_peptide_retraction_max_translation must be > 0"
+            )
+        if (
+            float(
+                config.phase_residual_peptide_retraction_activation_loss_threshold
+            )
+            < 0.0
+        ):
+            raise ValueError(
+                "phase_residual_peptide_retraction_activation_loss_threshold "
+                "must be >= 0"
+            )
         for name in (
             'w_phase_residual_magnitude',
             'w_phase_residual_temporal_smooth',
@@ -1855,6 +1893,85 @@ class Stage2Trainer:
         )
         return rigids_t, chi_t
 
+    def _apply_phase_peptide_retraction(
+        self,
+        batch,
+        rigids_t: Rigid,
+        chi_t: torch.Tensor,
+        t_value: float,
+    ) -> Tuple[Rigid, torch.Tensor]:
+        """Retract an interior phase-normal frame state toward peptide validity."""
+        phi_psi_omega_t = self._interpolate_backbone_torsions(batch, t_value)
+        phi_psi_omega_sincos = torch.stack(
+            [torch.sin(phi_psi_omega_t), torch.cos(phi_psi_omega_t)],
+            dim=-1,
+        )
+        chi_sincos = torch.stack([torch.sin(chi_t), torch.cos(chi_t)], dim=-1)
+        torsions_sincos = reorder_torsions_to_openfold(
+            torch.cat([phi_psi_omega_sincos, chi_sincos], dim=2)
+        )
+        atom14 = self.fk_module(torsions_sincos, rigids_t, batch.aatype)
+        progress = min(max(float(t_value), 0.0), 1.0)
+        progress = 3.0 * progress * progress - 2.0 * progress * progress * progress
+
+        def peptide_targets(n_coord, ca_coord, c_coord):
+            c_to_n = n_coord[:, 1:] - c_coord[:, :-1]
+            ca_to_c = ca_coord[:, :-1] - c_coord[:, :-1]
+            n_to_ca = ca_coord[:, 1:] - n_coord[:, 1:]
+            direction = F.normalize(c_to_n, dim=-1)
+            left_direction = F.normalize(ca_to_c, dim=-1)
+            right_direction = F.normalize(n_to_ca, dim=-1)
+            return (
+                torch.linalg.norm(c_to_n, dim=-1),
+                torch.acos(
+                    (left_direction * direction)
+                    .sum(dim=-1)
+                    .clamp(-1.0, 1.0)
+                ),
+                torch.acos(
+                    (right_direction * -direction)
+                    .sum(dim=-1)
+                    .clamp(-1.0, 1.0)
+                ),
+            )
+
+        apo_targets = peptide_targets(batch.N_apo, batch.Ca_apo, batch.C_apo)
+        holo_targets = peptide_targets(batch.N_holo, batch.Ca_holo, batch.C_holo)
+        target_length, target_cacn, target_cnca = (
+            (1.0 - progress) * apo_value + progress * holo_value
+            for apo_value, holo_value in zip(apo_targets, holo_targets)
+        )
+        translation = project_peptide_frame_translations(
+            atom14['atom14_pos'].float(),
+            atom14['atom14_mask'].bool(),
+            batch.node_mask.bool(),
+            batch.peptide_bond_mask.bool(),
+            n_iterations=int(
+                self.config.phase_residual_peptide_retraction_iterations
+            ),
+            relaxation=float(
+                self.config.phase_residual_peptide_retraction_relaxation
+            ),
+            anchor_strength=float(
+                self.config.phase_residual_peptide_retraction_anchor_strength
+            ),
+            bond_length=target_length,
+            angle_cacn=target_cacn,
+            angle_cnca=target_cnca,
+            max_translation=float(
+                self.config.phase_residual_peptide_retraction_max_translation
+            ),
+            activation_loss_threshold=float(
+                self.config.phase_residual_peptide_retraction_activation_loss_threshold
+            ),
+        )
+        rotation, guide_translation = self._rigid_to_rt(rigids_t)
+        translation = translation.to(guide_translation.dtype)
+        return (
+            self._rt_to_rigid(rotation, guide_translation + translation),
+            translation,
+        )
+
     def _phase_bridge_tangent(
         self,
         batch,
@@ -2254,8 +2371,26 @@ class Stage2Trainer:
                 R_residual,
                 trans_residual,
             )
-            rigids_list.append(self._rt_to_rigid(R_path, trans_path))
-            chi_list.append(wrap_to_pi(bridge_chi + projected_chi * residual_weight))
+            path_rigids = self._rt_to_rigid(R_path, trans_path)
+            path_chi = wrap_to_pi(
+                bridge_chi + projected_chi * residual_weight
+            )
+            retraction_translation = trans_path.new_zeros(trans_path.shape)
+            if getattr(
+                self.config,
+                'phase_residual_peptide_retraction',
+                False,
+            ):
+                path_rigids, retraction_translation = (
+                    self._apply_phase_peptide_retraction(
+                        batch,
+                        path_rigids,
+                        path_chi,
+                        t_value,
+                    )
+                )
+            rigids_list.append(path_rigids)
+            chi_list.append(path_chi)
             t_list.append(t_value)
             records.append(
                 {
@@ -2263,6 +2398,7 @@ class Stage2Trainer:
                     'chi_mask': batch.chi_mask.bool(),
                     'time': projected_rigid.new_tensor(t_value),
                     'envelope': envelope.squeeze(-1).squeeze(-1),
+                    'peptide_retraction_translation': retraction_translation,
                 }
             )
 
@@ -2284,6 +2420,21 @@ class Stage2Trainer:
                 [record['projected_residual_metric_norm'] for record in records],
                 dim=0,
             )
+            retraction_translation = torch.stack(
+                [
+                    record['peptide_retraction_translation']
+                    for record in records
+                ],
+                dim=0,
+            )
+            retraction_norm = torch.linalg.norm(
+                retraction_translation,
+                dim=-1,
+            )
+            retraction_mask = batch.node_mask.bool().unsqueeze(0).expand_as(
+                retraction_norm
+            )
+            retraction_count = retraction_mask.float().sum().clamp(min=1.0)
             self._last_phase_residual_stats = {
                 'phase_residual_active_frac': (
                     active_f.sum()
@@ -2305,6 +2456,17 @@ class Stage2Trainer:
                 'phase_residual_projected_parallel_cos': active_mean(
                     'projected_parallel_cos_abs'
                 ).detach(),
+                'phase_peptide_retraction_mean': (
+                    retraction_norm * retraction_mask.float()
+                ).sum().div(retraction_count).detach(),
+                'phase_peptide_retraction_max': retraction_norm.masked_fill(
+                    ~retraction_mask,
+                    0.0,
+                ).max().detach(),
+                'phase_peptide_retraction_active_frac': (
+                    (retraction_norm > 1e-6).float()
+                    * retraction_mask.float()
+                ).sum().div(retraction_count).detach(),
             }
         else:
             zero = batch.w_res.new_tensor(0.0)
@@ -2314,6 +2476,9 @@ class Stage2Trainer:
                 'phase_residual_norm_max': zero,
                 'phase_residual_raw_parallel_cos': zero,
                 'phase_residual_projected_parallel_cos': zero,
+                'phase_peptide_retraction_mean': zero,
+                'phase_peptide_retraction_max': zero,
+                'phase_peptide_retraction_active_frac': zero,
             }
 
         return rigids_list, chi_list, t_list
@@ -3400,6 +3565,9 @@ class Stage2Trainer:
         phase_residual_norm_max = chi_ref.new_tensor(0.0)
         phase_residual_raw_parallel_cos = chi_ref.new_tensor(0.0)
         phase_residual_projected_parallel_cos = chi_ref.new_tensor(0.0)
+        phase_peptide_retraction_mean = chi_ref.new_tensor(0.0)
+        phase_peptide_retraction_max = chi_ref.new_tensor(0.0)
+        phase_peptide_retraction_active_frac = chi_ref.new_tensor(0.0)
         L_pep = chi_ref.new_tensor(0.0)
         L_pep_interior = chi_ref.new_tensor(0.0)
         L_clash_interior = chi_ref.new_tensor(0.0)
@@ -3490,6 +3658,18 @@ class Stage2Trainer:
                 phase_residual_projected_parallel_cos = phase_stats.get(
                     'phase_residual_projected_parallel_cos',
                     phase_residual_projected_parallel_cos,
+                )
+                phase_peptide_retraction_mean = phase_stats.get(
+                    'phase_peptide_retraction_mean',
+                    phase_peptide_retraction_mean,
+                )
+                phase_peptide_retraction_max = phase_stats.get(
+                    'phase_peptide_retraction_max',
+                    phase_peptide_retraction_max,
+                )
+                phase_peptide_retraction_active_frac = phase_stats.get(
+                    'phase_peptide_retraction_active_frac',
+                    phase_peptide_retraction_active_frac,
                 )
                 residual_regularization = self._phase_residual_regularization(batch)
                 L_phase_residual_magnitude = residual_regularization['magnitude']
@@ -4272,6 +4452,9 @@ class Stage2Trainer:
             'phase_residual_norm_max': phase_residual_norm_max,
             'phase_residual_raw_parallel_cos': phase_residual_raw_parallel_cos,
             'phase_residual_projected_parallel_cos': phase_residual_projected_parallel_cos,
+            'phase_peptide_retraction_mean': phase_peptide_retraction_mean,
+            'phase_peptide_retraction_max': phase_peptide_retraction_max,
+            'phase_peptide_retraction_active_frac': phase_peptide_retraction_active_frac,
             'pep': L_pep,
             'pep_interior': L_pep_interior,
             'contact': L_contact,
@@ -4581,6 +4764,12 @@ class Stage2Trainer:
             'phase_residual_chi_metric_scale',
             'phase_residual_min_tangent_norm',
             'phase_residual_max_metric_norm',
+            'phase_residual_peptide_retraction',
+            'phase_residual_peptide_retraction_iterations',
+            'phase_residual_peptide_retraction_relaxation',
+            'phase_residual_peptide_retraction_anchor_strength',
+            'phase_residual_peptide_retraction_max_translation',
+            'phase_residual_peptide_retraction_activation_loss_threshold',
             'length_bucket_residue_budget',
             # Loss contract.
             'contact_loss_mode',
@@ -4631,6 +4820,12 @@ class Stage2Trainer:
             'phase_residual_chi_metric_scale': 1.0,
             'phase_residual_min_tangent_norm': 1e-3,
             'phase_residual_max_metric_norm': 0.0,
+            'phase_residual_peptide_retraction': False,
+            'phase_residual_peptide_retraction_iterations': 8,
+            'phase_residual_peptide_retraction_relaxation': 0.75,
+            'phase_residual_peptide_retraction_anchor_strength': 0.02,
+            'phase_residual_peptide_retraction_max_translation': 1.0,
+            'phase_residual_peptide_retraction_activation_loss_threshold': 0.0,
             'w_phase_residual_magnitude': 0.01,
             'w_phase_residual_temporal_smooth': 0.01,
             'w_phase_residual_neighbor_smooth': 0.01,

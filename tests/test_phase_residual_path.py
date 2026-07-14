@@ -43,6 +43,21 @@ class _ZeroPhaseResidualModel(_FakePhaseResidualModel):
         return out
 
 
+class _BackboneOnlyFK(nn.Module):
+    def forward(self, torsions_sincos, rigids, aatype):
+        del torsions_sincos, aatype
+        rotation = rigids.get_rots().get_rot_mats()
+        translation = rigids.get_trans()
+        local = translation.new_zeros((*translation.shape[:-1], 14, 3))
+        local[..., 0, :] = local.new_tensor([-1.20, 0.50, 0.0])
+        local[..., 2, :] = local.new_tensor([1.30, 0.0, 0.0])
+        position = torch.einsum('bnij,bnaj->bnai', rotation, local)
+        position = position + translation.unsqueeze(-2)
+        mask = torch.zeros(position.shape[:-1], dtype=torch.bool, device=position.device)
+        mask[..., :3] = True
+        return {'atom14_pos': position, 'atom14_mask': mask}
+
+
 def _rigid(translations):
     batch_size, n_res, _ = translations.shape
     rotations = torch.eye(3).view(1, 1, 3, 3).expand(
@@ -83,6 +98,15 @@ class PhaseResidualPathTest(unittest.TestCase):
             phase_residual_max_metric_norm=0.0,
             phase_residual_envelope="poly",
             phase_residual_scale=1.0,
+            phase_residual_peptide_retraction=False,
+            phase_residual_peptide_retraction_iterations=16,
+            phase_residual_peptide_retraction_relaxation=0.75,
+            phase_residual_peptide_retraction_anchor_strength=0.0,
+            phase_residual_peptide_retraction_max_translation=1.0,
+            phase_residual_peptide_retraction_activation_loss_threshold=0.0,
+            pep_bond_len=1.33,
+            pep_angle_cacn=2.035,
+            pep_angle_cnca=2.124,
             bg_beta=1.5,
         )
         return trainer
@@ -120,6 +144,7 @@ class PhaseResidualPathTest(unittest.TestCase):
             N_holo=n_holo,
             Ca_holo=ca_holo,
             C_holo=c_holo,
+            aatype=torch.zeros(batch_size, n_res, dtype=torch.long),
         )
 
     def test_identity_phase_path_has_exact_endpoints_and_off_bridge_motion(self):
@@ -221,6 +246,35 @@ class PhaseResidualPathTest(unittest.TestCase):
         )
         self.assertTrue(torch.equal(rigids[0].get_trans(), batch.Ca_apo))
         self.assertTrue(torch.equal(rigids[-1].get_trans(), batch.Ca_holo))
+
+    def test_peptide_retraction_is_bounded_and_preserves_endpoints(self):
+        batch = self._batch()
+        trainer = self._trainer("identity")
+        trainer.config.phase_residual_bridge_mode = "cartesian_backbone"
+        trainer.config.phase_residual_peptide_retraction = True
+        trainer.fk_module = _BackboneOnlyFK()
+        rigids_apo = trainer._build_rigids_from_backbone(
+            batch.N_apo, batch.Ca_apo, batch.C_apo, batch.node_mask
+        )
+        rigids_holo = trainer._build_rigids_from_backbone(
+            batch.N_holo, batch.Ca_holo, batch.C_holo, batch.node_mask
+        )
+
+        rigids, chi, times = trainer.phase_orthogonal_residual_path(
+            batch, rigids_apo, rigids_holo
+        )
+
+        self.assertEqual(times, [0.0, 0.25, 0.5, 0.75, 1.0])
+        self.assertTrue(torch.equal(rigids[0].get_trans(), batch.Ca_apo))
+        self.assertTrue(torch.equal(rigids[-1].get_trans(), batch.Ca_holo))
+        self.assertTrue(torch.equal(chi[-1], batch.torsion_holo[..., 3:7]))
+        stats = trainer._last_phase_residual_stats
+        self.assertGreater(stats['phase_peptide_retraction_mean'].item(), 0.0)
+        self.assertLessEqual(
+            stats['phase_peptide_retraction_max'].item(),
+            trainer.config.phase_residual_peptide_retraction_max_translation + 1e-6,
+        )
+        self.assertGreater(stats['phase_peptide_retraction_active_frac'].item(), 0.0)
 
 
 if __name__ == "__main__":

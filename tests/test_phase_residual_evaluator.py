@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 import torch.nn as nn
@@ -8,6 +9,7 @@ from flash_ipa.rigid import Rigid, Rotation
 
 from scripts.evaluate_stage2_transition_paths import (
     build_rigids_from_backbone,
+    construct_path,
     phase_orthogonal_residual_path,
 )
 
@@ -48,6 +50,74 @@ def _rigid(translations):
 
 
 class PhaseResidualEvaluatorTest(unittest.TestCase):
+    def test_construct_path_replays_checkpoint_peptide_retraction(self):
+        rigids_apo = _rigid(torch.zeros(1, 2, 3))
+        rigids_holo = _rigid(torch.ones(1, 2, 3))
+        chi = torch.zeros(1, 2, 4)
+        phase_path = ([rigids_apo, rigids_holo], [chi, chi], [0.0, 1.0])
+        projected_path = ([rigids_apo, rigids_holo], [chi, chi], [0.0, 1.0])
+        args = SimpleNamespace(
+            path_parameterization="checkpoint",
+            phase_residual_tau_mode=None,
+            phase_residual_bridge_mode=None,
+            time_warp_logit_scale=None,
+            time_warp_rate_eps=None,
+            time_warp_rate_clip=None,
+            phase_residual_envelope=None,
+            phase_residual_scale=None,
+            phase_residual_rotation_metric_scale=None,
+            phase_residual_translation_metric_scale=None,
+            phase_residual_chi_metric_scale=None,
+            phase_residual_min_tangent_norm=None,
+            phase_residual_max_metric_norm=None,
+        )
+        config = SimpleNamespace(
+            path_parameterization="phase_orthogonal_residual_v1",
+            phase_residual_peptide_retraction=True,
+            phase_residual_peptide_retraction_iterations=6,
+            phase_residual_peptide_retraction_relaxation=0.5,
+            phase_residual_peptide_retraction_anchor_strength=0.1,
+            phase_residual_peptide_retraction_max_translation=0.75,
+            phase_residual_peptide_retraction_activation_loss_threshold=0.01,
+        )
+        fk_module = object()
+        batch = SimpleNamespace()
+
+        with patch(
+            "scripts.evaluate_stage2_transition_paths.phase_orthogonal_residual_path",
+            return_value=phase_path,
+        ) as build_phase, patch(
+            "scripts.evaluate_stage2_transition_paths.project_peptide_geometry_onto_path",
+            return_value=projected_path,
+        ) as retract_path:
+            result = construct_path(
+                args,
+                config,
+                object(),
+                batch,
+                rigids_apo,
+                rigids_holo,
+                n_steps=4,
+                interaction_prior=None,
+                esm_gate_context=None,
+                integration_clips={},
+                fk_module=fk_module,
+            )
+
+        build_phase.assert_called_once()
+        retract_path.assert_called_once_with(
+            batch,
+            *phase_path,
+            fk_module=fk_module,
+            n_iterations=6,
+            relaxation=0.5,
+            anchor_strength=0.1,
+            max_translation=0.75,
+            activation_loss_threshold=0.01,
+        )
+        self.assertEqual(result[:3], projected_path)
+        self.assertEqual(result[3], {})
+
     def test_evaluator_preserves_endpoints_and_applies_normal_residual(self):
         torsion_apo = torch.zeros(1, 2, 7)
         torsion_holo = torsion_apo.clone()

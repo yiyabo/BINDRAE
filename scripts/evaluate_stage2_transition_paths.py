@@ -1470,40 +1470,86 @@ def construct_path(
             value = getattr(args, arg_name)
             return value if value is not None else getattr(config, arg_name, default)
 
-        return (
-            *phase_orthogonal_residual_path(
-                model,
-                batch,
-                rigids_apo,
-                rigids_holo,
-                n_steps=n_steps,
-                interaction_prior=interaction_prior,
-                esm_gate_context=esm_gate_context,
-                tau_mode=str(resolve_value("phase_residual_tau_mode", "learned")),
-                bridge_mode=str(
-                    resolve_value("phase_residual_bridge_mode", "se3_geodesic")
-                ),
-                logit_scale=float(resolve_value("time_warp_logit_scale", 1.0)),
-                rate_eps=float(resolve_value("time_warp_rate_eps", 1e-3)),
-                rate_clip=float(resolve_value("time_warp_rate_clip", 10.0)),
-                envelope_kind=str(resolve_value("phase_residual_envelope", "poly")),
-                residual_scale=float(resolve_value("phase_residual_scale", 1.0)),
-                rotation_metric_scale=float(
-                    resolve_value("phase_residual_rotation_metric_scale", 1.0)
-                ),
-                translation_metric_scale=float(
-                    resolve_value("phase_residual_translation_metric_scale", 1.0)
-                ),
-                chi_metric_scale=float(
-                    resolve_value("phase_residual_chi_metric_scale", 1.0)
-                ),
-                min_tangent_norm=float(
-                    resolve_value("phase_residual_min_tangent_norm", 1e-3)
-                ),
-                max_metric_norm=float(
-                    resolve_value("phase_residual_max_metric_norm", 0.0)
-                ),
+        phase_path = phase_orthogonal_residual_path(
+            model,
+            batch,
+            rigids_apo,
+            rigids_holo,
+            n_steps=n_steps,
+            interaction_prior=interaction_prior,
+            esm_gate_context=esm_gate_context,
+            tau_mode=str(resolve_value("phase_residual_tau_mode", "learned")),
+            bridge_mode=str(
+                resolve_value("phase_residual_bridge_mode", "se3_geodesic")
             ),
+            logit_scale=float(resolve_value("time_warp_logit_scale", 1.0)),
+            rate_eps=float(resolve_value("time_warp_rate_eps", 1e-3)),
+            rate_clip=float(resolve_value("time_warp_rate_clip", 10.0)),
+            envelope_kind=str(resolve_value("phase_residual_envelope", "poly")),
+            residual_scale=float(resolve_value("phase_residual_scale", 1.0)),
+            rotation_metric_scale=float(
+                resolve_value("phase_residual_rotation_metric_scale", 1.0)
+            ),
+            translation_metric_scale=float(
+                resolve_value("phase_residual_translation_metric_scale", 1.0)
+            ),
+            chi_metric_scale=float(
+                resolve_value("phase_residual_chi_metric_scale", 1.0)
+            ),
+            min_tangent_norm=float(
+                resolve_value("phase_residual_min_tangent_norm", 1e-3)
+            ),
+            max_metric_norm=float(
+                resolve_value("phase_residual_max_metric_norm", 0.0)
+            ),
+        )
+        if bool(getattr(config, "phase_residual_peptide_retraction", False)):
+            if fk_module is None:
+                raise ValueError(
+                    "phase residual peptide retraction requires an FK module"
+                )
+            phase_path = project_peptide_geometry_onto_path(
+                batch,
+                *phase_path,
+                fk_module=fk_module,
+                n_iterations=int(
+                    getattr(
+                        config,
+                        "phase_residual_peptide_retraction_iterations",
+                        8,
+                    )
+                ),
+                relaxation=float(
+                    getattr(
+                        config,
+                        "phase_residual_peptide_retraction_relaxation",
+                        0.75,
+                    )
+                ),
+                anchor_strength=float(
+                    getattr(
+                        config,
+                        "phase_residual_peptide_retraction_anchor_strength",
+                        0.02,
+                    )
+                ),
+                max_translation=float(
+                    getattr(
+                        config,
+                        "phase_residual_peptide_retraction_max_translation",
+                        1.0,
+                    )
+                ),
+                activation_loss_threshold=float(
+                    getattr(
+                        config,
+                        "phase_residual_peptide_retraction_activation_loss_threshold",
+                        0.0,
+                    )
+                ),
+            )
+        return (
+            *phase_path,
             correction,
         )
     if path_mode in {"boundary_residual_v1", "boundary_residual"}:

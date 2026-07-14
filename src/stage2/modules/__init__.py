@@ -18,6 +18,7 @@ from .geometry import (
     compute_w_eff,
 )
 from .phase_residual import endpoint_zero_envelope, project_product_tangent_normal
+from .chain_internal import project_peptide_frame_translations
 
 __all__ = [
     "so3_log",
@@ -33,4 +34,5 @@ __all__ = [
     "compute_w_eff",
     "endpoint_zero_envelope",
     "project_product_tangent_normal",
+    "project_peptide_frame_translations",
 ]
