@@ -35,6 +35,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--platform", choices=["CUDA", "OpenCL", "CPU"], default="CUDA")
     parser.add_argument("--seed", type=int, default=20260713)
+    parser.add_argument(
+        "--resample-initial-velocities",
+        action="store_true",
+        help=(
+            "Replace velocities restored from the NPT state with a seeded Maxwell-Boltzmann "
+            "sample. Enable this for independent trajectory replicas."
+        ),
+    )
     parser.add_argument("--temperature-k", type=float, default=300.0)
     parser.add_argument("--timestep-fs", type=float, default=2.0)
     parser.add_argument("--pre-equilibration-steps", type=int, default=500)
@@ -137,6 +145,10 @@ def run_pull(args: argparse.Namespace) -> Dict[str, Any]:
     integrator.setRandomNumberSeed(args.seed)
     simulation = app.Simulation(pdb.topology, system, integrator, platform, properties)
     simulation.context.setState(initial_state)
+    if args.resample_initial_velocities:
+        simulation.context.setVelocitiesToTemperature(
+            args.temperature_k * unit.kelvin, args.seed
+        )
     dof = degrees_of_freedom(system)
     start_rmsd_nm = float(pull_force.getCollectiveVariableValues(simulation.context)[0])
     final_target_nm = min(args.final_target_rmsd_nm, start_rmsd_nm)
@@ -290,6 +302,18 @@ def run_pull(args: argparse.Namespace) -> Dict[str, Any]:
         "reverse_for_model_direction": True,
         "platform": args.platform,
         "seed": args.seed,
+        "initial_velocities": (
+            "seeded_maxwell_boltzmann"
+            if args.resample_initial_velocities
+            else "restored_from_npt_state"
+        ),
+        "protocol": {
+            "temperature_k": args.temperature_k,
+            "timestep_fs": args.timestep_fs,
+            "report_interval": args.report_interval,
+            "rmsd_k_kj_mol_nm2": args.rmsd_k_kj_mol_nm2,
+            "final_target_rmsd_nm": args.final_target_rmsd_nm,
+        },
         "steps": {
             "pre_equilibration": args.pre_equilibration_steps,
             "pulling": args.pulling_steps,

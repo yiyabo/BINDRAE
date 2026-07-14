@@ -17,6 +17,15 @@ to revive that lane.
 - `export_md_phase_normal_targets.py` - convert an audited silver atomistic path into monotone phase and bridge-normal residual targets with explicit identifiability gates.
 - `assemble_md_phase_normal_cache.py` - assemble only passed MD target directories into an immutable multi-system training cache.
 - `audit_md_rmsd_pull.py` / `audit_md_atomistic_path.py` - path-progress and independent atomistic geometry gates for biased MD paths.
+- `build_md_context_matrix.py` / `run_md_context_pipeline.py` - immutable,
+  resumable setup-to-NPT context preparation for selected MD pilot systems.
+- `build_md_replica_matrix.py` / `run_md_replica_pipeline.py` - immutable,
+  independent-seed silver pull replicas with path/atomistic audits and target
+  export.
+- `collect_md_context_results.py` - collect only passed endpoint contexts while
+  retaining failed-system outcomes.
+- `finalize_md_replica_matrix.py` - summarize every replica outcome and assemble
+  all passed phase-normal targets into one immutable cache.
 - `validate_triplets_data.py` - validates Stage-1 triplet datasets.
 - `audit_ligand_sensitive_dataset.py` - ligand-sensitive dataset audit.
 - `diagnose_stage1_prior.py` - Stage-1 diagnostic entrypoint.

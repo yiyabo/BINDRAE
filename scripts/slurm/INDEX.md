@@ -29,6 +29,14 @@ records, not templates.
 - `submit_stage2_24k_resumable.sh` - fixed-tag submitter for the 24k OracleMotion / ESM7 / REPA matrix; reuses the interrupted run directories and keeps `AUTO_RESUME=1` so resubmission continues from `last_checkpoint.pt`.
 - `evaluate_stage2_transition_paths_1gpu.sh` - residue-level transition evaluator.
 - `run_md_global_rmsd_pull_cpu.sh` - biased silver-path pilot; it is not a kinetics workflow.
+- `run_md_context_pipeline_array_cpu.sh` - resumable setup, NVT, NPT, and
+  context registration array for selected pilot systems.
+- `run_md_replica_pipeline_array_cpu.sh` - independent-seed silver pull,
+  audit, and phase-normal target-export array.
+- `continue_md_pilot_after_context_cpu.sh` - after-any continuation that
+  collects passed contexts and submits five replicas per admitted system.
+- `finalize_md_replica_matrix_cpu.sh` - after-any replica outcome summary and
+  passed-target cache assembly.
 - `audit_md_rmsd_pull_cpu.sh` / `audit_md_atomistic_path_cpu.sh` - path and atomistic admission audits.
 - `export_md_phase_normal_targets_cpu.sh` - export audited phase/normal-residual targets on CPU.
 - `evaluate_stage2_bridge_timewarp_1gpu.sh` - endpoint-exact bridge time-warp headroom evaluator before training a time-warp model.

@@ -3,6 +3,7 @@ import unittest
 import numpy as np
 
 from scripts.export_md_phase_normal_targets import (
+    _extract_endpoint_arrays,
     contact_annotations,
     infer_monotone_phase,
     monotone_path_indices,
@@ -13,6 +14,28 @@ from scripts.export_md_phase_normal_targets import (
 
 
 class MdPhaseNormalTargetTest(unittest.TestCase):
+    def test_single_chain_endpoint_alias_uses_residue_number(self):
+        atoms = {
+            "N": np.array([0.0, 0.0, 0.0]),
+            "CA": np.array([1.0, 0.0, 0.0]),
+            "C": np.array([1.0, 1.0, 0.0]),
+        }
+        residues = [{"key": ("D", 2, ""), "resname": "GLY", "atoms": atoms}]
+        arrays = _extract_endpoint_arrays(
+            residues, [("A", 2, "")], ignore_chain=True
+        )
+        np.testing.assert_array_equal(arrays["Ca"], [[1.0, 0.0, 0.0]])
+
+    def test_multichain_endpoint_alias_remains_strict(self):
+        atoms = {
+            "N": np.array([0.0, 0.0, 0.0]),
+            "CA": np.array([1.0, 0.0, 0.0]),
+            "C": np.array([1.0, 1.0, 0.0]),
+        }
+        residues = [{"key": ("D", 2, ""), "resname": "GLY", "atoms": atoms}]
+        with self.assertRaises(KeyError):
+            _extract_endpoint_arrays(residues, [("A", 2, "")])
+
     def test_temporal_smoothing_preserves_length_and_wrapped_angles(self):
         values = np.array([0.0, 0.0, 9.0, 0.0, 0.0])[:, None]
         smoothed = temporal_moving_average(values, 3)

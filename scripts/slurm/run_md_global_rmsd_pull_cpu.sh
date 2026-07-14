@@ -23,6 +23,7 @@ PULLING_STEPS="${PULLING_STEPS:-5000}"
 ENDPOINT_HOLD_STEPS="${ENDPOINT_HOLD_STEPS:-1000}"
 RMSD_K_KJ_MOL_NM2="${RMSD_K_KJ_MOL_NM2:-5000}"
 FINAL_TARGET_RMSD_NM="${FINAL_TARGET_RMSD_NM:-0.05}"
+RESAMPLE_INITIAL_VELOCITIES="${RESAMPLE_INITIAL_VELOCITIES:-0}"
 
 cd "$ROOT"
 mkdir -p logs/slurm "$OUTPUT_DIR"
@@ -33,7 +34,8 @@ conda activate BINDRAE-MD
 export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-32}"
 
-python scripts/run_md_global_rmsd_pull.py \
+PULL_ARGS=(
+  scripts/run_md_global_rmsd_pull.py
   --candidate-manifest "$CANDIDATE_MANIFEST" \
   --transition-id "$TRANSITION_ID" \
   --npt-dir "$NPT_DIR" \
@@ -45,3 +47,8 @@ python scripts/run_md_global_rmsd_pull.py \
   --endpoint-hold-steps "$ENDPOINT_HOLD_STEPS" \
   --rmsd-k-kj-mol-nm2 "$RMSD_K_KJ_MOL_NM2" \
   --final-target-rmsd-nm "$FINAL_TARGET_RMSD_NM"
+)
+if [[ "$RESAMPLE_INITIAL_VELOCITIES" == "1" ]]; then
+  PULL_ARGS+=(--resample-initial-velocities)
+fi
+python "${PULL_ARGS[@]}"

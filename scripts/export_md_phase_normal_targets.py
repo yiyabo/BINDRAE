@@ -396,6 +396,28 @@ def _topology_residue_key(residue: Any) -> Tuple[str, int, str]:
     return chain_id, int(residue.resSeq), ""
 
 
+def _single_chain_keys(keys: Sequence[Tuple[str, int, str]]) -> bool:
+    return bool(keys) and len({key[0] for key in keys}) == 1
+
+
+def _residue_alignment_key(
+    key: Tuple[str, int, str], *, ignore_chain: bool
+) -> Tuple[str, int, str]:
+    return ("", key[1], key[2]) if ignore_chain else key
+
+
+def _residue_lookup(
+    residues: Sequence[Mapping[str, Any]], *, label: str, ignore_chain: bool
+) -> Dict[Tuple[str, int, str], Mapping[str, Any]]:
+    lookup: Dict[Tuple[str, int, str], Mapping[str, Any]] = {}
+    for residue in residues:
+        key = _residue_alignment_key(tuple(residue["key"]), ignore_chain=ignore_chain)
+        if key in lookup:
+            raise ValueError(f"Duplicate {label} residue identity after alignment: {key}")
+        lookup[key] = residue
+    return lookup
+
+
 def _safe_sample_id(sample_id: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(sample_id))
 
@@ -445,14 +467,20 @@ def _residue_ligand_distances(
 
 
 def _extract_endpoint_arrays(
-    residues: Sequence[Mapping[str, Any]], keys: Sequence[Tuple[str, int, str]]
+    residues: Sequence[Mapping[str, Any]],
+    keys: Sequence[Tuple[str, int, str]],
+    *,
+    ignore_chain: bool = False,
 ) -> Dict[str, np.ndarray]:
-    by_key = {tuple(residue["key"]): residue for residue in residues}
+    by_key = _residue_lookup(
+        residues, label="endpoint", ignore_chain=ignore_chain
+    )
     n_coord, ca_coord, c_coord = [], [], []
     chi, chi_mask = [], []
     names = []
     for key in keys:
-        residue = by_key[key]
+        aligned_key = _residue_alignment_key(key, ignore_chain=ignore_chain)
+        residue = by_key[aligned_key]
         atoms = residue["atoms"]
         if not all(name in atoms for name in ("N", "CA", "C")):
             raise ValueError(f"Endpoint residue {key} lacks N/CA/C")
@@ -677,8 +705,6 @@ def export_targets(args: argparse.Namespace) -> Dict[str, Any]:
     endpoints = candidate["endpoints"]
     apo_residues = parse_pdb_residues(Path(endpoints["apo_structure_path"]))
     holo_residues = parse_pdb_residues(Path(endpoints["holo_structure_path"]))
-    apo_by_key = {tuple(residue["key"]): residue for residue in apo_residues}
-    holo_by_key = {tuple(residue["key"]): residue for residue in holo_residues}
 
     preparation = json.loads(args.preparation_report.read_text())
     protein_atoms = int(preparation["protein"]["prepared_protein_atoms"])
@@ -692,24 +718,57 @@ def export_targets(args: argparse.Namespace) -> Dict[str, Any]:
             f"DCD/metrics mismatch: {trajectory.n_frames} frames vs {len(metrics)} rows"
         )
 
-    topology_residues = []
-    keys = []
+    candidate_topology_residues = []
     for residue in trajectory.topology.residues:
         atom_indices = [atom.index for atom in residue.atoms]
         if not atom_indices or min(atom_indices) >= protein_atoms:
             continue
-        key = _topology_residue_key(residue)
         names = {atom.name for atom in residue.atoms}
-        if key in apo_by_key and key in holo_by_key and {"N", "CA", "C"} <= names:
-            topology_residues.append(residue)
-            keys.append(key)
+        if {"N", "CA", "C"} <= names:
+            candidate_topology_residues.append(residue)
+
+    apo_keys = [tuple(residue["key"]) for residue in apo_residues]
+    holo_keys = [tuple(residue["key"]) for residue in holo_residues]
+    topology_keys = [
+        _topology_residue_key(residue) for residue in candidate_topology_residues
+    ]
+    ignore_chain = (
+        _single_chain_keys(apo_keys)
+        and _single_chain_keys(holo_keys)
+        and _single_chain_keys(topology_keys)
+    )
+    apo_by_key = _residue_lookup(
+        apo_residues, label="apo", ignore_chain=ignore_chain
+    )
+    holo_by_key = _residue_lookup(
+        holo_residues, label="holo", ignore_chain=ignore_chain
+    )
+
+    topology_residues = []
+    keys = []
+    for residue, key in zip(candidate_topology_residues, topology_keys):
+        aligned_key = _residue_alignment_key(key, ignore_chain=ignore_chain)
+        apo_residue = apo_by_key.get(aligned_key)
+        holo_residue = holo_by_key.get(aligned_key)
+        if apo_residue is None or holo_residue is None:
+            continue
+        topology_resname = canonical_resname(residue.name)
+        endpoint_resnames = {apo_residue["resname"], holo_residue["resname"]}
+        if endpoint_resnames != {topology_resname}:
+            raise ValueError(
+                "Residue-name mismatch for aligned identity "
+                f"{key}: apo={apo_residue['resname']} "
+                f"holo={holo_residue['resname']} topology={topology_resname}"
+            )
+        topology_residues.append(residue)
+        keys.append(key)
     mapping_fraction = len(keys) / max(len(holo_residues), 1)
     if mapping_fraction < args.min_mapping_fraction:
         raise ValueError(
             f"Mapped only {len(keys)}/{len(holo_residues)} residues ({mapping_fraction:.3f})"
         )
-    apo = _extract_endpoint_arrays(apo_residues, keys)
-    holo = _extract_endpoint_arrays(holo_residues, keys)
+    apo = _extract_endpoint_arrays(apo_residues, keys, ignore_chain=ignore_chain)
+    holo = _extract_endpoint_arrays(holo_residues, keys, ignore_chain=ignore_chain)
     n_residues = len(keys)
 
     atom_maps = [{atom.name: atom.index for atom in residue.atoms} for residue in topology_residues]
