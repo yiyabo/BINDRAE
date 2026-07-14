@@ -15,7 +15,12 @@ SCHEMA_VERSION = "bindrae_md_context_matrix_v1"
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--candidate-manifest", type=Path, required=True)
-    parser.add_argument("--existing-context-manifest", type=Path, required=True)
+    parser.add_argument("--existing-context-manifest", type=Path)
+    parser.add_argument(
+        "--exclude-sample-list",
+        type=Path,
+        help="Optional newline-delimited sample IDs that must not be prepared again.",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--seed-base", type=int, default=60715000)
     parser.add_argument("--protocol-tag", default="endpoint_context_fixed_v1")
@@ -35,6 +40,15 @@ def load_jsonl(path: Path) -> List[Dict[str, Any]]:
     if not records:
         raise ValueError(f"No records in {path}")
     return records
+
+
+def load_sample_ids(path: Path) -> Set[str]:
+    sample_ids = [line.strip() for line in path.read_text().splitlines() if line.strip()]
+    if not sample_ids:
+        raise ValueError(f"No sample IDs in {path}")
+    if len(sample_ids) != len(set(sample_ids)):
+        raise ValueError(f"Duplicate sample IDs in {path}")
+    return set(sample_ids)
 
 
 def sample_id(record: Mapping[str, Any]) -> str:
@@ -70,14 +84,22 @@ def validate_candidate_files(record: Mapping[str, Any]) -> None:
 
 def build_matrix(args: argparse.Namespace) -> Dict[str, Any]:
     candidates = load_jsonl(args.candidate_manifest)
-    contexts = load_jsonl(args.existing_context_manifest)
+    existing_context_manifest = getattr(args, "existing_context_manifest", None)
+    exclude_sample_list = getattr(args, "exclude_sample_list", None)
+    contexts = load_jsonl(existing_context_manifest) if existing_context_manifest else []
     prepared: Set[str] = {sample_id(record) for record in contexts}
+    excluded_requested = (
+        load_sample_ids(exclude_sample_list) if exclude_sample_list else set()
+    )
     candidate_ids = [sample_id(record) for record in candidates]
     if len(candidate_ids) != len(set(candidate_ids)):
         raise ValueError("Candidate manifest contains duplicate sample IDs")
-    unknown = prepared - set(candidate_ids)
+    candidate_id_set = set(candidate_ids)
+    unknown = prepared - candidate_id_set
     if unknown:
         raise ValueError(f"Existing contexts are absent from candidate manifest: {sorted(unknown)}")
+    excluded = excluded_requested & candidate_id_set
+    excluded_not_in_candidates = excluded_requested - candidate_id_set
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     protocol = {
@@ -100,7 +122,7 @@ def build_matrix(args: argparse.Namespace) -> Dict[str, Any]:
     matrix: List[Dict[str, Any]] = []
     for candidate_index, candidate in enumerate(candidates):
         system_sample_id = sample_id(candidate)
-        if system_sample_id in prepared:
+        if system_sample_id in prepared or system_sample_id in excluded:
             continue
         validate_candidate_files(candidate)
         system_root = args.output_dir / "systems" / system_sample_id
@@ -129,9 +151,16 @@ def build_matrix(args: argparse.Namespace) -> Dict[str, Any]:
     summary = {
         "schema_version": SCHEMA_VERSION,
         "candidate_manifest": str(args.candidate_manifest),
-        "existing_context_manifest": str(args.existing_context_manifest),
+        "existing_context_manifest": (
+            str(existing_context_manifest) if existing_context_manifest else None
+        ),
+        "exclude_sample_list": str(exclude_sample_list) if exclude_sample_list else None,
         "selected_systems": len(candidates),
         "already_prepared_systems": len(prepared),
+        "excluded_requested_systems": len(excluded_requested),
+        "excluded_systems": len(excluded),
+        "excluded_sample_ids": sorted(excluded),
+        "excluded_not_in_candidates": sorted(excluded_not_in_candidates),
         "planned_systems": len(matrix),
         "seed_base": args.seed_base,
         "protocol": protocol,
