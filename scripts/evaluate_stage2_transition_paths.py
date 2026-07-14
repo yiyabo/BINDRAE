@@ -2097,6 +2097,11 @@ def main() -> None:
         stage1v2_posterior_feature_names=stage1v2_settings["names_raw"],
         esm_num_layers=int(getattr(config, "esm_num_layers", 1)),
     )
+    if len(loader.dataset) == 0:
+        raise ValueError(
+            "No evaluation samples remain after split/subset/cache filtering: "
+            f"split={args.split!r}, valid_samples_file={args.valid_samples_file!r}"
+        )
 
     total_stats = defaultdict(RunningStats)
     total_counts = defaultdict(int)
@@ -2207,6 +2212,36 @@ def main() -> None:
             args.phase_residual_min_tangent_norm
             if args.phase_residual_min_tangent_norm is not None
             else getattr(config, "phase_residual_min_tangent_norm", None)
+        ),
+        "phase_residual_peptide_retraction": bool(
+            getattr(config, "phase_residual_peptide_retraction", False)
+        ),
+        "phase_residual_peptide_retraction_iterations": int(
+            getattr(config, "phase_residual_peptide_retraction_iterations", 8)
+        ),
+        "phase_residual_peptide_retraction_relaxation": float(
+            getattr(config, "phase_residual_peptide_retraction_relaxation", 0.75)
+        ),
+        "phase_residual_peptide_retraction_anchor_strength": float(
+            getattr(
+                config,
+                "phase_residual_peptide_retraction_anchor_strength",
+                0.02,
+            )
+        ),
+        "phase_residual_peptide_retraction_max_translation": float(
+            getattr(
+                config,
+                "phase_residual_peptide_retraction_max_translation",
+                1.0,
+            )
+        ),
+        "phase_residual_peptide_retraction_activation_loss_threshold": float(
+            getattr(
+                config,
+                "phase_residual_peptide_retraction_activation_loss_threshold",
+                0.0,
+            )
         ),
         "n_integration_steps": n_steps,
         "integration_clips": integration_clips,
