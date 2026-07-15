@@ -17,6 +17,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input-dir", type=Path, action="append", required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--skip-audit-failed",
+        action="store_true",
+        help="Skip only targets whose audit explicitly records a failed gate.",
+    )
     return parser.parse_args()
 
 
@@ -85,9 +90,32 @@ def inspect_target(directory: Path) -> Dict[str, Any]:
     }
 
 
+def collect_targets(
+    directories: List[Path], *, skip_audit_failed: bool = False
+) -> tuple[List[Dict[str, Any]], List[str]]:
+    records: List[Dict[str, Any]] = []
+    skipped: List[str] = []
+    for directory in directories:
+        audit_path = directory / "target_audit.json"
+        if skip_audit_failed and audit_path.is_file():
+            audit = json.loads(audit_path.read_text())
+            if (
+                not bool(audit.get("passed"))
+                and audit.get("status") == "md_phase_normal_targets_failed"
+            ):
+                skipped.append(str(directory))
+                continue
+        records.append(inspect_target(directory))
+    if not records:
+        raise ValueError("No passed MD phase-normal targets remain after filtering")
+    return records, skipped
+
+
 def main() -> None:
     args = parse_args()
-    records = [inspect_target(directory) for directory in args.input_dir]
+    records, skipped_failed = collect_targets(
+        args.input_dir, skip_audit_failed=args.skip_audit_failed
+    )
     sample_ids = [record["sample_id"] for record in records]
     if len(sample_ids) != len(set(sample_ids)):
         raise ValueError(f"Duplicate sample IDs: {sample_ids}")
@@ -115,6 +143,9 @@ def main() -> None:
     summary = {
         "schema_version": "md_phase_normal_cache_collection_v1",
         "samples": len(records),
+        "input_targets": len(args.input_dir),
+        "audit_failed_targets_skipped": len(skipped_failed),
+        "audit_failed_source_dirs": skipped_failed,
         "frames": sum(int(record["n_frames"]) for record in records),
         "residues": sum(int(record["n_residues"]) for record in records),
         "valid_residual_points": sum(

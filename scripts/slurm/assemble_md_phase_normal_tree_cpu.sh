@@ -14,6 +14,8 @@ ROOT=${ROOT:-/mnt/inaisfs/data/home/zhaozc_criait/XinxiangWang/BINDRAE}
 INPUT_ROOT=${INPUT_ROOT:?INPUT_ROOT is required}
 OUTPUT_DIR=${OUTPUT_DIR:?OUTPUT_DIR is required}
 EXPECTED_TARGETS=${EXPECTED_TARGETS:?EXPECTED_TARGETS is required}
+EXPECTED_PASSED_TARGETS=${EXPECTED_PASSED_TARGETS:-${EXPECTED_TARGETS}}
+SKIP_AUDIT_FAILED=${SKIP_AUDIT_FAILED:-0}
 
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate BINDRAE-MD
@@ -32,6 +34,20 @@ ARGS=()
 for directory in "${TARGET_DIRS[@]}"; do
   ARGS+=(--input-dir "${directory}")
 done
+if [[ "$SKIP_AUDIT_FAILED" == "1" ]]; then
+  ARGS+=(--skip-audit-failed)
+elif [[ "$SKIP_AUDIT_FAILED" != "0" ]]; then
+  echo "ERROR: SKIP_AUDIT_FAILED must be 0 or 1"
+  exit 1
+fi
 python scripts/assemble_md_phase_normal_cache.py \
   "${ARGS[@]}" \
   --output-dir "${OUTPUT_DIR}"
+
+ACTUAL_PASSED=$(python -c \
+  'import json,sys; print(json.load(open(sys.argv[1]))["samples"])' \
+  "${OUTPUT_DIR}/summary.json")
+if [[ "$ACTUAL_PASSED" -ne "$EXPECTED_PASSED_TARGETS" ]]; then
+  echo "ERROR: expected ${EXPECTED_PASSED_TARGETS} passed targets, assembled ${ACTUAL_PASSED}"
+  exit 1
+fi
