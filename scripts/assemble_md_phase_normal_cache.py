@@ -48,6 +48,11 @@ def inspect_target(directory: Path) -> Dict[str, Any]:
         n_residues = int(data["n_residues"].item())
         n_frames = int(np.asarray(data["t_values"]).size)
         valid_points = int(np.asarray(data["residual_valid_mask"]).sum())
+        phase_target_mode = (
+            str(data["phase_target_mode"].item())
+            if "phase_target_mode" in data.files
+            else "inferred"
+        )
     return {
         "source_dir": str(directory),
         "source_path": cache_path,
@@ -56,6 +61,7 @@ def inspect_target(directory: Path) -> Dict[str, Any]:
         "n_residues": n_residues,
         "n_frames": n_frames,
         "valid_residual_points": valid_points,
+        "phase_target_mode": phase_target_mode,
         "sha256": sha256(cache_path),
         "audit_metrics": audit.get("metrics", {}),
     }
@@ -98,6 +104,13 @@ def main() -> None:
         ),
         "sample_ids": sample_ids,
     }
+    phase_target_modes = sorted(
+        {str(record["phase_target_mode"]) for record in records}
+    )
+    if len(phase_target_modes) != 1:
+        raise ValueError(f"Mixed phase target modes: {phase_target_modes}")
+    phase_target_mode = phase_target_modes[0]
+    summary["phase_target_mode"] = phase_target_mode
     active_points = sum(
         int(record["audit_metrics"].get("active_interior_points", 0))
         for record in records
@@ -115,6 +128,11 @@ def main() -> None:
             "active_interior_points": active_points,
             "confident_phase_points": confident_phase_points,
             "phase_supervision_density": (
+                confident_phase_points / active_points
+                if active_points and phase_target_mode == "inferred"
+                else 0.0
+            ),
+            "reference_phase_coverage": (
                 confident_phase_points / active_points if active_points else 0.0
             ),
             "residual_candidate_points": residual_candidate_points,

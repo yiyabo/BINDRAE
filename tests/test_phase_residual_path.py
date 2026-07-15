@@ -225,6 +225,35 @@ class PhaseResidualPathTest(unittest.TestCase):
             )
             self.assertTrue(torch.allclose(chi_t, expected_chi, atol=1e-7))
 
+    def test_zero_residual_scale_is_strict_warp_only(self):
+        trainer = self._trainer("learned")
+        trainer.config.phase_residual_scale = 0.0
+        batch = self._batch()
+        rigids_apo = _rigid(torch.zeros(1, 3, 3))
+        rigids_holo = _rigid(
+            torch.tensor([[[1.0, 0.0, 0.0], [0.5, 0.0, 0.0], [0.2, 0.0, 0.0]]])
+        )
+        rigids, chi, _ = trainer.phase_orthogonal_residual_path(
+            batch,
+            rigids_apo,
+            rigids_holo,
+        )
+        for index, tau in enumerate(trainer._last_phase_tau_values):
+            expected_rigid, expected_chi = trainer._phase_interpolate_endpoints_tensor(
+                batch,
+                rigids_apo,
+                rigids_holo,
+                tau,
+            )
+            self.assertTrue(
+                torch.allclose(
+                    rigids[index].get_trans(),
+                    expected_rigid.get_trans(),
+                    atol=1e-7,
+                )
+            )
+            self.assertTrue(torch.allclose(chi[index], expected_chi, atol=1e-7))
+
     def test_cartesian_bridge_rebuilds_frames_from_backbone_triplets(self):
         trainer = self._trainer("identity")
         trainer.config.phase_residual_bridge_mode = "cartesian_backbone"

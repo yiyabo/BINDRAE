@@ -461,8 +461,9 @@ class Stage2Trainer:
             raise ValueError(
                 f"Unsupported phase_residual_envelope={config.phase_residual_envelope}"
             )
+        if float(config.phase_residual_scale) < 0.0:
+            raise ValueError("phase_residual_scale must be >= 0")
         for name in (
-            'phase_residual_scale',
             'phase_residual_rotation_metric_scale',
             'phase_residual_translation_metric_scale',
             'phase_residual_chi_metric_scale',

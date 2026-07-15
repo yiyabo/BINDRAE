@@ -82,6 +82,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--phase-grid-size", type=int, default=201)
     parser.add_argument("--smoothing-window", type=int, default=21)
     parser.add_argument("--identity-prior-weight", type=float, default=0.02)
+    parser.add_argument(
+        "--phase-target-mode",
+        choices=("inferred", "identity"),
+        default="inferred",
+        help=(
+            "Reference phase for the normal residual. 'inferred' is the full "
+            "phase-normal target; 'identity' is the strict residual-only ablation."
+        ),
+    )
     parser.add_argument("--rotation-scale-rad", type=float, default=1.0)
     parser.add_argument("--translation-scale-a", type=float, default=1.0)
     parser.add_argument("--chi-scale-rad", type=float, default=1.0)
@@ -106,6 +115,36 @@ def canonical_resname(name: str) -> str:
 
 def wrap_to_pi(value: np.ndarray) -> np.ndarray:
     return (np.asarray(value) + np.pi) % (2.0 * np.pi) - np.pi
+
+
+def apply_phase_target_mode(
+    mode: str,
+    progress: np.ndarray,
+    tau_target: np.ndarray,
+    phase_confidence: np.ndarray,
+    projection_cost: np.ndarray,
+    identity_cost: np.ndarray,
+    raw_monotonicity_violations: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Choose the bridge phase used to define residual supervision."""
+    if mode == "inferred":
+        return (
+            tau_target,
+            phase_confidence,
+            projection_cost,
+            raw_monotonicity_violations,
+        )
+    if mode != "identity":
+        raise ValueError(f"Unsupported phase target mode: {mode}")
+    identity_tau = np.broadcast_to(
+        np.asarray(progress, dtype=np.float64)[:, None], tau_target.shape
+    ).copy()
+    return (
+        identity_tau,
+        np.ones_like(phase_confidence),
+        identity_cost.copy(),
+        np.zeros_like(raw_monotonicity_violations),
+    )
 
 
 def smoothstep(value: np.ndarray) -> np.ndarray:
@@ -1080,6 +1119,21 @@ def export_targets(args: argparse.Namespace) -> Dict[str, Any]:
         endpoint_motion_norm[residue_index] = inferred["endpoint_motion_norm"]
         raw_monotonicity_violations[residue_index] = inferred["raw_monotonicity_violations"]
 
+    (
+        tau_target,
+        phase_confidence,
+        projection_cost,
+        raw_monotonicity_violations,
+    ) = apply_phase_target_mode(
+        args.phase_target_mode,
+        progress,
+        tau_target,
+        phase_confidence,
+        projection_cost,
+        identity_cost,
+        raw_monotonicity_violations,
+    )
+
     active_mask = endpoint_motion_norm >= args.min_endpoint_motion_norm
     phase_confidence[:, ~active_mask] = 0.0
     phase_confidence[0, active_mask] = 1.0
@@ -1159,6 +1213,7 @@ def export_targets(args: argparse.Namespace) -> Dict[str, Any]:
     residual_supervision_density = int(residual_valid.sum()) / max(
         residual_candidate_count, 1
     )
+    reconstruction_required = args.phase_target_mode == "inferred"
     checks = {
         "upstream_path_audits": path_audit_passed and atomistic_audit_passed,
         "residue_mapping": mapping_fraction >= args.min_mapping_fraction,
@@ -1173,9 +1228,18 @@ def export_targets(args: argparse.Namespace) -> Dict[str, Any]:
             residual_supervision_density >= args.min_supervision_density
         ),
         "normal_projection": max_projected_parallel_cos <= 1e-4,
-        "translation_reconstruction": mean_translation_error <= args.max_mean_reconstruction_translation_a,
-        "rotation_reconstruction": mean_rotation_error <= args.max_mean_reconstruction_rotation_rad,
-        "chi_reconstruction": mean_chi_error <= args.max_mean_reconstruction_chi_rad,
+        "translation_reconstruction": (
+            not reconstruction_required
+            or mean_translation_error <= args.max_mean_reconstruction_translation_a
+        ),
+        "rotation_reconstruction": (
+            not reconstruction_required
+            or mean_rotation_error <= args.max_mean_reconstruction_rotation_rad
+        ),
+        "chi_reconstruction": (
+            not reconstruction_required
+            or mean_chi_error <= args.max_mean_reconstruction_chi_rad
+        ),
     }
     passed = all(checks.values())
     cache_node_mask = np.zeros(canonical_n_residues, dtype=bool)
@@ -1246,6 +1310,7 @@ def export_targets(args: argparse.Namespace) -> Dict[str, Any]:
         sample_id=np.array(sample_id),
         transition_id=np.array(args.transition_id),
         evidence_tier=np.array("silver_enhanced_sampling"),
+        phase_target_mode=np.array(args.phase_target_mode),
         bridge_mode=np.array("cartesian_backbone"),
         residual_envelope=np.array("poly"),
         rotation_metric_scale=np.array(args.rotation_scale_rad, dtype=np.float32),
@@ -1292,6 +1357,7 @@ def export_targets(args: argparse.Namespace) -> Dict[str, Any]:
     )
     audit = {
         "schema_version": SCHEMA_VERSION,
+        "phase_target_mode": args.phase_target_mode,
         "status": "md_phase_normal_targets_passed" if passed else "md_phase_normal_targets_failed",
         "passed": passed,
         "checks": checks,
@@ -1321,8 +1387,9 @@ def export_targets(args: argparse.Namespace) -> Dict[str, Any]:
             "contact_event_residues": contact_event_count,
         },
         "usage": {
-            "phase_supervision": passed,
+            "phase_supervision": passed and args.phase_target_mode == "inferred",
             "geometry_supervision": passed,
+            "reconstruction_fidelity_claim": reconstruction_required,
             "heldout_benchmark": False,
             "kinetics_claims": False,
             "evidence_weight": "low_silver_pilot",
@@ -1337,9 +1404,12 @@ def export_targets(args: argparse.Namespace) -> Dict[str, Any]:
                 "sample_id": sample_id,
                 "transition_id": args.transition_id,
                 "schema_version": SCHEMA_VERSION,
+                "phase_target_mode": args.phase_target_mode,
                 "relative_path": cache_path.name,
                 "status": audit["status"],
-                "phase_supervision": passed,
+                "phase_supervision": (
+                    passed and args.phase_target_mode == "inferred"
+                ),
             },
             sort_keys=True,
         ) + "\n"

@@ -34,6 +34,7 @@ python scripts/export_md_phase_normal_targets.py \
   --phase-grid-size "${PHASE_GRID_SIZE:-201}" \
   --smoothing-window "${SMOOTHING_WINDOW:-21}" \
   --identity-prior-weight "${IDENTITY_PRIOR_WEIGHT:-0.02}" \
+  --phase-target-mode "${PHASE_TARGET_MODE:-inferred}" \
   --min-endpoint-motion-norm "${MIN_ENDPOINT_MOTION_NORM:-0.5}" \
   --min-phase-confidence "${MIN_PHASE_CONFIDENCE:-0.05}" \
   --min-supervision-density "${MIN_SUPERVISION_DENSITY:-0.05}" \

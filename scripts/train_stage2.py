@@ -101,7 +101,7 @@ def parse_args():
                         choices=['poly', 'sin2'],
                         help='Endpoint-zero envelope for phase residuals')
     parser.add_argument('--phase_residual_scale', type=float, default=1.0,
-                        help='Global scale applied after tangent-normal projection')
+                        help='Global scale after tangent-normal projection; 0 is warp-only')
     parser.add_argument('--phase_residual_rotation_metric_scale', type=float, default=1.0,
                         help='Characteristic rotation scale in radians for the product metric')
     parser.add_argument('--phase_residual_translation_metric_scale', type=float, default=1.0,

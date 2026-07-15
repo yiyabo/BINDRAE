@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 
 from scripts.export_md_phase_normal_targets import (
+    apply_phase_target_mode,
     _extract_endpoint_arrays,
     _load_canonical_residue_axis,
     _scatter_residue_axis,
@@ -20,6 +21,31 @@ from scripts.export_md_phase_normal_targets import (
 
 
 class MdPhaseNormalTargetTest(unittest.TestCase):
+    def test_identity_phase_target_uses_synchronous_reference(self):
+        progress = np.asarray([0.0, 0.4, 1.0])
+        tau = np.asarray([[0.0, 0.0], [0.2, 0.7], [1.0, 1.0]])
+        confidence = np.full_like(tau, 0.25)
+        projection_cost = np.full_like(tau, 3.0)
+        identity_cost = np.full_like(tau, 5.0)
+        violations = np.asarray([2, 1], dtype=np.int32)
+
+        result = apply_phase_target_mode(
+            "identity",
+            progress,
+            tau,
+            confidence,
+            projection_cost,
+            identity_cost,
+            violations,
+        )
+
+        np.testing.assert_allclose(
+            result[0], np.broadcast_to(progress[:, None], tau.shape)
+        )
+        np.testing.assert_array_equal(result[1], np.ones_like(confidence))
+        np.testing.assert_array_equal(result[2], identity_cost)
+        np.testing.assert_array_equal(result[3], np.zeros_like(violations))
+
     def test_canonical_axis_comes_from_stage2_apo_torsion_cache(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             data_dir = Path(tmpdir)

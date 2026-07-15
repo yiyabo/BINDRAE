@@ -39,6 +39,8 @@ records, not templates.
   passed-target cache assembly.
 - `audit_md_rmsd_pull_cpu.sh` / `audit_md_atomistic_path_cpu.sh` - path and atomistic admission audits.
 - `export_md_phase_normal_targets_cpu.sh` - export audited phase/normal-residual targets on CPU.
+- `export_md_phase_normal_matrix_cpu.sh` - array re-export of a merged MD collection under a selected phase reference.
+- `assemble_md_phase_normal_tree_cpu.sh` - dependency-safe assembly of a complete re-export tree into one immutable cache.
 - `evaluate_stage2_bridge_timewarp_1gpu.sh` - endpoint-exact bridge time-warp headroom evaluator before training a time-warp model.
 - `evaluate_stage2_trajectory_reliability_1gpu.sh` - internal physical/contact trajectory reliability benchmark against cubic interpolation.
 - `generate_stage2_trajectories_1gpu.sh` - trajectory export wrapper for visualization.
