@@ -51,7 +51,7 @@ from src.stage2.modules import (  # noqa: E402
 from flash_ipa.rigid import Rigid, Rotation  # noqa: E402
 
 
-def parse_args() -> argparse.Namespace:
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Evaluate residue-level Stage-2 path transitions")
     parser.add_argument("--checkpoint", required=True, help="Stage-2 checkpoint path")
     parser.add_argument("--data_dir", default="processed_data/triplets", help="Stage-2 data directory")
@@ -193,7 +193,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--pocket_threshold", type=float, default=0.3)
     parser.add_argument("--output", default=None, help="optional JSON output path")
-    return parser.parse_args()
+    return parser
+
+
+def parse_args() -> argparse.Namespace:
+    return build_arg_parser().parse_args()
 
 
 def batch_to_device(batch, device: torch.device):
@@ -913,6 +917,84 @@ def bridge_timewarp_path(
     return rigids_list, chi_list, t_list
 
 
+def phase_residual_tau_values(
+    model,
+    batch,
+    rigids_apo: Rigid,
+    rigids_holo: Rigid,
+    n_steps: int,
+    interaction_prior: Optional[torch.Tensor],
+    esm_gate_context: Optional[torch.Tensor],
+    *,
+    tau_mode: str,
+    bridge_mode: str,
+    logit_scale: float,
+    rate_eps: float,
+    rate_clip: float,
+) -> List[torch.Tensor]:
+    """Evaluate monotone per-residue phase values on a uniform time grid."""
+    n_steps = int(n_steps)
+    if n_steps < 2:
+        raise ValueError("phase_orthogonal_residual_v1 requires n_steps >= 2")
+    bsz, n_res = batch.node_mask.shape
+    device = batch.node_mask.device
+    node_mask = batch.node_mask.bool()
+    node_mask_f = node_mask.float()
+
+    if tau_mode == "identity":
+        return [
+            torch.full(
+                (bsz, n_res),
+                k / n_steps,
+                dtype=torch.float32,
+                device=device,
+            )
+            for k in range(n_steps + 1)
+        ]
+    if tau_mode != "learned":
+        raise ValueError(f"Unsupported phase residual tau_mode={tau_mode}")
+
+    rates: List[torch.Tensor] = []
+    for k in range(n_steps):
+        t_mid = (k + 0.5) / n_steps
+        mid_tau = torch.full(
+            (bsz, n_res), t_mid, dtype=torch.float32, device=device
+        )
+        mid_rigids, mid_chi = phase_interpolate_endpoints_tensor(
+            batch, rigids_apo, rigids_holo, mid_tau, bridge_mode
+        )
+        out = model(
+            chi=mid_chi,
+            rigids=mid_rigids,
+            esm=batch.esm,
+            lig_points=batch.lig_points,
+            lig_types=batch.lig_types,
+            lig_mask=batch.lig_mask,
+            w_res=batch.w_res,
+            t=torch.full((bsz,), t_mid, device=device),
+            node_mask=batch.node_mask,
+            nma_features=batch.nma_features,
+            interaction_prior=interaction_prior,
+            esm_gate_context=esm_gate_context,
+        )
+        logits = out["time_warp_logits"].float().squeeze(-1) * node_mask_f
+        rate = F.softplus(logits * float(logit_scale)) + float(rate_eps)
+        if float(rate_clip) > 0.0:
+            rate = rate.clamp(max=float(rate_clip))
+        rates.append(torch.where(node_mask, rate, torch.ones_like(rate)))
+    rate_stack = torch.stack(rates, dim=0)
+    cumulative = torch.cumsum(rate_stack, dim=0)
+    total_rate = cumulative[-1].clamp(min=float(rate_eps))
+    tau_values = [
+        torch.zeros((bsz, n_res), dtype=torch.float32, device=device)
+    ]
+    tau_values.extend(
+        (cumulative[k] / total_rate).clamp(0.0, 1.0)
+        for k in range(n_steps)
+    )
+    return tau_values
+
+
 def phase_orthogonal_residual_path(
     model,
     batch,
@@ -939,62 +1021,23 @@ def phase_orthogonal_residual_path(
     n_steps = int(n_steps)
     if n_steps < 2:
         raise ValueError("phase_orthogonal_residual_v1 requires n_steps >= 2")
-    bsz, n_res = batch.node_mask.shape
+    bsz, _ = batch.node_mask.shape
     device = batch.node_mask.device
     node_mask = batch.node_mask.bool()
-    node_mask_f = node_mask.float()
-
-    if tau_mode == "identity":
-        tau_values = [
-            torch.full(
-                (bsz, n_res),
-                k / n_steps,
-                dtype=torch.float32,
-                device=device,
-            )
-            for k in range(n_steps + 1)
-        ]
-    elif tau_mode == "learned":
-        rates: List[torch.Tensor] = []
-        for k in range(n_steps):
-            t_mid = (k + 0.5) / n_steps
-            mid_tau = torch.full(
-                (bsz, n_res), t_mid, dtype=torch.float32, device=device
-            )
-            mid_rigids, mid_chi = phase_interpolate_endpoints_tensor(
-                batch, rigids_apo, rigids_holo, mid_tau, bridge_mode
-            )
-            out = model(
-                chi=mid_chi,
-                rigids=mid_rigids,
-                esm=batch.esm,
-                lig_points=batch.lig_points,
-                lig_types=batch.lig_types,
-                lig_mask=batch.lig_mask,
-                w_res=batch.w_res,
-                t=torch.full((bsz,), t_mid, device=device),
-                node_mask=batch.node_mask,
-                nma_features=batch.nma_features,
-                interaction_prior=interaction_prior,
-                esm_gate_context=esm_gate_context,
-            )
-            logits = out["time_warp_logits"].float().squeeze(-1) * node_mask_f
-            rate = F.softplus(logits * float(logit_scale)) + float(rate_eps)
-            if float(rate_clip) > 0.0:
-                rate = rate.clamp(max=float(rate_clip))
-            rates.append(torch.where(node_mask, rate, torch.ones_like(rate)))
-        rate_stack = torch.stack(rates, dim=0)
-        cumulative = torch.cumsum(rate_stack, dim=0)
-        total_rate = cumulative[-1].clamp(min=float(rate_eps))
-        tau_values = [
-            torch.zeros((bsz, n_res), dtype=torch.float32, device=device)
-        ]
-        tau_values.extend(
-            (cumulative[k] / total_rate).clamp(0.0, 1.0)
-            for k in range(n_steps)
-        )
-    else:
-        raise ValueError(f"Unsupported phase residual tau_mode={tau_mode}")
+    tau_values = phase_residual_tau_values(
+        model,
+        batch,
+        rigids_apo,
+        rigids_holo,
+        n_steps,
+        interaction_prior,
+        esm_gate_context,
+        tau_mode=tau_mode,
+        bridge_mode=bridge_mode,
+        logit_scale=logit_scale,
+        rate_eps=rate_eps,
+        rate_clip=rate_clip,
+    )
 
     bridge_tangent_chi = wrap_to_pi(
         batch.torsion_holo[..., 3:7] - batch.torsion_apo[..., 3:7]

@@ -38,6 +38,7 @@ to revive that lane.
 ## Active Stage-2 Evaluation / Demo
 
 - `evaluate_stage2_transition_paths.py` - residue-level transition path evaluator.
+- `evaluate_stage2_md_reference_paths.py` - compare generated paths with all held-out audited MD replicas using system- and replica-macro metrics.
 - `evaluate_stage2_bridge_timewarp.py` - endpoint-exact bridge time-warp headroom evaluator for pure/oracle/projected-progress paths.
 - `evaluate_stage2_trajectory_reliability.py` - internal trajectory reliability benchmark against cubic SE(3)+chi interpolation.
 - `evaluate_stage2_path_critic.py` - Stage-2 path critic/evaluator helper.

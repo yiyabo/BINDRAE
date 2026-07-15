@@ -28,6 +28,7 @@ records, not templates.
 - `train_stage2_oracle_motion_ablation_4gpu.sh` - active Stage-2 OracleMotion / ESM last-K / REPA ablation launcher; legacy filename, defaults to 2xA100 on the current cluster and supports matched plus REPA-target-shuffled controls.
 - `submit_stage2_24k_resumable.sh` - fixed-tag submitter for the 24k OracleMotion / ESM7 / REPA matrix; reuses the interrupted run directories and keeps `AUTO_RESUME=1` so resubmission continues from `last_checkpoint.pt`.
 - `evaluate_stage2_transition_paths_1gpu.sh` - residue-level transition evaluator.
+- `evaluate_stage2_md_reference_1gpu.sh` - one-GPU held-out MD-reference path evaluator.
 - `run_md_global_rmsd_pull_cpu.sh` - biased silver-path pilot; it is not a kinetics workflow.
 - `run_md_context_pipeline_array_cpu.sh` - resumable setup, NVT, NPT, and
   context registration array for selected pilot systems.
