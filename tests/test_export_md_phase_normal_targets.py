@@ -12,6 +12,7 @@ from scripts.export_md_phase_normal_targets import (
     _scatter_residue_axis,
     _triple_sequence_alignment,
     contact_annotations,
+    endpoint_envelope,
     infer_monotone_phase,
     monotone_path_indices,
     smoothstep,
@@ -21,6 +22,17 @@ from scripts.export_md_phase_normal_targets import (
 
 
 class MdPhaseNormalTargetTest(unittest.TestCase):
+    def test_sin2_envelope_is_c1_at_endpoints(self):
+        epsilon = 1e-5
+        values = np.asarray([0.0, epsilon, 0.5, 1.0 - epsilon, 1.0])
+        sin2 = endpoint_envelope(values)
+        poly = endpoint_envelope(values, "poly")
+        self.assertEqual(float(sin2[0]), 0.0)
+        self.assertEqual(float(sin2[-1]), 0.0)
+        self.assertAlmostEqual(float(sin2[2]), 1.0)
+        self.assertLess(float(sin2[1] / epsilon), 1e-3)
+        self.assertGreater(float(poly[1] / epsilon), 3.9)
+
     def test_identity_phase_target_uses_synchronous_reference(self):
         progress = np.asarray([0.0, 0.4, 1.0])
         tau = np.asarray([[0.0, 0.0], [0.2, 0.7], [1.0, 1.0]])

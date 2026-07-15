@@ -75,6 +75,27 @@ def inspect_collection(cache_dir: Path) -> List[Dict[str, Any]]:
             schema = str(data["schema_version"].item())
             sample_id = str(data["sample_id"].item())
             transition_id = str(data["transition_id"].item())
+            phase_target_mode = (
+                str(data["phase_target_mode"].item())
+                if "phase_target_mode" in data.files
+                else "inferred"
+            )
+            residual_envelope = (
+                str(data["residual_envelope"].item())
+                if "residual_envelope" in data.files
+                else "poly"
+            )
+            metric_scales = {
+                "rotation": float(data["rotation_metric_scale"].item())
+                if "rotation_metric_scale" in data.files
+                else 1.0,
+                "translation": float(data["translation_metric_scale"].item())
+                if "translation_metric_scale" in data.files
+                else 1.0,
+                "chi": float(data["chi_metric_scale"].item())
+                if "chi_metric_scale" in data.files
+                else 1.0,
+            }
         if schema != "md_phase_normal_v1":
             raise ValueError(f"{source_path} schema_version={schema!r}")
         if sample_id != record["sample_id"] or transition_id != record["transition_id"]:
@@ -82,6 +103,9 @@ def inspect_collection(cache_dir: Path) -> List[Dict[str, Any]]:
         inspected.append(
             {
                 **record,
+                "phase_target_mode": phase_target_mode,
+                "residual_envelope": residual_envelope,
+                "metric_scales": metric_scales,
                 "source_cache_dir": str(cache_dir),
                 "source_path": source_path,
             }
@@ -142,6 +166,22 @@ def merge_collections(input_dirs: Iterable[Path], output_dir: Path) -> Dict[str,
     ]
     records, duplicate_count = deduplicate_records(all_records)
     records.sort(key=lambda record: (record["sample_id"], record["transition_id"]))
+    phase_target_modes = sorted(
+        {str(record["phase_target_mode"]) for record in records}
+    )
+    if len(phase_target_modes) != 1:
+        raise ValueError(f"Mixed phase target modes: {phase_target_modes}")
+    residual_envelopes = sorted(
+        {str(record["residual_envelope"]) for record in records}
+    )
+    if len(residual_envelopes) != 1:
+        raise ValueError(f"Mixed residual envelopes: {residual_envelopes}")
+    metric_contracts = {
+        json.dumps(record["metric_scales"], sort_keys=True)
+        for record in records
+    }
+    if len(metric_contracts) != 1:
+        raise ValueError(f"Mixed metric scales: {sorted(metric_contracts)}")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     manifest_records = []
@@ -197,6 +237,9 @@ def merge_collections(input_dirs: Iterable[Path], output_dir: Path) -> Dict[str,
         ),
         "base_sample_ids": base_sample_ids,
         "sample_ids": sample_ids,
+        "phase_target_mode": phase_target_modes[0],
+        "residual_envelope": residual_envelopes[0],
+        "metric_scales": json.loads(next(iter(metric_contracts))),
     }
     (output_dir / "manifest.jsonl").write_text(
         "".join(json.dumps(record, sort_keys=True) + "\n" for record in manifest_records)

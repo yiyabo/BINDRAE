@@ -24,6 +24,11 @@ def parse_args() -> argparse.Namespace:
         choices=("inferred", "identity"),
         default="identity",
     )
+    parser.add_argument(
+        "--residual-envelope",
+        choices=("sin2", "poly"),
+        default="sin2",
+    )
     return parser.parse_args()
 
 
@@ -94,6 +99,8 @@ def main() -> None:
         str(replica["sample_id"]),
         "--phase-target-mode",
         args.phase_target_mode,
+        "--residual-envelope",
+        args.residual_envelope,
     ]
     subprocess.run(command, cwd=PROJECT_ROOT, check=True)
     print(
@@ -102,6 +109,7 @@ def main() -> None:
                 "index": args.index,
                 "sample_id": replica["sample_id"],
                 "phase_target_mode": args.phase_target_mode,
+                "residual_envelope": args.residual_envelope,
                 "output_dir": str(output_dir),
             },
             sort_keys=True,

@@ -22,6 +22,11 @@ class AssembleMdPhaseNormalCacheTest(unittest.TestCase):
                 residual_valid_mask=np.array(
                     [[False, False], [True, False], [False, False]]
                 ),
+                phase_target_mode=np.array("identity"),
+                residual_envelope=np.array("sin2"),
+                rotation_metric_scale=np.array(0.5, dtype=np.float32),
+                translation_metric_scale=np.array(2.0, dtype=np.float32),
+                chi_metric_scale=np.array(0.75, dtype=np.float32),
             )
             (directory / "target_audit.json").write_text(
                 json.dumps(
@@ -36,6 +41,12 @@ class AssembleMdPhaseNormalCacheTest(unittest.TestCase):
             self.assertEqual(record["sample_id"], "sample")
             self.assertEqual(record["n_frames"], 3)
             self.assertEqual(record["valid_residual_points"], 1)
+            self.assertEqual(record["phase_target_mode"], "identity")
+            self.assertEqual(record["residual_envelope"], "sin2")
+            self.assertEqual(
+                record["metric_scales"],
+                {"rotation": 0.5, "translation": 2.0, "chi": 0.75},
+            )
 
 
 if __name__ == "__main__":

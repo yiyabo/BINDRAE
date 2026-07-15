@@ -5,7 +5,7 @@ from typing import Dict, Optional
 import torch
 
 
-def endpoint_zero_envelope(t: torch.Tensor, kind: str = "poly") -> torch.Tensor:
+def endpoint_zero_envelope(t: torch.Tensor, kind: str = "sin2") -> torch.Tensor:
     """Return a unit-peak envelope that is exactly zero at both endpoints."""
     t_clamped = t.float().clamp(0.0, 1.0)
     if kind == "poly":

@@ -16,7 +16,14 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _write_collection(directory: Path, sample_id: str, transition_id: str) -> None:
+def _write_collection(
+    directory: Path,
+    sample_id: str,
+    transition_id: str,
+    *,
+    phase_target_mode: str = "inferred",
+    residual_envelope: str = "sin2",
+) -> None:
     directory.mkdir(parents=True)
     target = directory / f"{sample_id}.npz"
     np.savez_compressed(
@@ -24,6 +31,11 @@ def _write_collection(directory: Path, sample_id: str, transition_id: str) -> No
         schema_version=np.array("md_phase_normal_v1"),
         sample_id=np.array(sample_id),
         transition_id=np.array(transition_id),
+        phase_target_mode=np.array(phase_target_mode),
+        residual_envelope=np.array(residual_envelope),
+        rotation_metric_scale=np.array(1.0, dtype=np.float32),
+        translation_metric_scale=np.array(1.0, dtype=np.float32),
+        chi_metric_scale=np.array(1.0, dtype=np.float32),
     )
     record = {
         "sample_id": sample_id,
@@ -64,7 +76,23 @@ class MergeMdPhaseNormalCachesTest(unittest.TestCase):
             self.assertEqual(summary["base_systems"], 2)
             self.assertEqual(summary["duplicate_records_removed"], 0)
             self.assertEqual(summary["phase_supervision_density"], 0.5)
+            self.assertEqual(summary["phase_target_mode"], "inferred")
+            self.assertEqual(summary["residual_envelope"], "sin2")
             self.assertEqual(len(list(output.glob("*.npz"))), 2)
+
+    def test_mixed_envelope_fails(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            first = root / "first"
+            second = root / "second"
+            _write_collection(
+                first, "system-a__silver_r00", "a:r00", residual_envelope="sin2"
+            )
+            _write_collection(
+                second, "system-b__silver_r01", "b:r01", residual_envelope="poly"
+            )
+            with self.assertRaisesRegex(ValueError, "Mixed residual envelopes"):
+                merge_collections([first, second], root / "merged")
 
     def test_exact_duplicate_is_removed(self):
         record = {

@@ -97,7 +97,7 @@ def parse_args():
                         default='se3_geodesic',
                         choices=['se3_geodesic', 'cartesian_backbone'],
                         help='Reference backbone bridge used by the phase model')
-    parser.add_argument('--phase_residual_envelope', type=str, default='poly',
+    parser.add_argument('--phase_residual_envelope', type=str, default='sin2',
                         choices=['poly', 'sin2'],
                         help='Endpoint-zero envelope for phase residuals')
     parser.add_argument('--phase_residual_scale', type=float, default=1.0,

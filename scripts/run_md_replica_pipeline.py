@@ -20,6 +20,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--matrix", type=Path, required=True)
     parser.add_argument("--index", type=int, required=True)
     parser.add_argument("--platform", choices=["CPU", "CUDA", "OpenCL"], default="CPU")
+    parser.add_argument(
+        "--residual-envelope", choices=["sin2", "poly"], default="sin2"
+    )
     parser.add_argument("--force", action="store_true")
     return parser.parse_args()
 
@@ -121,6 +124,7 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
         "replica_index": record["replica_index"],
         "seed": record["seed"],
         "protocol": record["protocol"],
+        "residual_envelope": args.residual_envelope,
         "started_at": utc_now(),
         "stages": {},
     }
@@ -187,6 +191,7 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
                 "--preparation-report", str(record["preparation_report"]),
                 "--output-dir", str(target_dir),
                 "--sample-id", str(record["sample_id"]),
+                "--residual-envelope", args.residual_envelope,
             ],
             target_dir / "target_audit.json",
             "md_phase_normal_targets_passed",

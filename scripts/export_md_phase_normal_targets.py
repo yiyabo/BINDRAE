@@ -91,6 +91,15 @@ def parse_args() -> argparse.Namespace:
             "phase-normal target; 'identity' is the strict residual-only ablation."
         ),
     )
+    parser.add_argument(
+        "--residual-envelope",
+        choices=("sin2", "poly"),
+        default="sin2",
+        help=(
+            "Endpoint-zero envelope used to convert the geometric normal "
+            "displacement into the residual-head target."
+        ),
+    )
     parser.add_argument("--rotation-scale-rad", type=float, default=1.0)
     parser.add_argument("--translation-scale-a", type=float, default=1.0)
     parser.add_argument("--chi-scale-rad", type=float, default=1.0)
@@ -152,9 +161,14 @@ def smoothstep(value: np.ndarray) -> np.ndarray:
     return 3.0 * value * value - 2.0 * value * value * value
 
 
-def endpoint_envelope(value: np.ndarray) -> np.ndarray:
+def endpoint_envelope(value: np.ndarray, kind: str = "sin2") -> np.ndarray:
     value = np.asarray(value, dtype=np.float64)
-    envelope = 4.0 * value * (1.0 - value)
+    if kind == "sin2":
+        envelope = np.sin(np.pi * value) ** 2
+    elif kind == "poly":
+        envelope = 4.0 * value * (1.0 - value)
+    else:
+        raise ValueError(f"Unsupported residual envelope: {kind}")
     return np.where((value > 0.0) & (value < 1.0), envelope, 0.0)
 
 
@@ -797,7 +811,9 @@ def _normal_decomposition(
         bridge_chi + projected_chi - observed_chi_t + torch.pi, 2.0 * torch.pi
     ) - torch.pi
 
-    envelope = torch.as_tensor(endpoint_envelope(progress), dtype=dtype).view(-1, 1)
+    envelope = torch.as_tensor(
+        endpoint_envelope(progress, args.residual_envelope), dtype=dtype
+    ).view(-1, 1)
     confidence_t = torch.as_tensor(confidence, dtype=dtype)
     residual_norm = projection["projected_residual_metric_norm"]
     valid = (
@@ -1207,7 +1223,8 @@ def export_targets(args: argparse.Namespace) -> Dict[str, Any]:
     active_point_count = int(active_points.sum())
     confident_phase_density = int(confident_points.sum()) / max(active_point_count, 1)
     residual_candidate_points = active_points & (
-        endpoint_envelope(progress)[:, None] >= args.min_residual_envelope
+        endpoint_envelope(progress, args.residual_envelope)[:, None]
+        >= args.min_residual_envelope
     )
     residual_candidate_count = int(residual_candidate_points.sum())
     residual_supervision_density = int(residual_valid.sum()) / max(
@@ -1312,7 +1329,7 @@ def export_targets(args: argparse.Namespace) -> Dict[str, Any]:
         evidence_tier=np.array("silver_enhanced_sampling"),
         phase_target_mode=np.array(args.phase_target_mode),
         bridge_mode=np.array("cartesian_backbone"),
-        residual_envelope=np.array("poly"),
+        residual_envelope=np.array(args.residual_envelope),
         rotation_metric_scale=np.array(args.rotation_scale_rad, dtype=np.float32),
         translation_metric_scale=np.array(args.translation_scale_a, dtype=np.float32),
         chi_metric_scale=np.array(args.chi_scale_rad, dtype=np.float32),
@@ -1358,6 +1375,7 @@ def export_targets(args: argparse.Namespace) -> Dict[str, Any]:
     audit = {
         "schema_version": SCHEMA_VERSION,
         "phase_target_mode": args.phase_target_mode,
+        "residual_envelope": args.residual_envelope,
         "status": "md_phase_normal_targets_passed" if passed else "md_phase_normal_targets_failed",
         "passed": passed,
         "checks": checks,
@@ -1405,6 +1423,7 @@ def export_targets(args: argparse.Namespace) -> Dict[str, Any]:
                 "transition_id": args.transition_id,
                 "schema_version": SCHEMA_VERSION,
                 "phase_target_mode": args.phase_target_mode,
+                "residual_envelope": args.residual_envelope,
                 "relative_path": cache_path.name,
                 "status": audit["status"],
                 "phase_supervision": (

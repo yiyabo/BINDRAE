@@ -11,10 +11,19 @@ from src.stage2.modules.phase_residual import (
 class PhaseResidualProjectionTest(unittest.TestCase):
     def test_endpoint_envelope_is_exact(self):
         t = torch.tensor([0.0, 0.25, 0.5, 0.75, 1.0])
-        envelope = endpoint_zero_envelope(t, kind="poly")
+        envelope = endpoint_zero_envelope(t)
         self.assertEqual(envelope[0].item(), 0.0)
         self.assertEqual(envelope[-1].item(), 0.0)
         self.assertAlmostEqual(envelope[2].item(), 1.0, places=6)
+
+    def test_default_envelope_has_zero_endpoint_slope(self):
+        epsilon = 1e-4
+        t = torch.tensor([0.0, epsilon, 1.0 - epsilon, 1.0])
+        envelope = endpoint_zero_envelope(t)
+        left_slope = (envelope[1] - envelope[0]) / epsilon
+        right_slope = (envelope[-1] - envelope[-2]) / epsilon
+        self.assertLess(abs(left_slope.item()), 2e-3)
+        self.assertLess(abs(right_slope.item()), 2e-3)
 
     def test_projection_is_metric_orthogonal(self):
         torch.manual_seed(7)

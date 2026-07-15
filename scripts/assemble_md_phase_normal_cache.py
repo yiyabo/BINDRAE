@@ -53,6 +53,22 @@ def inspect_target(directory: Path) -> Dict[str, Any]:
             if "phase_target_mode" in data.files
             else "inferred"
         )
+        residual_envelope = (
+            str(data["residual_envelope"].item())
+            if "residual_envelope" in data.files
+            else "poly"
+        )
+        metric_scales = {
+            "rotation": float(data["rotation_metric_scale"].item())
+            if "rotation_metric_scale" in data.files
+            else 1.0,
+            "translation": float(data["translation_metric_scale"].item())
+            if "translation_metric_scale" in data.files
+            else 1.0,
+            "chi": float(data["chi_metric_scale"].item())
+            if "chi_metric_scale" in data.files
+            else 1.0,
+        }
     return {
         "source_dir": str(directory),
         "source_path": cache_path,
@@ -62,6 +78,8 @@ def inspect_target(directory: Path) -> Dict[str, Any]:
         "n_frames": n_frames,
         "valid_residual_points": valid_points,
         "phase_target_mode": phase_target_mode,
+        "residual_envelope": residual_envelope,
+        "metric_scales": metric_scales,
         "sha256": sha256(cache_path),
         "audit_metrics": audit.get("metrics", {}),
     }
@@ -111,6 +129,19 @@ def main() -> None:
         raise ValueError(f"Mixed phase target modes: {phase_target_modes}")
     phase_target_mode = phase_target_modes[0]
     summary["phase_target_mode"] = phase_target_mode
+    residual_envelopes = sorted(
+        {str(record["residual_envelope"]) for record in records}
+    )
+    if len(residual_envelopes) != 1:
+        raise ValueError(f"Mixed residual envelopes: {residual_envelopes}")
+    summary["residual_envelope"] = residual_envelopes[0]
+    metric_contracts = {
+        json.dumps(record["metric_scales"], sort_keys=True)
+        for record in records
+    }
+    if len(metric_contracts) != 1:
+        raise ValueError(f"Mixed metric scales: {sorted(metric_contracts)}")
+    summary["metric_scales"] = json.loads(next(iter(metric_contracts)))
     active_points = sum(
         int(record["audit_metrics"].get("active_interior_points", 0))
         for record in records

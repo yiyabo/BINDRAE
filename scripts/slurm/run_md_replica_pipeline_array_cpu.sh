@@ -16,6 +16,7 @@ ROOT="${ROOT:-/mnt/inaisfs/data/home/zhaozc_criait/XinxiangWang/BINDRAE}"
 MATRIX="${MATRIX:?Set MATRIX to replica_matrix.jsonl}"
 MATRIX_INDEX="${SLURM_ARRAY_TASK_ID:?Submit this launcher as a Slurm array}"
 PLATFORM="${PLATFORM:-CPU}"
+RESIDUAL_ENVELOPE="${RESIDUAL_ENVELOPE:-sin2}"
 
 cd "$ROOT"
 mkdir -p logs/slurm
@@ -29,8 +30,10 @@ export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-32}"
 echo "Matrix: $MATRIX"
 echo "Matrix index: $MATRIX_INDEX"
 echo "Platform: $PLATFORM"
+echo "Residual envelope: $RESIDUAL_ENVELOPE"
 
 python scripts/run_md_replica_pipeline.py \
   --matrix "$MATRIX" \
   --index "$MATRIX_INDEX" \
-  --platform "$PLATFORM"
+  --platform "$PLATFORM" \
+  --residual-envelope "$RESIDUAL_ENVELOPE"
