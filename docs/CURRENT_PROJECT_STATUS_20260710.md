@@ -1,6 +1,6 @@
 # Current Project Status
 
-Date: 2026-07-13
+Date: 2026-07-16
 
 This is the operational source of truth for the current BINDRAE research track.
 For the method and manuscript logic, read
@@ -64,6 +64,10 @@ Implemented properties:
 - evaluator support for deterministic component ablations.
 - Cartesian `N/CA/C` endpoint bridge with locally differentiated tangents;
 - reproducible `se3_geodesic` reference-bridge ablation.
+- `sin^2(pi t)` residual envelope as the main contract, giving both zero
+  displacement and zero residual slope at the two endpoints;
+- immutable MD-target cache contracts that record phase mode, residual
+  envelope, and rotation/translation/chi metric scales.
 
 ## What Has Been Validated
 
@@ -120,10 +124,11 @@ endpoint-only aggregate losses:
 
 ### MD-supervised capacity and geometry diagnostic (2026-07-15)
 
-The first audited MD cache contains 29 accepted paths from seven endpoint
-systems. These runs use the same seven systems for training and validation, so
-they are capacity and optimization diagnostics only, not generalization
-evidence.
+The first audited MD cache contained 29 accepted paths from seven endpoint
+systems. Those same-system runs were capacity and optimization diagnostics
+only, not generalization evidence. The silver corpus has since expanded to 82
+accepted paths from 23 endpoint systems, enabling a fixed 17-system train / six-
+system held-out pilot split.
 
 Isolated 100-epoch tests showed that both supervised components are learnable:
 
@@ -339,10 +344,43 @@ Updated queue:
    the stochastic multipath extension after the deterministic decomposition is
    identified.
 
+### Smooth-envelope target contract and matched screen (2026-07-16)
+
+The main APNB residual envelope is now `sin2 = sin^2(pi t)`. Historical `poly`
+targets and checkpoints remain loadable and must continue to use `poly`; new
+targets record the envelope explicitly and incompatible cache contracts cannot
+be merged silently.
+
+The 82-path collection was re-exported under both phase references:
+
+- inferred phase: 81/82 paths passed; one path was conservatively rejected at
+  4.918% residual-supervision coverage against the fixed 5% gate;
+- identity phase: 82/82 paths passed;
+- both caches use metric scales `(rotation, translation, chi) = (1, 1, 1)`.
+
+The next matched screen uses the same 17/6 system split, trunk, objective,
+two-A100 budget, batch size, and 40-epoch ceiling for every trainable row:
+
+```text
+143174  phase-only     pending
+143175  residual-only  pending
+143176  full APNB      pending
+```
+
+This screen is a deterministic component-identification experiment, not a
+final paper result. Full APNB is promoted only if it beats phase-only and
+residual-only on held-out path metrics while retaining controlled residual and
+tail-geometry behavior.
+
 ## Repository Posture
 
-The local branch is `codex/stage2-esm-repa-enhance`. The phase-normal coordinate
-fix and its regression tests are committed as `f435c1f7`.
+The local branch is `codex/stage2-esm-repa-enhance`. Recent method-contract
+commits are:
+
+- `f435c1f7`: align phase-normal supervision coordinates;
+- `42123470`: use the smooth endpoint envelope and immutable cache contracts;
+- `fa35a554`: add the matched APNB screen submitter;
+- `63020fc6`: record audit-rejected targets during cache assembly.
 
 Do not overwrite historical checkpoints, logs, or failed export directories.
 Use unique tags and output paths for every retry.

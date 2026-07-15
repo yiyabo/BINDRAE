@@ -1,6 +1,6 @@
 # BINDRAE Conference Method Blueprint
 
-Date: 2026-07-10
+Date: 2026-07-16
 
 Status: canonical method document for the current conference-oriented research
 track. It separates implemented components, near-term experiments, and proposed
@@ -187,6 +187,11 @@ the along-bridge component is removed:
      {\langle v_i,v_i\rangle_g}v_i.
 \]
 
+The current pilot fixes all three characteristic scales to one. Final metric
+scales must be selected from training-fold geometry, frozen before held-out
+evaluation, and accompanied by a sensitivity analysis; metric weights are part
+of the method contract rather than free test-time tuning parameters.
+
 For the Cartesian backbone bridge, the rigid tangent is evaluated from a local
 central difference of neighboring rebuilt frames. It therefore follows the
 actual curved frame path rather than reusing the endpoint SE(3) logarithm.
@@ -204,13 +209,16 @@ X_i(t)=
 \left[b(t)\Delta_i^\perp(t)\right],
 \]
 
-where `b(0)=b(1)=0`, for example
+where the main contract uses
 
 \[
-b(t)=4t(1-t)
-\quad\text{or}\quad
 b(t)=\sin^2(\pi t).
 \]
+
+This envelope also satisfies `b'(0)=b'(1)=0`, so the residual contribution to
+endpoint velocity vanishes. The older `4t(1-t)` envelope remains a historical
+ablation, but it supplies position-level rather than first-order endpoint
+smoothness.
 
 Rigid residuals are applied through the `SE(3)` exponential map and chi
 residuals are wrapped on the torus. Apo and holo are inserted explicitly as the
@@ -365,7 +373,21 @@ temporal reversal along the reference bridge.
 
 ### Proposition 3: tangent-normal identifiability
 
-Under the chosen product metric,
+Let the asynchronous bridge manifold be
+
+\[
+\mathcal B=\prod_i\gamma_i([0,1]),
+\]
+
+and let `V` contain its residue-supported tangent basis. Under product metric
+`G`, the global normal projector is
+
+\[
+P_\perp=I-V(V^\top G V)^{-1}V^\top G.
+\]
+
+Because `G` and `V` are block diagonal over residues, this global projector is
+equivalent to the implemented per-residue projections. Therefore
 
 \[
 \langle\Delta_i^\perp,v_i\rangle_g=0.
@@ -438,6 +460,20 @@ spline or string for every endpoint pair.
 Arc-length or event-aligned progress should be used when MD trajectories have
 different physical durations. Absolute MD time is not a valid target unless the
 simulation protocol makes it identifiable.
+
+### Canonical phase-normal targets
+
+For each MD frame, the exporter computes a metric projection onto a dense
+residue bridge grid and solves a monotone dynamic program over path progress.
+The resulting `tau_target` is a canonical monotone projection coordinate, not
+an assertion of unique physical time. Projection fit and local uniqueness
+define confidence masks; low-confidence phase/residual points do not enter the
+supervised objective.
+
+For the residual-only ablation, targets are exported separately with
+`tau_i(t)=t`. Reusing residual targets defined at inferred phase would compare
+tangent vectors attached to different bridge base points and is scientifically
+invalid.
 
 ## Required Four-Model Identification Experiment
 
@@ -638,7 +674,7 @@ The method claim should be weakened or abandoned if any of the following hold:
 | Confidence-weighted free-flow phase pseudo-teacher | Tested; learnable but failed matched path evaluation |
 | Canonical full OracleMotion train cache | Re-export pending |
 | Controlled manifold benchmark | Not implemented |
-| Independent MD benchmark | Planned |
+| Independent MD benchmark | 23-system silver pilot; gold benchmark planned |
 | Global stochastic path latent | Proposed, not implemented |
 | Multi-path ensemble objective | Proposed, not implemented |
 | Stage-1 replacement for OracleMotion | Future paper track |
