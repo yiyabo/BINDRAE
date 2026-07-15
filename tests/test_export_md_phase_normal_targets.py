@@ -1,10 +1,13 @@
 import importlib.util
+import tempfile
 import unittest
+from pathlib import Path
 
 import numpy as np
 
 from scripts.export_md_phase_normal_targets import (
     _extract_endpoint_arrays,
+    _load_canonical_residue_axis,
     _scatter_residue_axis,
     _triple_sequence_alignment,
     contact_annotations,
@@ -17,6 +20,25 @@ from scripts.export_md_phase_normal_targets import (
 
 
 class MdPhaseNormalTargetTest(unittest.TestCase):
+    def test_canonical_axis_comes_from_stage2_apo_torsion_cache(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            sample_dir = data_dir / "samples" / "sample-a"
+            sample_dir.mkdir(parents=True)
+            np.savez_compressed(
+                sample_dir / "torsion_apo.npz",
+                residue_keys=np.array(["A|6|", "A|7|", "A|301|"]),
+                residue_names=np.array(["ALA", "GLY", "ARG"]),
+                residue_alignment_version=np.array(
+                    "canonical_residue_key_v2_esm_compatible"
+                ),
+            )
+            keys, names = _load_canonical_residue_axis(
+                data_dir, "sample-a__silver_r05"
+            )
+            self.assertEqual(keys, [("A", 6, ""), ("A", 7, ""), ("A", 301, "")])
+            self.assertEqual(names, ["ALA", "GLY", "ARG"])
+
     def test_sequence_alignment_handles_numbering_offsets_and_masks_mutations(self):
         if importlib.util.find_spec("Bio") is None:
             self.skipTest("BioPython is unavailable in the local test environment")

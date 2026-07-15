@@ -19,6 +19,12 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.data.residue_identity import (  # noqa: E402
+    RESIDUE_ALIGNMENT_VERSION,
+    load_residue_keys,
+    residue_identity_hash,
+)
+
 
 SCHEMA_VERSION = "md_phase_normal_v1"
 STANDARD_RESIDUES = {
@@ -67,6 +73,7 @@ CHI_ATOMS: Mapping[str, Sequence[Sequence[str]]] = {
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pull-dir", type=Path, required=True)
+    parser.add_argument("--data-dir", type=Path, default=Path("processed_data/triplets"))
     parser.add_argument("--candidate-manifest", type=Path, required=True)
     parser.add_argument("--transition-id", required=True)
     parser.add_argument("--preparation-report", type=Path, required=True)
@@ -469,6 +476,37 @@ def _triple_sequence_alignment(
     ]
 
 
+def _load_canonical_residue_axis(
+    data_dir: Path, sample_id: str
+) -> Tuple[List[Tuple[str, int, str]], List[str]]:
+    base_sample_id = str(sample_id).split("__silver_r", 1)[0]
+    torsion_path = data_dir / "samples" / base_sample_id / "torsion_apo.npz"
+    if not torsion_path.is_file():
+        raise FileNotFoundError(f"Missing canonical torsion cache: {torsion_path}")
+    with np.load(torsion_path, allow_pickle=False) as data:
+        keys = load_residue_keys(data)
+        if keys is None:
+            raise ValueError(f"{torsion_path} missing canonical residue_keys")
+        if "residue_alignment_version" not in data:
+            raise ValueError(f"{torsion_path} missing residue_alignment_version")
+        version = str(np.asarray(data["residue_alignment_version"]).item())
+        if version != RESIDUE_ALIGNMENT_VERSION:
+            raise ValueError(
+                f"{torsion_path} residue_alignment_version={version!r}, "
+                f"expected {RESIDUE_ALIGNMENT_VERSION!r}"
+            )
+        if "residue_names" not in data:
+            raise ValueError(f"{torsion_path} missing residue_names")
+        names = [canonical_resname(value) for value in data["residue_names"].tolist()]
+    if len(keys) != len(names):
+        raise ValueError(
+            f"{torsion_path} has {len(keys)} residue keys but {len(names)} names"
+        )
+    if any(name not in STANDARD_RESIDUES for name in names):
+        raise ValueError(f"{torsion_path} contains non-standard residue names")
+    return [tuple(key) for key in keys], names
+
+
 def _scatter_residue_axis(
     values: np.ndarray,
     target_indices: Sequence[int],
@@ -759,6 +797,8 @@ def _normal_decomposition(
 def export_targets(args: argparse.Namespace) -> Dict[str, Any]:
     import mdtraj as md
 
+    sample_id = args.sample_id
+
     required = [
         args.pull_dir / "rmsd_pull.dcd",
         args.pull_dir / "final_pulled.pdb",
@@ -786,6 +826,11 @@ def export_targets(args: argparse.Namespace) -> Dict[str, Any]:
         raise ValueError("Path and atomistic audits must both pass before target export")
     candidate = _load_candidate(args.candidate_manifest, args.transition_id)
     endpoints = candidate["endpoints"]
+    if sample_id is None:
+        sample_id = Path(endpoints["holo_structure_path"]).parent.name
+    canonical_keys, canonical_resnames = _load_canonical_residue_axis(
+        args.data_dir, sample_id
+    )
     apo_residues = parse_pdb_residues(Path(endpoints["apo_structure_path"]))
     holo_residues = parse_pdb_residues(Path(endpoints["holo_structure_path"]))
 
@@ -829,8 +874,22 @@ def export_targets(args: argparse.Namespace) -> Dict[str, Any]:
             [residue["resname"] for residue in holo_residues],
             topology_names,
         )
-        mapping_method = "single_chain_global_sequence_exact"
-        apo_indices = [apo_index for apo_index, _, _ in aligned_indices]
+        canonical_to_apo = _exact_sequence_alignment_pairs(
+            canonical_resnames,
+            [residue["resname"] for residue in apo_residues],
+        )
+        canonical_index_by_apo = {
+            apo_index: canonical_index
+            for canonical_index, apo_index in canonical_to_apo
+        }
+        aligned_indices = [
+            indices for indices in aligned_indices if indices[0] in canonical_index_by_apo
+        ]
+        mapping_method = "single_chain_canonical_global_sequence_exact"
+        canonical_indices = [
+            canonical_index_by_apo[apo_index]
+            for apo_index, _, _ in aligned_indices
+        ]
         selected_apo_residues = [
             apo_residues[apo_index] for apo_index, _, _ in aligned_indices
         ]
@@ -846,18 +905,18 @@ def export_targets(args: argparse.Namespace) -> Dict[str, Any]:
             for _, _, topology_index in aligned_indices
         ]
     else:
-        mapping_method = "multichain_residue_identity_exact"
+        mapping_method = "multichain_canonical_residue_identity_exact"
         apo_by_key = _residue_lookup(
             apo_residues, label="apo", ignore_chain=False
         )
         holo_by_key = _residue_lookup(
             holo_residues, label="holo", ignore_chain=False
         )
-        apo_index_by_key = {
-            tuple(residue["key"]): index
-            for index, residue in enumerate(apo_residues)
+        canonical_index_by_key = {
+            _residue_alignment_key(key, ignore_chain=False): index
+            for index, key in enumerate(canonical_keys)
         }
-        apo_indices = []
+        canonical_indices = []
         selected_apo_residues = []
         selected_holo_residues = []
         topology_residues = []
@@ -867,7 +926,8 @@ def export_targets(args: argparse.Namespace) -> Dict[str, Any]:
         ):
             apo_residue = apo_by_key.get(key)
             holo_residue = holo_by_key.get(key)
-            if apo_residue is None or holo_residue is None:
+            canonical_index = canonical_index_by_key.get(key)
+            if apo_residue is None or holo_residue is None or canonical_index is None:
                 continue
             if not (
                 apo_residue["resname"]
@@ -875,17 +935,17 @@ def export_targets(args: argparse.Namespace) -> Dict[str, Any]:
                 == topology_resname
             ):
                 continue
-            apo_indices.append(apo_index_by_key[key])
+            canonical_indices.append(canonical_index)
             selected_apo_residues.append(apo_residue)
             selected_holo_residues.append(holo_residue)
             topology_residues.append(residue)
             keys.append(key)
 
-    canonical_n_residues = len(apo_residues)
+    canonical_n_residues = len(canonical_keys)
     mapping_fraction = len(keys) / max(canonical_n_residues, 1)
     if mapping_fraction < args.min_mapping_fraction:
         raise ValueError(
-            f"Mapped only {len(keys)}/{canonical_n_residues} apo residues "
+            f"Mapped only {len(keys)}/{canonical_n_residues} canonical residues "
             f"({mapping_fraction:.3f}) using {mapping_method}"
         )
     apo = _extract_residue_arrays(selected_apo_residues)
@@ -1119,16 +1179,16 @@ def export_targets(args: argparse.Namespace) -> Dict[str, Any]:
     }
     passed = all(checks.values())
     cache_node_mask = np.zeros(canonical_n_residues, dtype=bool)
-    cache_node_mask[np.asarray(apo_indices, dtype=np.int64)] = True
+    cache_node_mask[np.asarray(canonical_indices, dtype=np.int64)] = True
     cache_tau_target = np.broadcast_to(
         progress[:, None], (len(progress), canonical_n_residues)
     ).copy()
-    cache_tau_target[:, apo_indices] = tau_target
+    cache_tau_target[:, canonical_indices] = tau_target
 
     def scatter_residue(values: np.ndarray, *, axis: int, fill_value=0):
         return _scatter_residue_axis(
             values,
-            apo_indices,
+            canonical_indices,
             canonical_n_residues,
             axis=axis,
             fill_value=fill_value,
@@ -1176,12 +1236,7 @@ def export_targets(args: argparse.Namespace) -> Dict[str, Any]:
     cache_monotonicity_violations = scatter_residue(
         raw_monotonicity_violations, axis=0
     )
-    canonical_keys = [tuple(residue["key"]) for residue in apo_residues]
-    canonical_resnames = np.asarray(
-        [residue["resname"] for residue in apo_residues]
-    )
-
-    sample_id = args.sample_id or Path(endpoints["holo_structure_path"]).parent.name
+    canonical_resnames_array = np.asarray(canonical_resnames)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     cache_path = args.output_dir / f"{_safe_sample_id(sample_id)}.npz"
     np.savez_compressed(
@@ -1200,6 +1255,8 @@ def export_targets(args: argparse.Namespace) -> Dict[str, Any]:
         mapped_residues=np.array(n_residues, dtype=np.int32),
         mapping_fraction=np.array(mapping_fraction, dtype=np.float32),
         mapping_method=np.array(mapping_method),
+        residue_alignment_version=np.array(RESIDUE_ALIGNMENT_VERSION),
+        residue_identity_hash=np.array(residue_identity_hash(canonical_keys)),
         t_values=progress.astype(np.float32),
         tau_target=cache_tau_target.astype(np.float32),
         phase_confidence=cache_phase_confidence.astype(np.float32),
@@ -1231,7 +1288,7 @@ def export_targets(args: argparse.Namespace) -> Dict[str, Any]:
         residue_number=np.asarray(
             [key[1] for key in canonical_keys], dtype=np.int32
         ),
-        residue_name=canonical_resnames,
+        residue_name=canonical_resnames_array,
     )
     audit = {
         "schema_version": SCHEMA_VERSION,
