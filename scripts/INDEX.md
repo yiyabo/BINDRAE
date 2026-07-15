@@ -16,6 +16,7 @@ to revive that lane.
 - `export_stage2_teacher_residual_cache.py` - historical/free-flow teacher-residual exporter retained for reproducibility; it is not the active phase-normal path target.
 - `export_md_phase_normal_targets.py` - convert an audited silver atomistic path into monotone phase and bridge-normal residual targets with explicit identifiability gates.
 - `assemble_md_phase_normal_cache.py` - assemble only passed MD target directories into an immutable multi-system training cache.
+- `merge_md_phase_normal_caches.py` - verify, deduplicate, and merge immutable MD phase-normal cache collections.
 - `audit_md_rmsd_pull.py` / `audit_md_atomistic_path.py` - path-progress and independent atomistic geometry gates for biased MD paths.
 - `build_md_context_matrix.py` / `run_md_context_pipeline.py` - immutable,
   resumable setup-to-NPT context preparation for selected MD pilot systems.
