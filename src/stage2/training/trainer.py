@@ -607,9 +607,11 @@ class Stage2Trainer:
         if (
             config.phase_teacher_residual_heads_only
             and config.w_phase_teacher <= 0.0
+            and config.w_phase_normal_residual <= 0.0
         ):
             raise ValueError(
-                "phase_teacher_residual_heads_only requires w_phase_teacher > 0"
+                "phase_teacher_residual_heads_only requires phase or "
+                "phase-normal supervision"
             )
         if config.phase_teacher_head_only and config.phase_teacher_residual_heads_only:
             raise ValueError(
@@ -1012,6 +1014,7 @@ class Stage2Trainer:
         self.scaler = GradScaler() if self.autocast_dtype == torch.float16 else None
 
         self.current_epoch = 0
+        self._validation_mode = False
         self.global_step = 0
         self.optimizer_step_count = 0
         self.best_val_metric = float('inf')
@@ -2192,11 +2195,17 @@ class Stage2Trainer:
         logits_list: List[torch.Tensor] = []
         for k in range(n_steps):
             t_mid = (k + 0.5) / n_steps
-            mid_rigids, mid_chi = self._interpolate_endpoints(
+            mid_tau = torch.full(
+                (bsz, n_res),
+                t_mid,
+                dtype=torch.float32,
+                device=self.device,
+            )
+            mid_rigids, mid_chi = self._phase_interpolate_endpoints_tensor(
                 batch,
                 rigids_apo,
                 rigids_holo,
-                t_mid,
+                mid_tau,
             )
             out = self._model_forward(
                 chi=mid_chi,
@@ -2269,6 +2278,115 @@ class Stage2Trainer:
         }
         return tau_values
 
+    def _phase_residual_projection_at_tau(
+        self,
+        batch,
+        rigids_apo: Rigid,
+        rigids_holo: Rigid,
+        tau: torch.Tensor,
+        t_value: float,
+        stage1_chi=None,
+        stage1_rigids=None,
+        stage1_chi_mask=None,
+        interaction_prior=None,
+        esm_gate_context=None,
+    ) -> Tuple[Rigid, torch.Tensor, Dict[str, torch.Tensor]]:
+        """Evaluate the normal residual head in the tangent space at ``tau``."""
+        bsz = batch.node_mask.shape[0]
+        node_mask = batch.node_mask.bool()
+        tau = torch.where(
+            node_mask,
+            tau,
+            torch.full_like(tau, float(t_value)),
+        )
+        bridge_rigids, bridge_chi = self._phase_interpolate_endpoints_tensor(
+            batch,
+            rigids_apo,
+            rigids_holo,
+            tau,
+        )
+        bridge_tangent_rigid = self._phase_bridge_tangent(
+            batch,
+            rigids_apo,
+            rigids_holo,
+            tau,
+        )
+        bridge_tangent_chi = wrap_to_pi(
+            batch.torsion_holo[..., 3:7] - batch.torsion_apo[..., 3:7]
+        )
+        out = self._model_forward(
+            chi=bridge_chi,
+            rigids=bridge_rigids,
+            esm=batch.esm,
+            lig_points=batch.lig_points,
+            lig_types=batch.lig_types,
+            lig_mask=batch.lig_mask,
+            w_res=batch.w_res,
+            t=torch.full((bsz,), float(t_value), device=self.device),
+            node_mask=batch.node_mask,
+            nma_features=batch.nma_features,
+            stage1_chi=stage1_chi,
+            stage1_rigids=stage1_rigids,
+            stage1_chi_mask=stage1_chi_mask,
+            interaction_prior=interaction_prior,
+            esm_gate_context=esm_gate_context,
+            current_step=self.global_step,
+        )
+        residual_rigid = torch.cat(
+            [out['residual_rigid_rot'], out['residual_rigid_trans']],
+            dim=-1,
+        )
+        projection = project_product_tangent_normal(
+            residual_rigid,
+            out['residual_chi'],
+            bridge_tangent_rigid,
+            bridge_tangent_chi,
+            node_mask=batch.node_mask,
+            chi_mask=batch.chi_mask,
+            rotation_scale=self.config.phase_residual_rotation_metric_scale,
+            translation_scale=self.config.phase_residual_translation_metric_scale,
+            chi_scale=self.config.phase_residual_chi_metric_scale,
+            min_tangent_norm=self.config.phase_residual_min_tangent_norm,
+            max_metric_norm=self.config.phase_residual_max_metric_norm,
+        )
+        return bridge_rigids, bridge_chi, projection
+
+    def _phase_normal_teacher_forced_records(
+        self,
+        batch,
+        rigids_apo: Rigid,
+        rigids_holo: Rigid,
+        target_tau: torch.Tensor,
+        t_values: List[float],
+        stage1_chi=None,
+        stage1_rigids=None,
+        stage1_chi_mask=None,
+        interaction_prior=None,
+        esm_gate_context=None,
+    ) -> List[Dict[str, torch.Tensor]]:
+        """Evaluate normal residual predictions at the MD target phase."""
+        if target_tau.shape[0] != len(t_values):
+            raise RuntimeError(
+                "Phase-normal target/time mismatch: "
+                f"tau={target_tau.shape[0]} times={len(t_values)}"
+            )
+        records: List[Dict[str, torch.Tensor]] = []
+        for index, t_value in enumerate(t_values):
+            _, _, projection = self._phase_residual_projection_at_tau(
+                batch,
+                rigids_apo,
+                rigids_holo,
+                target_tau[index],
+                t_value,
+                stage1_chi=stage1_chi,
+                stage1_rigids=stage1_rigids,
+                stage1_chi_mask=stage1_chi_mask,
+                interaction_prior=interaction_prior,
+                esm_gate_context=esm_gate_context,
+            )
+            records.append(projection)
+        return records
+
     def phase_orthogonal_residual_path(
         self,
         batch,
@@ -2283,7 +2401,6 @@ class Stage2Trainer:
         """Endpoint-exact phase bridge plus a normal-space spatial residual."""
         n_steps = int(self.config.n_integration_steps)
         bsz = batch.node_mask.shape[0]
-        node_mask = batch.node_mask.bool()
         tau_values = self._phase_residual_tau_values(
             batch,
             rigids_apo,
@@ -2296,10 +2413,6 @@ class Stage2Trainer:
         )
         self._last_phase_tau_values = tau_values
 
-        bridge_tangent_chi = wrap_to_pi(
-            batch.torsion_holo[..., 3:7] - batch.torsion_apo[..., 3:7]
-        )
-
         rigids_list: List[Rigid] = [rigids_apo]
         chi_list: List[torch.Tensor] = [batch.torsion_apo[..., 3:7]]
         t_list: List[float] = [0.0]
@@ -2307,54 +2420,19 @@ class Stage2Trainer:
 
         for k in range(1, n_steps):
             t_value = k / n_steps
-            tau = torch.where(
-                node_mask,
-                tau_values[k],
-                torch.full_like(tau_values[k], t_value),
-            )
-            bridge_rigids, bridge_chi = self._phase_interpolate_endpoints_tensor(
-                batch,
-                rigids_apo,
-                rigids_holo,
-                tau,
-            )
-            bridge_tangent_rigid = self._phase_bridge_tangent(
-                batch, rigids_apo, rigids_holo, tau
-            )
-            out = self._model_forward(
-                chi=bridge_chi,
-                rigids=bridge_rigids,
-                esm=batch.esm,
-                lig_points=batch.lig_points,
-                lig_types=batch.lig_types,
-                lig_mask=batch.lig_mask,
-                w_res=batch.w_res,
-                t=torch.full((bsz,), t_value, device=self.device),
-                node_mask=batch.node_mask,
-                nma_features=batch.nma_features,
-                stage1_chi=stage1_chi,
-                stage1_rigids=stage1_rigids,
-                stage1_chi_mask=stage1_chi_mask,
-                interaction_prior=interaction_prior,
-                esm_gate_context=esm_gate_context,
-                current_step=self.global_step,
-            )
-            residual_rigid = torch.cat(
-                [out['residual_rigid_rot'], out['residual_rigid_trans']],
-                dim=-1,
-            )
-            projection = project_product_tangent_normal(
-                residual_rigid,
-                out['residual_chi'],
-                bridge_tangent_rigid,
-                bridge_tangent_chi,
-                node_mask=batch.node_mask,
-                chi_mask=batch.chi_mask,
-                rotation_scale=self.config.phase_residual_rotation_metric_scale,
-                translation_scale=self.config.phase_residual_translation_metric_scale,
-                chi_scale=self.config.phase_residual_chi_metric_scale,
-                min_tangent_norm=self.config.phase_residual_min_tangent_norm,
-                max_metric_norm=self.config.phase_residual_max_metric_norm,
+            bridge_rigids, bridge_chi, projection = (
+                self._phase_residual_projection_at_tau(
+                    batch,
+                    rigids_apo,
+                    rigids_holo,
+                    tau_values[k],
+                    t_value,
+                    stage1_chi=stage1_chi,
+                    stage1_rigids=stage1_rigids,
+                    stage1_chi_mask=stage1_chi_mask,
+                    interaction_prior=interaction_prior,
+                    esm_gate_context=esm_gate_context,
+                )
             )
             projected_rigid = projection['projected_rigid']
             projected_chi = projection['projected_chi']
@@ -2630,6 +2708,8 @@ class Stage2Trainer:
         replicas = sorted(root.glob(f"{safe_id}__silver_r*.npz"))
         if not replicas:
             return direct
+        if bool(getattr(self, '_validation_mode', False)):
+            return replicas[0]
         epoch = int(getattr(self, 'current_epoch', 0))
         return replicas[epoch % len(replicas)]
 
@@ -2779,6 +2859,7 @@ class Stage2Trainer:
         bsz, max_n = batch.node_mask.shape
         target_rigid = torch.zeros((n_t, bsz, max_n, 6), dtype=torch.float32)
         target_chi = torch.zeros((n_t, bsz, max_n, 4), dtype=torch.float32)
+        target_tau = torch.zeros((n_t, bsz, max_n), dtype=torch.float32)
         target_mask = torch.zeros((n_t, bsz, max_n), dtype=torch.bool)
         target_weight = torch.zeros((n_t, bsz, max_n), dtype=torch.float32)
         target_chi_mask = torch.zeros((n_t, bsz, max_n, 4), dtype=torch.bool)
@@ -2848,6 +2929,7 @@ class Stage2Trainer:
                         )
 
                 source_t = np.asarray(data['t_values'], dtype=np.float32)
+                tau_target = np.asarray(data['tau_target'], dtype=np.float32)
                 residual_rot = np.asarray(data['residual_rot'], dtype=np.float32)
                 residual_trans = np.asarray(data['residual_trans'], dtype=np.float32)
                 residual_chi = np.asarray(data['residual_chi'], dtype=np.float32)
@@ -2857,6 +2939,8 @@ class Stage2Trainer:
                 )
                 expected_rigid_shape = (source_t.size, n_res, 3)
                 expected_mask_shape = (source_t.size, n_res)
+                if tau_target.shape != expected_mask_shape:
+                    raise ValueError(f"{path} has invalid tau_target shape")
                 if residual_rot.shape != expected_rigid_shape:
                     raise ValueError(f"{path} has invalid residual_rot shape")
                 if residual_trans.shape != expected_rigid_shape:
@@ -2882,6 +2966,9 @@ class Stage2Trainer:
                     )
                     target_chi[k, b, :n_res] = torch.from_numpy(
                         residual_chi[index].copy()
+                    )
+                    target_tau[k, b, :n_res] = torch.from_numpy(
+                        tau_target[index].copy()
                     )
                     valid = node & residual_valid[index]
                     target_mask[k, b, :n_res] = torch.from_numpy(valid)
@@ -2917,6 +3004,7 @@ class Stage2Trainer:
         return {
             'rigid': target_rigid.to(self.device),
             'chi': target_chi.to(self.device),
+            'tau': target_tau.to(self.device),
             'mask': target_mask,
             'weight': target_weight,
             'chi_mask': target_chi_mask,
@@ -3727,7 +3815,18 @@ class Stage2Trainer:
                     t_list[1:-1],
                 )
                 if phase_normal_targets is not None:
-                    records = self._last_phase_residual_records
+                    records = self._phase_normal_teacher_forced_records(
+                        batch,
+                        rigids_apo,
+                        rigids_holo,
+                        phase_normal_targets['tau'],
+                        t_list[1:-1],
+                        stage1_chi=stage1_chi,
+                        stage1_rigids=stage1_rigids,
+                        stage1_chi_mask=stage1_chi_mask,
+                        interaction_prior=combined_prior_features,
+                        esm_gate_context=esm_gate_context,
+                    )
                     if len(records) != len(t_list) - 2:
                         raise RuntimeError(
                             "Phase-normal residual record/time mismatch: "
@@ -4651,20 +4750,24 @@ class Stage2Trainer:
         }
         n_batches = 0
 
-        with torch.no_grad():
-            for batch in tqdm(self.val_loader, desc='Validation', ncols=120, leave=False):
-                batch = self._batch_to_device(batch)
-                if self.config.val_t is None:
-                    t = torch.rand(batch.esm.shape[0], device=self.device)
-                else:
-                    t = torch.full((batch.esm.shape[0],), float(self.config.val_t), device=self.device)
-                losses = self.compute_losses(batch, t, force_geom=True)
-                self._check_finite_losses(losses, "validation")
-                for k in val_losses:
-                    val_losses[k] += losses[k].item()
-                for key in distribution_values:
-                    distribution_values[key].append(float(losses[key].item()))
-                n_batches += 1
+        self._validation_mode = True
+        try:
+            with torch.no_grad():
+                for batch in tqdm(self.val_loader, desc='Validation', ncols=120, leave=False):
+                    batch = self._batch_to_device(batch)
+                    if self.config.val_t is None:
+                        t = torch.rand(batch.esm.shape[0], device=self.device)
+                    else:
+                        t = torch.full((batch.esm.shape[0],), float(self.config.val_t), device=self.device)
+                    losses = self.compute_losses(batch, t, force_geom=True)
+                    self._check_finite_losses(losses, "validation")
+                    for k in val_losses:
+                        val_losses[k] += losses[k].item()
+                    for key in distribution_values:
+                        distribution_values[key].append(float(losses[key].item()))
+                    n_batches += 1
+        finally:
+            self._validation_mode = False
 
         val_losses, n_batches = self._all_reduce_loss_sums(val_losses, n_batches)
         denom = max(n_batches, 1)

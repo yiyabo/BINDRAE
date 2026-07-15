@@ -1,4 +1,6 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
 import torch
@@ -41,6 +43,16 @@ class _ZeroPhaseResidualModel(_FakePhaseResidualModel):
         out["residual_rigid_rot"] = torch.zeros_like(out["residual_rigid_rot"])
         out["residual_rigid_trans"] = torch.zeros_like(out["residual_rigid_trans"])
         return out
+
+
+class _RecordingPhaseResidualModel(_FakePhaseResidualModel):
+    def __init__(self):
+        super().__init__()
+        self.rigids_seen = []
+
+    def forward(self, *args, **kwargs):
+        self.rigids_seen.append(kwargs["rigids"])
+        return super().forward(*args, **kwargs)
 
 
 class _BackboneOnlyFK(nn.Module):
@@ -198,6 +210,99 @@ class PhaseResidualPathTest(unittest.TestCase):
         self.assertGreater(
             trainer._last_timewarp_stats["time_warp_tau_abs_mean"].item(),
             0.0,
+        )
+
+    def test_learned_phase_head_uses_configured_cartesian_bridge(self):
+        trainer = self._trainer("learned")
+        trainer.config.phase_residual_bridge_mode = "cartesian_backbone"
+        trainer.model = _RecordingPhaseResidualModel()
+        batch = self._batch()
+        rigids_apo = trainer._build_rigids_from_backbone(
+            batch.N_apo, batch.Ca_apo, batch.C_apo, batch.node_mask
+        )
+        rigids_holo = trainer._build_rigids_from_backbone(
+            batch.N_holo, batch.Ca_holo, batch.C_holo, batch.node_mask
+        )
+
+        trainer._phase_residual_tau_values(batch, rigids_apo, rigids_holo)
+
+        first_midpoint = torch.full((1, 3), 0.125)
+        expected_rigids, _ = trainer._phase_interpolate_endpoints_tensor(
+            batch, rigids_apo, rigids_holo, first_midpoint
+        )
+        actual_rigids = trainer.model.rigids_seen[0]
+        self.assertTrue(
+            torch.allclose(
+                actual_rigids.get_trans(), expected_rigids.get_trans(), atol=1e-7
+            )
+        )
+        self.assertTrue(
+            torch.allclose(
+                actual_rigids.get_rots().get_rot_mats(),
+                expected_rigids.get_rots().get_rot_mats(),
+                atol=1e-7,
+            )
+        )
+
+    def test_validation_replica_selection_is_stable(self):
+        trainer = self._trainer("identity")
+        trainer.current_epoch = 1
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            first = root / "sample__silver_r000.npz"
+            second = root / "sample__silver_r001.npz"
+            first.touch()
+            second.touch()
+
+            trainer._validation_mode = False
+            self.assertEqual(
+                trainer._replicated_supervision_cache_path(tmp_dir, "sample"),
+                second,
+            )
+            trainer._validation_mode = True
+            self.assertEqual(
+                trainer._replicated_supervision_cache_path(tmp_dir, "sample"),
+                first,
+            )
+
+    def test_normal_supervision_uses_target_phase_bridge(self):
+        trainer = self._trainer("learned")
+        trainer.config.phase_residual_bridge_mode = "cartesian_backbone"
+        trainer.model = _RecordingPhaseResidualModel()
+        batch = self._batch()
+        rigids_apo = trainer._build_rigids_from_backbone(
+            batch.N_apo, batch.Ca_apo, batch.C_apo, batch.node_mask
+        )
+        rigids_holo = trainer._build_rigids_from_backbone(
+            batch.N_holo, batch.Ca_holo, batch.C_holo, batch.node_mask
+        )
+        target_tau = torch.full((2, 1, 3), 0.75)
+
+        records = trainer._phase_normal_teacher_forced_records(
+            batch,
+            rigids_apo,
+            rigids_holo,
+            target_tau,
+            [0.25, 0.5],
+        )
+
+        expected_rigids, _ = trainer._phase_interpolate_endpoints_tensor(
+            batch, rigids_apo, rigids_holo, target_tau[0]
+        )
+        self.assertEqual(len(records), 2)
+        self.assertTrue(
+            torch.allclose(
+                trainer.model.rigids_seen[0].get_trans(),
+                expected_rigids.get_trans(),
+                atol=1e-7,
+            )
+        )
+        self.assertTrue(
+            torch.allclose(
+                trainer.model.rigids_seen[0].get_rots().get_rot_mats(),
+                expected_rigids.get_rots().get_rot_mats(),
+                atol=1e-7,
+            )
         )
 
     def test_zero_residual_reduces_exactly_to_phase_bridge(self):
