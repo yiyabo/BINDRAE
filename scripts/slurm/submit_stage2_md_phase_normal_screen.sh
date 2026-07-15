@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# Submit the matched deterministic phase-normal identification screen.
+#
+# Phase-only, residual-only, and full APNB use matched data, compute, trunk,
+# and optimization settings. The synchronous bridge is analytic and is
+# evaluated separately with no training job.
+
+set -euo pipefail
+
+ROOT="${ROOT:-/mnt/inaisfs/data/home/zhaozc_criait/XinxiangWang/BINDRAE}"
+INFERRED_CACHE="${INFERRED_CACHE:?INFERRED_CACHE is required}"
+IDENTITY_CACHE="${IDENTITY_CACHE:?IDENTITY_CACHE is required}"
+INFERRED_DEPENDENCY="${INFERRED_DEPENDENCY:-}"
+IDENTITY_DEPENDENCY="${IDENTITY_DEPENDENCY:-}"
+ORACLE_CACHE="${ORACLE_CACHE:-logs/stage2_oracle_motion/oracle_motion_mdphase_silver23_canonical_v2e_20260715_v1}"
+SUBSET_TAG="${SUBSET_TAG:-mdphase_silver82_groupsplit17v6}"
+SUBSET_SEED="${SUBSET_SEED:-20260715}"
+TRAIN_N="${TRAIN_N:-17}"
+VAL_N="${VAL_N:-6}"
+MAX_EPOCHS="${MAX_EPOCHS:-40}"
+EARLY_STOP_PATIENCE="${EARLY_STOP_PATIENCE:-12}"
+GPUS="${GPUS:-2}"
+BATCH_SIZE="${BATCH_SIZE:-2}"
+RUN_VERSION="${RUN_VERSION:-v1}"
+DATE_TAG="${DATE_TAG:-$(date +%Y%m%d)}"
+
+export PATH="/data/soft/slurm/24.11.4/bin:${PATH}"
+cd "$ROOT"
+
+if [[ ! -d "$ORACLE_CACHE" ]]; then
+  echo "ERROR: required Oracle cache directory is missing: $ORACLE_CACHE" >&2
+  exit 2
+fi
+if [[ ! -d "$INFERRED_CACHE" && -z "$INFERRED_DEPENDENCY" ]]; then
+  echo "ERROR: inferred cache is missing and no dependency was supplied: $INFERRED_CACHE" >&2
+  exit 2
+fi
+if [[ ! -d "$IDENTITY_CACHE" && -z "$IDENTITY_DEPENDENCY" ]]; then
+  echo "ERROR: identity cache is missing and no dependency was supplied: $IDENTITY_CACHE" >&2
+  exit 2
+fi
+
+unset PHASE_TEACHER_CACHE_DIR PHASE_NORMAL_CACHE_DIR W_PHASE_TEACHER
+unset W_PHASE_NORMAL_RESIDUAL PHASE_RESIDUAL_TAU_MODE PHASE_RESIDUAL_SCALE TAG
+
+COMMON_EXPORT="NPROC_PER_NODE=${GPUS},STAGE1V2_MODE=oracle_motion,STAGE1V2_TRAIN_CACHE_DIR=${ORACLE_CACHE},STAGE1V2_VAL_CACHE_DIR=${ORACLE_CACHE},ESM_FUSION_ENABLED=1,ESM_NUM_LAYERS=7,ESM_FUSION_MODE=gated_residual,ESM_GATE_BIAS=-2.0,ESM_GATE_CONTEXT_MODE=pocket_motion,PATH_PARAMETERIZATION=phase_orthogonal_residual_v1,PHASE_RESIDUAL_BRIDGE_MODE=cartesian_backbone,PHASE_RESIDUAL_ENVELOPE=sin2,PHASE_RESIDUAL_ROTATION_METRIC_SCALE=1.0,PHASE_RESIDUAL_TRANSLATION_METRIC_SCALE=1.0,PHASE_RESIDUAL_CHI_METRIC_SCALE=1.0,PHASE_RESIDUAL_MIN_TANGENT_NORM=0.5,TRAIN_N=${TRAIN_N},VAL_N=${VAL_N},SUBSET_SEED=${SUBSET_SEED},SUBSET_TAG=${SUBSET_TAG},USE_EXISTING_SUBSETS=1,TRUST_PRECHECKED_SAMPLES=1,MAX_EPOCHS=${MAX_EPOCHS},EARLY_STOP_PATIENCE=${EARLY_STOP_PATIENCE},BATCH_SIZE=${BATCH_SIZE},VAL_BATCH_SIZE=1,NUM_WORKERS=2,PREFETCH_FACTOR=2,N_INTEGRATION_STEPS=3,N_GEOM_STEPS=4,GEOM_EVERY=1,W_FM_CHI=0.1,W_FM_RIGID=0.1,W_BG=0.1,W_SMOOTH=0.05,W_CLASH=0.1,W_PEP=0.1,W_CONTACT=0.1,W_END=0.0,PHASE_TEACHER_MASK_MODE=active,W_PHASE_RESIDUAL_MAGNITUDE=0.01,W_PHASE_RESIDUAL_TEMPORAL_SMOOTH=0.01,W_PHASE_RESIDUAL_NEIGHBOR_SMOOTH=0.01,REPA_ENABLED=0,WARMUP_STEPS=0,CHECKPOINT_EVERY_N_EPOCHS=5,AUTO_RESUME=0,PROGRESS_LOG_EVERY=1,GPU_MONITOR_INTERVAL=30"
+
+submit_variant() {
+  local variant="$1"
+  local dependency="$2"
+  local variant_export="$3"
+  local tag="stage2_pn_sin2_${variant}_silver82_g17v6_e${MAX_EPOCHS}_bs${BATCH_SIZE}x${GPUS}_${DATE_TAG}_${RUN_VERSION}"
+  local args=(
+    --parsable
+    --job-name="pn_${variant}"
+    --gres="gpu:A100:${GPUS}"
+    --cpus-per-task=16
+    --mem=200G
+    --time=08:00:00
+  )
+  if [[ -n "$dependency" ]]; then
+    args+=(--dependency="afterok:${dependency}")
+  fi
+  args+=(
+    --export="ALL,${COMMON_EXPORT},${variant_export},TAG=${tag}"
+    scripts/slurm/train_stage2_oracle_motion_ablation_4gpu.sh
+  )
+  local job_id
+  job_id=$(sbatch "${args[@]}")
+  printf '%s\t%s\t%s\n' "$variant" "$job_id" "$tag"
+}
+
+submit_variant \
+  "phase" \
+  "$INFERRED_DEPENDENCY" \
+  "PHASE_RESIDUAL_TAU_MODE=learned,PHASE_RESIDUAL_SCALE=0.0,PHASE_TEACHER_CACHE_DIR=${INFERRED_CACHE},W_PHASE_TEACHER=0.1,PHASE_NORMAL_CACHE_DIR=${INFERRED_CACHE},W_PHASE_NORMAL_RESIDUAL=0.0"
+
+submit_variant \
+  "residual" \
+  "$IDENTITY_DEPENDENCY" \
+  "PHASE_RESIDUAL_TAU_MODE=identity,PHASE_RESIDUAL_SCALE=1.0,W_PHASE_TEACHER=0.0,PHASE_NORMAL_CACHE_DIR=${IDENTITY_CACHE},W_PHASE_NORMAL_RESIDUAL=0.1"
+
+submit_variant \
+  "full" \
+  "$INFERRED_DEPENDENCY" \
+  "PHASE_RESIDUAL_TAU_MODE=learned,PHASE_RESIDUAL_SCALE=1.0,PHASE_TEACHER_CACHE_DIR=${INFERRED_CACHE},W_PHASE_TEACHER=0.1,PHASE_NORMAL_CACHE_DIR=${INFERRED_CACHE},W_PHASE_NORMAL_RESIDUAL=0.1"
