@@ -1,9 +1,12 @@
+import importlib.util
 import unittest
 
 import numpy as np
 
 from scripts.export_md_phase_normal_targets import (
     _extract_endpoint_arrays,
+    _scatter_residue_axis,
+    _triple_sequence_alignment,
     contact_annotations,
     infer_monotone_phase,
     monotone_path_indices,
@@ -14,6 +17,26 @@ from scripts.export_md_phase_normal_targets import (
 
 
 class MdPhaseNormalTargetTest(unittest.TestCase):
+    def test_sequence_alignment_handles_numbering_offsets_and_masks_mutations(self):
+        if importlib.util.find_spec("Bio") is None:
+            self.skipTest("BioPython is unavailable in the local test environment")
+        aligned = _triple_sequence_alignment(
+            ["ALA", "PHE", "GLY", "SER"],
+            ["ALA", "LEU", "GLY", "SER"],
+            ["ALA", "LEU", "GLY", "SER"],
+        )
+        self.assertEqual(aligned, [(0, 0, 0), (2, 2, 2), (3, 3, 3)])
+
+    def test_residue_scatter_preserves_canonical_axis(self):
+        compact = np.array([[1.0, 2.0], [3.0, 4.0]])
+        scattered = _scatter_residue_axis(
+            compact, [0, 2], 4, axis=1, fill_value=-1.0
+        )
+        np.testing.assert_array_equal(
+            scattered,
+            np.array([[1.0, -1.0, 2.0, -1.0], [3.0, -1.0, 4.0, -1.0]]),
+        )
+
     def test_single_chain_endpoint_alias_uses_residue_number(self):
         atoms = {
             "N": np.array([0.0, 0.0, 0.0]),

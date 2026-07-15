@@ -25,6 +25,12 @@ STANDARD_RESIDUES = {
     "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
     "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL",
 }
+RESIDUE_ONE_LETTER = {
+    "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C",
+    "GLN": "Q", "GLU": "E", "GLY": "G", "HIS": "H", "ILE": "I",
+    "LEU": "L", "LYS": "K", "MET": "M", "PHE": "F", "PRO": "P",
+    "SER": "S", "THR": "T", "TRP": "W", "TYR": "Y", "VAL": "V",
+}
 RESIDUE_ALIASES = {
     "ASH": "ASP", "CYM": "CYS", "CYX": "CYS", "GLH": "GLU",
     "HID": "HIS", "HIE": "HIS", "HIP": "HIS", "LYN": "LYS",
@@ -418,6 +424,74 @@ def _residue_lookup(
     return lookup
 
 
+def _exact_sequence_alignment_pairs(
+    reference_names: Sequence[str], query_names: Sequence[str]
+) -> List[Tuple[int, int]]:
+    """Return order-preserving, exact residue matches from a global alignment."""
+    from Bio.Align import PairwiseAligner
+
+    reference = "".join(RESIDUE_ONE_LETTER[name] for name in reference_names)
+    query = "".join(RESIDUE_ONE_LETTER[name] for name in query_names)
+    aligner = PairwiseAligner(mode="global")
+    aligner.match_score = 2.0
+    aligner.mismatch_score = -1.0
+    aligner.open_gap_score = -5.0
+    aligner.extend_gap_score = -0.5
+    alignment = aligner.align(reference, query)[0]
+
+    pairs: List[Tuple[int, int]] = []
+    for (ref_start, ref_end), (query_start, query_end) in zip(
+        alignment.aligned[0], alignment.aligned[1]
+    ):
+        for ref_index, query_index in zip(
+            range(int(ref_start), int(ref_end)),
+            range(int(query_start), int(query_end)),
+        ):
+            if reference_names[ref_index] == query_names[query_index]:
+                pairs.append((ref_index, query_index))
+    return pairs
+
+
+def _triple_sequence_alignment(
+    apo_names: Sequence[str],
+    holo_names: Sequence[str],
+    topology_names: Sequence[str],
+) -> List[Tuple[int, int, int]]:
+    """Align apo and prepared topology through the holo residue axis."""
+    apo_to_holo = _exact_sequence_alignment_pairs(apo_names, holo_names)
+    holo_to_topology = dict(
+        _exact_sequence_alignment_pairs(holo_names, topology_names)
+    )
+    return [
+        (apo_index, holo_index, holo_to_topology[holo_index])
+        for apo_index, holo_index in apo_to_holo
+        if holo_index in holo_to_topology
+    ]
+
+
+def _scatter_residue_axis(
+    values: np.ndarray,
+    target_indices: Sequence[int],
+    target_size: int,
+    *,
+    axis: int,
+    fill_value: float | bool | int = 0,
+) -> np.ndarray:
+    """Scatter a compact matched-residue tensor onto a canonical residue axis."""
+    values = np.asarray(values)
+    moved = np.moveaxis(values, axis, 0)
+    if moved.shape[0] != len(target_indices):
+        raise ValueError(
+            f"Residue scatter mismatch: {moved.shape[0]} values for "
+            f"{len(target_indices)} indices"
+        )
+    output = np.full(
+        (target_size, *moved.shape[1:]), fill_value, dtype=values.dtype
+    )
+    output[np.asarray(target_indices, dtype=np.int64)] = moved
+    return np.moveaxis(output, 0, axis)
+
+
 def _safe_sample_id(sample_id: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(sample_id))
 
@@ -475,12 +549,21 @@ def _extract_endpoint_arrays(
     by_key = _residue_lookup(
         residues, label="endpoint", ignore_chain=ignore_chain
     )
+    selected = []
+    for key in keys:
+        aligned_key = _residue_alignment_key(key, ignore_chain=ignore_chain)
+        selected.append(by_key[aligned_key])
+    return _extract_residue_arrays(selected)
+
+
+def _extract_residue_arrays(
+    residues: Sequence[Mapping[str, Any]],
+) -> Dict[str, np.ndarray]:
     n_coord, ca_coord, c_coord = [], [], []
     chi, chi_mask = [], []
     names = []
-    for key in keys:
-        aligned_key = _residue_alignment_key(key, ignore_chain=ignore_chain)
-        residue = by_key[aligned_key]
+    for residue in residues:
+        key = tuple(residue["key"])
         atoms = residue["atoms"]
         if not all(name in atoms for name in ("N", "CA", "C")):
             raise ValueError(f"Endpoint residue {key} lacks N/CA/C")
@@ -737,38 +820,76 @@ def export_targets(args: argparse.Namespace) -> Dict[str, Any]:
         and _single_chain_keys(holo_keys)
         and _single_chain_keys(topology_keys)
     )
-    apo_by_key = _residue_lookup(
-        apo_residues, label="apo", ignore_chain=ignore_chain
-    )
-    holo_by_key = _residue_lookup(
-        holo_residues, label="holo", ignore_chain=ignore_chain
-    )
+    topology_names = [
+        canonical_resname(residue.name) for residue in candidate_topology_residues
+    ]
+    if ignore_chain:
+        aligned_indices = _triple_sequence_alignment(
+            [residue["resname"] for residue in apo_residues],
+            [residue["resname"] for residue in holo_residues],
+            topology_names,
+        )
+        mapping_method = "single_chain_global_sequence_exact"
+        apo_indices = [apo_index for apo_index, _, _ in aligned_indices]
+        selected_apo_residues = [
+            apo_residues[apo_index] for apo_index, _, _ in aligned_indices
+        ]
+        selected_holo_residues = [
+            holo_residues[holo_index] for _, holo_index, _ in aligned_indices
+        ]
+        topology_residues = [
+            candidate_topology_residues[topology_index]
+            for _, _, topology_index in aligned_indices
+        ]
+        keys = [
+            topology_keys[topology_index]
+            for _, _, topology_index in aligned_indices
+        ]
+    else:
+        mapping_method = "multichain_residue_identity_exact"
+        apo_by_key = _residue_lookup(
+            apo_residues, label="apo", ignore_chain=False
+        )
+        holo_by_key = _residue_lookup(
+            holo_residues, label="holo", ignore_chain=False
+        )
+        apo_index_by_key = {
+            tuple(residue["key"]): index
+            for index, residue in enumerate(apo_residues)
+        }
+        apo_indices = []
+        selected_apo_residues = []
+        selected_holo_residues = []
+        topology_residues = []
+        keys = []
+        for residue, key, topology_resname in zip(
+            candidate_topology_residues, topology_keys, topology_names
+        ):
+            apo_residue = apo_by_key.get(key)
+            holo_residue = holo_by_key.get(key)
+            if apo_residue is None or holo_residue is None:
+                continue
+            if not (
+                apo_residue["resname"]
+                == holo_residue["resname"]
+                == topology_resname
+            ):
+                continue
+            apo_indices.append(apo_index_by_key[key])
+            selected_apo_residues.append(apo_residue)
+            selected_holo_residues.append(holo_residue)
+            topology_residues.append(residue)
+            keys.append(key)
 
-    topology_residues = []
-    keys = []
-    for residue, key in zip(candidate_topology_residues, topology_keys):
-        aligned_key = _residue_alignment_key(key, ignore_chain=ignore_chain)
-        apo_residue = apo_by_key.get(aligned_key)
-        holo_residue = holo_by_key.get(aligned_key)
-        if apo_residue is None or holo_residue is None:
-            continue
-        topology_resname = canonical_resname(residue.name)
-        endpoint_resnames = {apo_residue["resname"], holo_residue["resname"]}
-        if endpoint_resnames != {topology_resname}:
-            raise ValueError(
-                "Residue-name mismatch for aligned identity "
-                f"{key}: apo={apo_residue['resname']} "
-                f"holo={holo_residue['resname']} topology={topology_resname}"
-            )
-        topology_residues.append(residue)
-        keys.append(key)
-    mapping_fraction = len(keys) / max(len(holo_residues), 1)
+    canonical_n_residues = len(apo_residues)
+    mapping_fraction = len(keys) / max(canonical_n_residues, 1)
     if mapping_fraction < args.min_mapping_fraction:
         raise ValueError(
-            f"Mapped only {len(keys)}/{len(holo_residues)} residues ({mapping_fraction:.3f})"
+            f"Mapped only {len(keys)}/{canonical_n_residues} apo residues "
+            f"({mapping_fraction:.3f}) using {mapping_method}"
         )
-    apo = _extract_endpoint_arrays(apo_residues, keys, ignore_chain=ignore_chain)
-    holo = _extract_endpoint_arrays(holo_residues, keys, ignore_chain=ignore_chain)
+    apo = _extract_residue_arrays(selected_apo_residues)
+    holo = _extract_residue_arrays(selected_holo_residues)
     n_residues = len(keys)
 
     atom_maps = [{atom.name: atom.index for atom in residue.atoms} for residue in topology_residues]
@@ -997,6 +1118,69 @@ def export_targets(args: argparse.Namespace) -> Dict[str, Any]:
         "chi_reconstruction": mean_chi_error <= args.max_mean_reconstruction_chi_rad,
     }
     passed = all(checks.values())
+    cache_node_mask = np.zeros(canonical_n_residues, dtype=bool)
+    cache_node_mask[np.asarray(apo_indices, dtype=np.int64)] = True
+    cache_tau_target = np.broadcast_to(
+        progress[:, None], (len(progress), canonical_n_residues)
+    ).copy()
+    cache_tau_target[:, apo_indices] = tau_target
+
+    def scatter_residue(values: np.ndarray, *, axis: int, fill_value=0):
+        return _scatter_residue_axis(
+            values,
+            apo_indices,
+            canonical_n_residues,
+            axis=axis,
+            fill_value=fill_value,
+        )
+
+    cache_phase_confidence = scatter_residue(phase_confidence, axis=1)
+    cache_projection_cost = scatter_residue(projection_cost, axis=1)
+    cache_identity_cost = scatter_residue(identity_cost, axis=1)
+    cache_chi_mask = scatter_residue(chi_mask, axis=0)
+    cache_pocket_mask = scatter_residue(contacts["pocket_mask"], axis=0)
+    cache_active_mask = scatter_residue(active_mask, axis=0)
+    cache_approach_mask = scatter_residue(contacts["approach_mask"], axis=0)
+    cache_formed_contact_mask = scatter_residue(
+        contacts["formed_contact_mask"], axis=0
+    )
+    cache_release_mask = scatter_residue(contacts["release_mask"], axis=0)
+    cache_transient_contact_mask = scatter_residue(
+        contacts["transient_contact_mask"], axis=0
+    )
+    cache_contact_event_progress = scatter_residue(
+        contacts["contact_event_progress"], axis=0
+    )
+    cache_contact_distances = scatter_residue(
+        distances, axis=1, fill_value=np.inf
+    )
+    cache_endpoint_motion_norm = scatter_residue(endpoint_motion_norm, axis=0)
+    cache_residual_rot = scatter_residue(decomposition["residual_rot"], axis=1)
+    cache_residual_trans = scatter_residue(
+        decomposition["residual_trans"], axis=1
+    )
+    cache_residual_chi = scatter_residue(decomposition["residual_chi"], axis=1)
+    cache_residual_valid = scatter_residue(residual_valid, axis=1)
+    cache_residual_confidence = scatter_residue(
+        decomposition["residual_confidence"], axis=1
+    )
+    cache_normal_residual_norm = scatter_residue(
+        decomposition["normal_residual_metric_norm"], axis=1
+    )
+    cache_raw_parallel_cos = scatter_residue(
+        decomposition["raw_parallel_cos_abs"], axis=1
+    )
+    cache_projected_parallel_cos = scatter_residue(
+        decomposition["projected_parallel_cos_abs"], axis=1
+    )
+    cache_monotonicity_violations = scatter_residue(
+        raw_monotonicity_violations, axis=0
+    )
+    canonical_keys = [tuple(residue["key"]) for residue in apo_residues]
+    canonical_resnames = np.asarray(
+        [residue["resname"] for residue in apo_residues]
+    )
+
     sample_id = args.sample_id or Path(endpoints["holo_structure_path"]).parent.name
     args.output_dir.mkdir(parents=True, exist_ok=True)
     cache_path = args.output_dir / f"{_safe_sample_id(sample_id)}.npz"
@@ -1012,37 +1196,42 @@ def export_targets(args: argparse.Namespace) -> Dict[str, Any]:
         rotation_metric_scale=np.array(args.rotation_scale_rad, dtype=np.float32),
         translation_metric_scale=np.array(args.translation_scale_a, dtype=np.float32),
         chi_metric_scale=np.array(args.chi_scale_rad, dtype=np.float32),
-        n_residues=np.array(n_residues, dtype=np.int32),
+        n_residues=np.array(canonical_n_residues, dtype=np.int32),
+        mapped_residues=np.array(n_residues, dtype=np.int32),
+        mapping_fraction=np.array(mapping_fraction, dtype=np.float32),
+        mapping_method=np.array(mapping_method),
         t_values=progress.astype(np.float32),
-        tau_target=tau_target.astype(np.float32),
-        phase_confidence=phase_confidence.astype(np.float32),
-        projection_cost=projection_cost.astype(np.float32),
-        identity_cost=identity_cost.astype(np.float32),
-        node_mask=np.ones(n_residues, dtype=bool),
-        chi_mask=chi_mask,
-        w_res=contacts["pocket_mask"].astype(np.float32),
-        pocket_mask=contacts["pocket_mask"],
-        active_mask=active_mask,
-        motion_active=active_mask,
-        approach_mask=contacts["approach_mask"],
-        formed_contact_mask=contacts["formed_contact_mask"],
-        release_mask=contacts["release_mask"],
-        transient_contact_mask=contacts["transient_contact_mask"],
-        contact_event_progress=contacts["contact_event_progress"].astype(np.float32),
-        contact_distance_angstrom=distances.astype(np.float32),
-        endpoint_motion_metric_norm=endpoint_motion_norm.astype(np.float32),
-        residual_rot=decomposition["residual_rot"].astype(np.float32),
-        residual_trans=decomposition["residual_trans"].astype(np.float32),
-        residual_chi=decomposition["residual_chi"].astype(np.float32),
-        residual_valid_mask=residual_valid,
-        residual_confidence=decomposition["residual_confidence"].astype(np.float32),
-        normal_residual_metric_norm=decomposition["normal_residual_metric_norm"].astype(np.float32),
-        raw_parallel_cos_abs=decomposition["raw_parallel_cos_abs"].astype(np.float32),
-        projected_parallel_cos_abs=decomposition["projected_parallel_cos_abs"].astype(np.float32),
-        raw_monotonicity_violations=raw_monotonicity_violations,
-        residue_chain=np.asarray([key[0] for key in keys]),
-        residue_number=np.asarray([key[1] for key in keys], dtype=np.int32),
-        residue_name=apo["resnames"],
+        tau_target=cache_tau_target.astype(np.float32),
+        phase_confidence=cache_phase_confidence.astype(np.float32),
+        projection_cost=cache_projection_cost.astype(np.float32),
+        identity_cost=cache_identity_cost.astype(np.float32),
+        node_mask=cache_node_mask,
+        chi_mask=cache_chi_mask,
+        w_res=cache_pocket_mask.astype(np.float32),
+        pocket_mask=cache_pocket_mask,
+        active_mask=cache_active_mask,
+        motion_active=cache_active_mask,
+        approach_mask=cache_approach_mask,
+        formed_contact_mask=cache_formed_contact_mask,
+        release_mask=cache_release_mask,
+        transient_contact_mask=cache_transient_contact_mask,
+        contact_event_progress=cache_contact_event_progress.astype(np.float32),
+        contact_distance_angstrom=cache_contact_distances.astype(np.float32),
+        endpoint_motion_metric_norm=cache_endpoint_motion_norm.astype(np.float32),
+        residual_rot=cache_residual_rot.astype(np.float32),
+        residual_trans=cache_residual_trans.astype(np.float32),
+        residual_chi=cache_residual_chi.astype(np.float32),
+        residual_valid_mask=cache_residual_valid,
+        residual_confidence=cache_residual_confidence.astype(np.float32),
+        normal_residual_metric_norm=cache_normal_residual_norm.astype(np.float32),
+        raw_parallel_cos_abs=cache_raw_parallel_cos.astype(np.float32),
+        projected_parallel_cos_abs=cache_projected_parallel_cos.astype(np.float32),
+        raw_monotonicity_violations=cache_monotonicity_violations,
+        residue_chain=np.asarray([key[0] for key in canonical_keys]),
+        residue_number=np.asarray(
+            [key[1] for key in canonical_keys], dtype=np.int32
+        ),
+        residue_name=canonical_resnames,
     )
     audit = {
         "schema_version": SCHEMA_VERSION,
@@ -1051,8 +1240,10 @@ def export_targets(args: argparse.Namespace) -> Dict[str, Any]:
         "checks": checks,
         "metrics": {
             "frames": len(progress),
-            "residues": n_residues,
+            "residues": canonical_n_residues,
+            "mapped_residues": n_residues,
             "mapping_fraction": mapping_fraction,
+            "mapping_method": mapping_method,
             "active_residues": int(active_mask.sum()),
             "confident_phase_points": int(confident_points.sum()),
             "valid_residual_points": int(residual_valid.sum()),
