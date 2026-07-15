@@ -277,26 +277,72 @@ Non-claims:
 
 ## Immediate Work Queue
 
-1. Keep the synchronous Cartesian bridge and controlled normal residual as the
-   endpoint-corpus baselines.
-2. Finish the three-system `md_phase_normal_v1` training smoke; this cache is
-   silver biased-path supervision and is not a held-out benchmark.
-3. Add independent replicas and a controlled manifold benchmark with known
-   path truth before interpreting learned phase as repeatable event order.
-4. Obtain safe scratch allocation for MD trajectories; the installed 4.7-GB
-   `BINDRAE-MD` environment passed A100 CUDA smoke job `141483`, but the shared
-   GPFS remains 99% full.
-5. Expand the current 3/4 fixed-protocol silver-path yield into the 8-16-system
-   MD pilot while preserving failed attempts.
-6. Reserve gold atomistic transitions for independent validation and final
-   scientific timing claims.
-7. Freeze the deterministic method before implementing stochastic multipath.
+### 2026-07-15 Matched MD Diagnostic
+
+The first 10-epoch matched screen was invalid as evidence of learning for two
+reasons:
+
+1. its synchronous baseline used the legacy SE(3) bridge while learned variants
+   used the Cartesian-backbone bridge;
+2. the training phase head was evaluated on the legacy bridge even when
+   `phase_residual_bridge_mode=cartesian_backbone`.
+
+Training now evaluates the phase head on the configured bridge. Validation also
+uses a fixed MD replica instead of rotating replicas by epoch, so checkpoint
+selection is comparable. Normal-residual supervision is evaluated at the MD
+target phase, matching the tangent-space coordinates in which the cached target
+was defined. These fixes are in commit `f435c1f7`.
+
+The corrected pilot uses a strict 17-system train / 6-system held-out split.
+The held-out side contains 21 independent silver MD replicas. All rows below
+use 20 path steps and the same Cartesian-backbone bridge:
+
+| Variant | Product RMSE ↓ | Translation MAE Å ↓ | Rotation MAE rad ↓ | Chi MAE rad ↓ | Phase tau MAE ↓ | Phase Spearman ↑ | Pair accuracy ↑ | Contact timing MAE ↓ |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Synchronous Cartesian | 1.475828 | 0.928127 | 0.333600 | 0.317907 | 0.210338 | n/a | 0.0000 | 0.398950 |
+| Phase-only, best epoch 17 | **1.286644** | **0.820931** | **0.307076** | 0.281851 | **0.189226** | **0.2660** | **0.6151** | **0.319078** |
+| Normal-only capacity diagnostic | 1.479336 | 0.940285 | 0.339049 | 0.313659 | 0.210338 | n/a | 0.0000 | 0.399315 |
+| Joint phase + normal, best epoch 21 | 1.301359 | 0.852455 | 0.310407 | **0.277420** | 0.197640 | 0.0184 | 0.5040 | 0.329653 |
+
+Relative to synchronous Cartesian, phase-only improves product RMSE by 12.82%,
+translation by 11.55%, rotation by 7.95%, chi by 11.34%, phase tau MAE by
+10.04%, and contact timing MAE by 20.02%. It wins 20/21 replicas on product
+RMSE and 21/21 on chi MAE. A six-system paired bootstrap remains positive for
+all four path-error components, but six systems are not enough for final paper
+statistics.
+
+Contact-event coverage (0.3325) and transient-contact recall (0.2367) are
+unchanged. This is expected for a time warp that changes event timing without
+creating a new spatial route. The normal-only branch does not generalize, and
+the joint branch does not yet beat phase-only overall. Therefore the current
+evidence supports learned asynchronous phase, not a successful off-bridge
+normal residual.
+
+The normal-only run above is a capacity diagnostic, not the final four-way
+ablation: its cached normal target is defined at `tau_target`, while a proper
+residual-only ablation fixes `tau=t` and requires an identity-phase residual
+target. That target must be exported explicitly before the final matched table.
+
+Updated queue:
+
+1. Treat phase-only as the current best validated deterministic model.
+2. Expand MD supervision from 17 training systems toward at least 100 systems,
+   preserving protein-family and ligand-scaffold separation.
+3. Export identity-phase normal targets for the scientifically correct
+   residual-only ablation.
+4. Re-test the joint model with more systems, controlled trunk unfreezing, and
+   residual magnitude/smoothness regularization; do not claim residual success
+   before it beats phase-only on held-out paths.
+5. Repeat the four-way matched screen and report system-level confidence
+   intervals, failure rates, and tail geometry metrics.
+6. Reserve gold atomistic transitions for final external validation and keep
+   the stochastic multipath extension after the deterministic decomposition is
+   identified.
 
 ## Repository Posture
 
-The local branch is `codex/stage2-esm-repa-enhance` and remains intentionally
-dirty while canonical-residue fixes, APNB implementation, tests, and launch
-scripts are reviewed as separate commit units.
+The local branch is `codex/stage2-esm-repa-enhance`. The phase-normal coordinate
+fix and its regression tests are committed as `f435c1f7`.
 
 Do not overwrite historical checkpoints, logs, or failed export directories.
 Use unique tags and output paths for every retry.
