@@ -15,6 +15,7 @@ set -euo pipefail
 ROOT="${ROOT:-/mnt/inaisfs/data/home/zhaozc_criait/XinxiangWang/BINDRAE}"
 SELECTION_DIR="${SELECTION_DIR:?Set SELECTION_DIR to the completed selection output}"
 EXCLUDE_SAMPLE_LIST="${EXCLUDE_SAMPLE_LIST:?Set EXCLUDE_SAMPLE_LIST to previously attempted sample IDs}"
+EXCLUDE_CANDIDATE_MANIFEST="${EXCLUDE_CANDIDATE_MANIFEST:-}"
 CONTEXT_DIR="${CONTEXT_DIR:?Set CONTEXT_DIR for the new context matrix and systems}"
 REPLICA_DIR="${REPLICA_DIR:?Set REPLICA_DIR for accepted-system replicas}"
 CONTEXT_MAX_CONCURRENT="${CONTEXT_MAX_CONCURRENT:-16}"
@@ -44,18 +45,28 @@ if [[ ! -s "$EXCLUDE_SAMPLE_LIST" ]]; then
   echo "Exclusion sample list is missing or empty: $EXCLUDE_SAMPLE_LIST" >&2
   exit 2
 fi
+if [[ -n "$EXCLUDE_CANDIDATE_MANIFEST" && ! -s "$EXCLUDE_CANDIDATE_MANIFEST" ]]; then
+  echo "Endpoint-pair exclusion manifest is missing or empty: $EXCLUDE_CANDIDATE_MANIFEST" >&2
+  exit 2
+fi
 if [[ -e "$SUBMISSION_RECORD" ]]; then
   echo "Submission record already exists; refusing duplicate scale-out:" >&2
   cat "$SUBMISSION_RECORD" >&2
   exit 3
 fi
 
-python scripts/build_md_context_matrix.py \
-  --candidate-manifest "$CANDIDATE_MANIFEST" \
-  --exclude-sample-list "$EXCLUDE_SAMPLE_LIST" \
-  --output-dir "$CONTEXT_DIR" \
-  --seed-base "$CONTEXT_SEED_BASE" \
+MATRIX_ARGS=(
+  --candidate-manifest "$CANDIDATE_MANIFEST"
+  --exclude-sample-list "$EXCLUDE_SAMPLE_LIST"
+  --output-dir "$CONTEXT_DIR"
+  --seed-base "$CONTEXT_SEED_BASE"
   --protocol-tag endpoint_context_fixed_v1
+)
+if [[ -n "$EXCLUDE_CANDIDATE_MANIFEST" ]]; then
+  MATRIX_ARGS+=(--exclude-candidate-manifest "$EXCLUDE_CANDIDATE_MANIFEST")
+fi
+
+python scripts/build_md_context_matrix.py "${MATRIX_ARGS[@]}"
 
 TASKS=$(wc -l < "$CONTEXT_MATRIX" | tr -d ' ')
 if [[ "$TASKS" -le 0 ]]; then

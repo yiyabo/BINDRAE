@@ -36,8 +36,9 @@ records, not templates.
 - `run_md_context_pipeline_array_cpu.sh` - resumable setup, NVT, NPT, and
   context registration array for selected pilot systems.
 - `launch_md_corpus_scaleout_after_selection_cpu.sh` - after candidate
-  selection, builds a de-duplicated context matrix and chains context,
-  collection, replica, and finalization jobs without changing scientific gates.
+  selection, builds a sample- and endpoint-pair-de-duplicated context matrix
+  and chains context, collection, replica, and finalization jobs without
+  changing scientific gates.
 - `run_md_replica_pipeline_array_cpu.sh` - independent-seed silver pull,
   audit, and phase-normal target-export array.
 - `continue_md_pilot_after_context_cpu.sh` - after-any continuation that

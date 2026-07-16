@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Set
+from typing import Any, Dict, List, Mapping, Set, Tuple
 
 
 SCHEMA_VERSION = "bindrae_md_context_matrix_v1"
@@ -20,6 +20,16 @@ def parse_args() -> argparse.Namespace:
         "--exclude-sample-list",
         type=Path,
         help="Optional newline-delimited sample IDs that must not be prepared again.",
+    )
+    parser.add_argument(
+        "--exclude-candidate-manifest",
+        type=Path,
+        action="append",
+        default=[],
+        help=(
+            "Optional prior candidate manifest whose apo/holo endpoint pairs "
+            "must not be prepared again. May be passed more than once."
+        ),
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--seed-base", type=int, default=60715000)
@@ -59,6 +69,17 @@ def sample_id(record: Mapping[str, Any]) -> str:
     return path.parent.name
 
 
+def endpoint_pair(record: Mapping[str, Any]) -> Tuple[str, str]:
+    endpoints = dict(record.get("endpoints") or {})
+    apo = str(endpoints.get("apo_pdb_id") or "").strip().upper()
+    holo = str(endpoints.get("holo_pdb_id") or "").strip().upper()
+    if not apo or not holo:
+        raise ValueError(
+            f"Record has no usable apo/holo PDB identifiers: {record.get('transition_id')}"
+        )
+    return apo, holo
+
+
 def write_immutable(path: Path, text: str) -> None:
     if path.exists():
         if path.read_text() != text:
@@ -86,11 +107,19 @@ def build_matrix(args: argparse.Namespace) -> Dict[str, Any]:
     candidates = load_jsonl(args.candidate_manifest)
     existing_context_manifest = getattr(args, "existing_context_manifest", None)
     exclude_sample_list = getattr(args, "exclude_sample_list", None)
+    exclude_candidate_manifests = list(
+        getattr(args, "exclude_candidate_manifest", None) or []
+    )
     contexts = load_jsonl(existing_context_manifest) if existing_context_manifest else []
     prepared: Set[str] = {sample_id(record) for record in contexts}
     excluded_requested = (
         load_sample_ids(exclude_sample_list) if exclude_sample_list else set()
     )
+    excluded_endpoint_pairs = {
+        endpoint_pair(record)
+        for manifest in exclude_candidate_manifests
+        for record in load_jsonl(manifest)
+    }
     candidate_ids = [sample_id(record) for record in candidates]
     if len(candidate_ids) != len(set(candidate_ids)):
         raise ValueError("Candidate manifest contains duplicate sample IDs")
@@ -100,6 +129,11 @@ def build_matrix(args: argparse.Namespace) -> Dict[str, Any]:
         raise ValueError(f"Existing contexts are absent from candidate manifest: {sorted(unknown)}")
     excluded = excluded_requested & candidate_id_set
     excluded_not_in_candidates = excluded_requested - candidate_id_set
+    excluded_by_endpoint = {
+        sample_id(record)
+        for record in candidates
+        if endpoint_pair(record) in excluded_endpoint_pairs
+    }
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     protocol = {
@@ -122,7 +156,11 @@ def build_matrix(args: argparse.Namespace) -> Dict[str, Any]:
     matrix: List[Dict[str, Any]] = []
     for candidate_index, candidate in enumerate(candidates):
         system_sample_id = sample_id(candidate)
-        if system_sample_id in prepared or system_sample_id in excluded:
+        if (
+            system_sample_id in prepared
+            or system_sample_id in excluded
+            or system_sample_id in excluded_by_endpoint
+        ):
             continue
         validate_candidate_files(candidate)
         system_root = args.output_dir / "systems" / system_sample_id
@@ -155,12 +193,18 @@ def build_matrix(args: argparse.Namespace) -> Dict[str, Any]:
             str(existing_context_manifest) if existing_context_manifest else None
         ),
         "exclude_sample_list": str(exclude_sample_list) if exclude_sample_list else None,
+        "exclude_candidate_manifests": [
+            str(path) for path in exclude_candidate_manifests
+        ],
         "selected_systems": len(candidates),
         "already_prepared_systems": len(prepared),
         "excluded_requested_systems": len(excluded_requested),
         "excluded_systems": len(excluded),
         "excluded_sample_ids": sorted(excluded),
         "excluded_not_in_candidates": sorted(excluded_not_in_candidates),
+        "excluded_endpoint_pairs_requested": len(excluded_endpoint_pairs),
+        "excluded_endpoint_pair_systems": len(excluded_by_endpoint),
+        "excluded_endpoint_pair_sample_ids": sorted(excluded_by_endpoint),
         "planned_systems": len(matrix),
         "seed_base": args.seed_base,
         "protocol": protocol,
