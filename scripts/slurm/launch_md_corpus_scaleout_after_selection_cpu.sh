@@ -21,6 +21,7 @@ CONTEXT_MAX_CONCURRENT="${CONTEXT_MAX_CONCURRENT:-16}"
 REPLICA_MAX_CONCURRENT="${REPLICA_MAX_CONCURRENT:-16}"
 CONTEXT_SEED_BASE="${CONTEXT_SEED_BASE:-60719000}"
 REPLICA_SEED_BASE="${REPLICA_SEED_BASE:-60720000}"
+CONTEXT_JOB_NAME="${CONTEXT_JOB_NAME:-mdctx_scaleout}"
 
 export PATH="/data/soft/slurm/24.11.4/bin:${PATH}"
 cd "$ROOT"
@@ -64,7 +65,7 @@ fi
 LAST_INDEX=$((TASKS - 1))
 
 CONTEXT_JOB=$(sbatch --parsable \
-  --job-name=mdctx_scale255 \
+  --job-name="$CONTEXT_JOB_NAME" \
   --array="0-${LAST_INDEX}%${CONTEXT_MAX_CONCURRENT}" \
   --export=ALL,MATRIX="$CONTEXT_MATRIX",PLATFORM=CPU \
   scripts/slurm/run_md_context_pipeline_array_cpu.sh)
