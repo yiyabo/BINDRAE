@@ -358,19 +358,49 @@ The 82-path collection was re-exported under both phase references:
 - identity phase: 82/82 paths passed;
 - both caches use metric scales `(rotation, translation, chi) = (1, 1, 1)`.
 
-The next matched screen uses the same 17/6 system split, trunk, objective,
-two-A100 budget, batch size, and 40-epoch ceiling for every trainable row:
+The first `sin2` screen used a learning rate and supervision weight that were
+too small for component identification (`2e-5` and `0.1`, respectively), while
+training the entire 15.3M-parameter model under competing auxiliary losses.
+All three learned rows stayed within 0.03% of the synchronous bridge. This was
+an optimization collapse, not evidence against the target or evaluator: the
+previous strong phase checkpoint improved product RMSE by 14.38% when
+re-evaluated against the exact new `sin2` reference.
 
-```text
-143174  phase-only     pending
-143175  residual-only  pending
-143176  full APNB      pending
-```
+The corrected capacity screen trained only the relevant phase/residual heads
+for 100 epochs with `lr=3e-4`, unit MD supervision, and zero auxiliary or
+residual-regularization weights. It used the same strict 17-system train / six-
+system held-out split, with 21 held-out replicas and 20 generated path steps.
+The table reports system-macro means:
 
-This screen is a deterministic component-identification experiment, not a
-final paper result. Full APNB is promoted only if it beats phase-only and
-residual-only on held-out path metrics while retaining controlled residual and
-tail-geometry behavior.
+| Variant | Product RMSE ↓ | Translation MAE Å ↓ | Rotation MAE rad ↓ | Chi MAE rad ↓ | Phase tau MAE ↓ | Phase Spearman ↑ | Pair accuracy ↑ | Contact timing MAE ↓ |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Synchronous Cartesian | 1.554051 | 0.986568 | 0.383072 | 0.340054 | 0.225814 | n/a | 0.0000 | 0.423953 |
+| Phase-only, best epoch 15 | **1.317409** | **0.856073** | **0.331144** | 0.291845 | **0.207280** | **0.0904** | **0.5412** | **0.344684** |
+| Residual-only, best epoch 6 | 1.554039 | 0.990337 | 0.383358 | 0.337615 | 0.225814 | n/a | 0.0000 | 0.414969 |
+| Full APNB, best epoch 21 | 1.322098 | 0.869276 | 0.338023 | **0.289076** | 0.207327 | -0.0311 | 0.4817 | 0.345138 |
+
+Phase-only improves product RMSE by 15.23%, translation by 13.23%, rotation by
+13.56%, chi by 14.18%, phase tau MAE by 8.21%, and contact timing MAE by
+18.70% relative to the synchronous bridge. It wins all six systems on product,
+rotation, and chi error. Six-system paired bootstrap intervals are positive for
+all six lower-is-better metrics, although this sample is still too small for
+paper-level uncertainty estimates.
+
+Residual-only is statistically indistinguishable from the synchronous bridge.
+Its training normal MAE falls from 0.726 to 0.608 while held-out normal MAE
+worsens from 0.793 to 0.842, which is direct evidence of overfitting. Full APNB
+preserves most phase gains but does not beat phase-only: translation is worse
+on five of six systems, product and rotation are slightly worse, and its phase-
+order metrics are lower. Its held-out interior peptide loss at the selected
+checkpoint is 0.0302 versus 0.00774 for phase-only. Contact-event coverage and
+transient-contact recall are unchanged across all four rows.
+
+Therefore this component-identification experiment succeeds for asynchronous
+phase and fails the promotion gate for the normal residual. Phase-only is the
+current deterministic anchor. Full APNB remains an implemented hypothesis and
+must not be presented as validated until more MD training systems and a
+controlled residual retest make it beat phase-only on independent path and
+geometry metrics.
 
 ## Repository Posture
 
@@ -381,6 +411,7 @@ commits are:
 - `42123470`: use the smooth endpoint envelope and immutable cache contracts;
 - `fa35a554`: add the matched APNB screen submitter;
 - `63020fc6`: record audit-rejected targets during cache assembly.
+- `3947239c`: evaluate the MD holdout from the correct master manifest.
 
 Do not overwrite historical checkpoints, logs, or failed export directories.
 Use unique tags and output paths for every retry.

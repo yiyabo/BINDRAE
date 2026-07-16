@@ -674,21 +674,23 @@ The method claim should be weakened or abandoned if any of the following hold:
 | Confidence-weighted free-flow phase pseudo-teacher | Tested; learnable but failed matched path evaluation |
 | Canonical full OracleMotion train cache | Re-export pending |
 | Controlled manifold benchmark | Not implemented |
-| Independent MD benchmark | 23-system silver pilot; gold benchmark planned |
+| Independent MD benchmark | 23-system silver pilot complete; six-system held-out capacity screen validates phase but not the normal residual; gold benchmark planned |
 | Global stochastic path latent | Proposed, not implemented |
 | Multi-path ensemble objective | Proposed, not implemented |
 | Stage-1 replacement for OracleMotion | Future paper track |
 
 ## Execution Order
 
-1. Keep residual-only as the endpoint-corpus reference after the failed
-   endpoint-only phase-identification screen.
-2. Treat the completed pseudo-teacher experiment as a negative diagnostic; do
-   not tune it further without external timing evidence.
-3. Run the controlled manifold benchmark.
-4. Evaluate phase/event order on the independent MD benchmark.
-5. Freeze a deterministic APNB checkpoint only if supervised phase is
-   complementary to residual-only.
+1. Use MD-supervised phase-only as the current deterministic anchor; retain the
+   synchronous bridge and residual-only model as matched ablations.
+2. Expand MD supervision from 17 training systems toward at least 100 systems
+   under protein-family and ligand-scaffold separation.
+3. Diagnose normal-target coverage and retest the residual branch with
+   predeclared learning-rate, branch-weight, and magnitude-control settings;
+   do not tune against the final gold benchmark.
+4. Promote full APNB only if it beats phase-only and residual-only on held-out
+   path errors, event order, and independent physical validity.
+5. Run the controlled manifold benchmark and external gold MD benchmark.
 6. Implement the global stochastic path latent only after deterministic
    component identification succeeds.
 7. Fine-tune stochastic APNB on MD path ensembles and evaluate coverage versus
