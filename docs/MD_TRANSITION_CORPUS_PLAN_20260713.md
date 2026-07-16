@@ -525,3 +525,37 @@ replicas are independent endpoint systems. Job `142152` is the first two-GPU,
 two-epoch end-to-end smoke over the seven systems and 29-path cache; train and
 validation deliberately reuse the same systems, so its purpose is pipeline
 health rather than model selection or performance reporting.
+
+## Full-Corpus Scale-Out (2026-07-16)
+
+The 23-system / 82-path silver corpus was sufficient to validate the learned
+phase branch but the normal-residual branch overfit 17 training systems. Corpus
+expansion therefore precedes further residual hyperparameter tuning. The fixed
+context, pull, audit, and target-export gates remain unchanged.
+
+Two non-overlapping context lanes are active:
+
+1. The original 8,000-record screen contained 319 eligible records but only 166
+   unique endpoint pairs after selector de-duplication. Excluding all 64
+   previously attempted systems produced 102 new context tasks in job `143224`;
+   continuation job `143225` will collect passed contexts and submit five
+   replicas per admitted system.
+2. A full scan of all 64,724 training records found 2,307 eligible records and
+   selected 500 unique endpoint pairs. Candidate-manifest exclusion against the
+   first 166 endpoint pairs removed 144 overlaps and produced 356 new context
+   tasks in job `143242`; continuation job `143243` will launch the matching
+   replica and finalization chain.
+
+An earlier 430-task matrix (`143234` / `143235`) was canceled before any task
+started because a post-submission audit found 74 endpoint-pair overlaps that
+sample-ID exclusion alone could not detect. The context-matrix builder now
+supports explicit prior-candidate manifests and has a unit test for different
+sample IDs sharing the same apo/holo PDB pair. The replacement 356-system
+matrix has zero overlap with the prior 166 endpoint pairs and zero duplicate
+endpoint pairs internally.
+
+Together the active lanes cover 458 new endpoint systems. Historical yields
+suggest this is sufficient to exceed 100 accepted training systems, but this is
+only a planning estimate. The final corpus size is defined solely by passed
+setup, endpoint-basin, transition, atomistic, mapping, and supervision-density
+gates.
