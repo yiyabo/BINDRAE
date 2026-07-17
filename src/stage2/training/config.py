@@ -107,7 +107,10 @@ class TrainingConfig:
 
     # Bridge / FM
     alpha: float = 1.5
-    path_parameterization: str = "flow"  # flow | boundary_residual_v1 | boundary_residual | projected_flow | bridge_timewarp_v1 | phase_orthogonal_residual_v1
+    # flow | boundary_residual_v1 | boundary_residual | projected_flow |
+    # bridge_timewarp_v1 | phase_orthogonal_residual_v1 |
+    # phase_block_orthogonal_residual_v2
+    path_parameterization: str = "flow"
     boundary_residual_envelope: str = "sin2"  # sin2 | poly
     boundary_residual_scale: float = 1.0
     terminal_projection_schedule: str = "smootherstep"  # smoothstep | smootherstep | late_smoother | quadratic
@@ -116,6 +119,12 @@ class TrainingConfig:
     time_warp_rate_clip: float = 10.0
     phase_residual_tau_mode: str = "learned"  # learned | identity
     phase_residual_bridge_mode: str = "se3_geodesic"  # se3_geodesic | cartesian_backbone
+    # all | rotation | translation | chi | rotation_translation |
+    # rotation_chi | translation_chi (v2 only)
+    phase_residual_active_blocks: str = "all"
+    phase_residual_rotation_gate_bias: float = -2.0
+    phase_residual_translation_gate_bias: float = -6.0
+    phase_residual_chi_gate_bias: float = -2.0
     phase_residual_envelope: str = "sin2"  # sin2 | poly
     # Zero is the strict warp-only ablation: learned phase, no spatial residual.
     phase_residual_scale: float = 1.0
@@ -131,6 +140,7 @@ class TrainingConfig:
     phase_residual_peptide_retraction_max_translation: float = 1.0
     phase_residual_peptide_retraction_activation_loss_threshold: float = 0.0
     init_from_checkpoint: Optional[str] = None
+    init_from_checkpoint_mode: str = "strict"  # strict | shared_trunk
 
     # Boundary-residual teacher distillation. The cache stores free-flow
     # teacher residuals relative to the apo-holo bridge at interior times.
@@ -157,14 +167,25 @@ class TrainingConfig:
     phase_teacher_missing_policy: str = "error"  # error | skip
     phase_teacher_head_only: bool = False
     phase_teacher_residual_heads_only: bool = False
+    # cycle exposes each MD replica across epochs; first is a deterministic
+    # diagnostic used to separate optimization failure from path multimodality.
+    supervision_replica_mode: str = "cycle"  # cycle | first
 
     # Audited atomistic path targets for the phase-normal residual heads.
     # Unlike teacher_residual_cache_dir, this cache is defined in the
-    # phase_orthogonal_residual_v1 parameterization itself.
+    # phase residual parameterization itself.
     phase_normal_cache_dir: Optional[str] = None
     w_phase_normal_residual: float = 0.0
     phase_normal_residual_loss_type: str = "huber"  # mse | huber
     phase_normal_residual_huber_delta: float = 0.25
+    # Applied only while optimizing; validation keeps the complete target set
+    # so confidence-threshold screens remain directly comparable.
+    phase_normal_residual_min_confidence: float = 0.0
+    # The rigid target has six components while chi is averaged over valid
+    # torsions. Use rigid=6, chi=1 to match the product-path metric; defaults
+    # preserve the historical objective for controlled comparisons.
+    phase_normal_residual_rigid_weight: float = 1.0
+    phase_normal_residual_chi_weight: float = 1.0
     phase_normal_missing_policy: str = "error"  # error | skip
 
     # Loss weights

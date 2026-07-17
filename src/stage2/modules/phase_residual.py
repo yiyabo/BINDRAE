@@ -188,3 +188,250 @@ def project_product_tangent_normal(
             zeros,
         ),
     }
+
+
+def _project_metric_block(
+    residual: torch.Tensor,
+    tangent: torch.Tensor,
+    *,
+    element_mask: torch.Tensor,
+    active_mask: torch.Tensor,
+    scale: float,
+    min_tangent_norm: float,
+    eps: float,
+) -> Dict[str, torch.Tensor]:
+    """Project one product-manifold block without coupling other blocks."""
+    mask_f = element_mask.to(dtype=residual.dtype)
+    residual = residual * mask_f
+    tangent = tangent * mask_f
+    residual_metric = residual / scale
+    tangent_metric = tangent / scale
+    residual_norm_sq = residual_metric.square().sum(dim=-1)
+    tangent_norm_sq = tangent_metric.square().sum(dim=-1)
+    dot = (residual_metric * tangent_metric).sum(dim=-1)
+    # The public threshold selects residues by total endpoint motion. Reusing
+    # that comparatively large threshold inside each block would leave small
+    # but nonzero block tangents unprojected. Within an active residue, project
+    # every numerically defined block direction instead.
+    block_tangent_floor = min(float(min_tangent_norm), 1e-6)
+    tangent_active = active_mask & (
+        tangent_norm_sq > block_tangent_floor**2
+    )
+    denominator_floor = torch.finfo(tangent_norm_sq.dtype).tiny
+    coefficient = torch.where(
+        tangent_active,
+        dot / tangent_norm_sq.clamp_min(denominator_floor),
+        torch.zeros_like(dot),
+    )
+    projected = residual - coefficient.unsqueeze(-1) * tangent
+    projected = projected * active_mask.unsqueeze(-1).to(projected.dtype) * mask_f
+    projected_metric = projected / scale
+    projected_norm_sq = projected_metric.square().sum(dim=-1)
+    projected_dot = (projected_metric * tangent_metric).sum(dim=-1)
+    raw_parallel_cos = dot.abs() / (
+        residual_norm_sq.sqrt() * tangent_norm_sq.sqrt()
+    ).clamp_min(eps)
+    projected_parallel_cos = projected_dot.abs() / (
+        projected_norm_sq.sqrt() * tangent_norm_sq.sqrt()
+    ).clamp_min(eps)
+    zeros = torch.zeros_like(dot)
+    return {
+        "projected": projected,
+        "coefficient": coefficient,
+        "tangent_active_mask": tangent_active,
+        "tangent_metric_norm_sq": tangent_norm_sq,
+        "raw_residual_metric_norm_sq": residual_norm_sq,
+        "projected_residual_metric_norm_sq": projected_norm_sq,
+        "raw_parallel_cos_abs": torch.where(
+            tangent_active, raw_parallel_cos, zeros
+        ),
+        "projected_parallel_cos_abs": torch.where(
+            tangent_active, projected_parallel_cos, zeros
+        ),
+    }
+
+
+def project_block_tangent_normal(
+    residual_rigid: torch.Tensor,
+    residual_chi: torch.Tensor,
+    bridge_tangent_rigid: torch.Tensor,
+    bridge_tangent_chi: torch.Tensor,
+    *,
+    node_mask: Optional[torch.Tensor] = None,
+    chi_mask: Optional[torch.Tensor] = None,
+    rotation_scale: float = 1.0,
+    translation_scale: float = 1.0,
+    chi_scale: float = 1.0,
+    min_tangent_norm: float = 1e-4,
+    max_metric_norm: float = 0.0,
+    eps: float = 1e-8,
+) -> Dict[str, torch.Tensor]:
+    """Project rotation, translation, and chi blocks independently.
+
+    A shared product-space projection can remove a chi-parallel component by
+    introducing a compensating translation. This stricter decomposition gives
+    each block its own projection coefficient, while preserving the original
+    residue-level support contract. If one block has negligible endpoint
+    motion but another block is active, that block's residual is already normal
+    and is retained unchanged.
+    """
+    if residual_rigid.shape != bridge_tangent_rigid.shape:
+        raise ValueError("residual_rigid and bridge_tangent_rigid must match")
+    if residual_chi.shape != bridge_tangent_chi.shape:
+        raise ValueError("residual_chi and bridge_tangent_chi must match")
+    if residual_rigid.shape[:-1] != residual_chi.shape[:-1]:
+        raise ValueError("rigid and chi tensors must share leading dimensions")
+    if residual_rigid.shape[-1] != 6:
+        raise ValueError("rigid tangents must have final dimension 6")
+
+    rotation_scale = _validate_scale("rotation_scale", rotation_scale)
+    translation_scale = _validate_scale("translation_scale", translation_scale)
+    chi_scale = _validate_scale("chi_scale", chi_scale)
+    min_tangent_norm = float(min_tangent_norm)
+    if min_tangent_norm < 0.0:
+        raise ValueError("min_tangent_norm must be >= 0")
+    max_metric_norm = float(max_metric_norm)
+    if max_metric_norm < 0.0:
+        raise ValueError("max_metric_norm must be >= 0")
+
+    if node_mask is None:
+        node_mask = torch.ones(
+            residual_rigid.shape[:-1],
+            dtype=torch.bool,
+            device=residual_rigid.device,
+        )
+    else:
+        node_mask = node_mask.bool()
+    if node_mask.shape != residual_rigid.shape[:-1]:
+        raise ValueError("node_mask shape must match residual leading dimensions")
+
+    if chi_mask is None:
+        chi_mask = torch.ones_like(residual_chi, dtype=torch.bool)
+    else:
+        chi_mask = chi_mask.bool()
+    if chi_mask.shape != residual_chi.shape:
+        raise ValueError("chi_mask shape must match residual_chi")
+    chi_mask = chi_mask & node_mask.unsqueeze(-1)
+
+    rigid_mask = node_mask.unsqueeze(-1).expand_as(residual_rigid)
+    rotation_mask = rigid_mask[..., :3]
+    translation_mask = rigid_mask[..., 3:]
+    tangent_metric = _metric_coordinates(
+        bridge_tangent_rigid * rigid_mask.to(bridge_tangent_rigid.dtype),
+        bridge_tangent_chi * chi_mask.to(bridge_tangent_chi.dtype),
+        rotation_scale=rotation_scale,
+        translation_scale=translation_scale,
+        chi_scale=chi_scale,
+    )
+    tangent_norm_sq = tangent_metric.square().sum(dim=-1)
+    active_mask = node_mask & (tangent_norm_sq >= min_tangent_norm**2)
+
+    rotation = _project_metric_block(
+        residual_rigid[..., :3],
+        bridge_tangent_rigid[..., :3],
+        element_mask=rotation_mask,
+        active_mask=active_mask,
+        scale=rotation_scale,
+        min_tangent_norm=min_tangent_norm,
+        eps=eps,
+    )
+    translation = _project_metric_block(
+        residual_rigid[..., 3:],
+        bridge_tangent_rigid[..., 3:],
+        element_mask=translation_mask,
+        active_mask=active_mask,
+        scale=translation_scale,
+        min_tangent_norm=min_tangent_norm,
+        eps=eps,
+    )
+    chi = _project_metric_block(
+        residual_chi,
+        bridge_tangent_chi,
+        element_mask=chi_mask,
+        active_mask=active_mask,
+        scale=chi_scale,
+        min_tangent_norm=min_tangent_norm,
+        eps=eps,
+    )
+
+    projected_rigid = torch.cat(
+        [rotation["projected"], translation["projected"]], dim=-1
+    )
+    projected_chi = chi["projected"]
+    residual_metric = _metric_coordinates(
+        residual_rigid * rigid_mask.to(residual_rigid.dtype),
+        residual_chi * chi_mask.to(residual_chi.dtype),
+        rotation_scale=rotation_scale,
+        translation_scale=translation_scale,
+        chi_scale=chi_scale,
+    )
+    projected_metric = _metric_coordinates(
+        projected_rigid,
+        projected_chi,
+        rotation_scale=rotation_scale,
+        translation_scale=translation_scale,
+        chi_scale=chi_scale,
+    )
+    residual_norm_sq = residual_metric.square().sum(dim=-1)
+    projected_norm_sq = projected_metric.square().sum(dim=-1)
+    if max_metric_norm > 0.0:
+        projected_norm = projected_norm_sq.clamp_min(eps).sqrt()
+        cap_scale = (max_metric_norm / projected_norm).clamp(max=1.0)
+        cap_scale = torch.where(active_mask, cap_scale, torch.zeros_like(cap_scale))
+        projected_rigid = projected_rigid * cap_scale.unsqueeze(-1)
+        projected_chi = projected_chi * cap_scale.unsqueeze(-1)
+        projected_metric = _metric_coordinates(
+            projected_rigid,
+            projected_chi,
+            rotation_scale=rotation_scale,
+            translation_scale=translation_scale,
+            chi_scale=chi_scale,
+        )
+        projected_norm_sq = projected_metric.square().sum(dim=-1)
+
+    raw_dot = (residual_metric * tangent_metric).sum(dim=-1)
+    projected_dot = (projected_metric * tangent_metric).sum(dim=-1)
+    raw_parallel_cos = raw_dot.abs() / (
+        residual_norm_sq.sqrt() * tangent_norm_sq.sqrt()
+    ).clamp_min(eps)
+    projected_parallel_cos = projected_dot.abs() / (
+        projected_norm_sq.sqrt() * tangent_norm_sq.sqrt()
+    ).clamp_min(eps)
+    zeros = torch.zeros_like(raw_dot)
+
+    return {
+        "projected_rigid": projected_rigid,
+        "projected_chi": projected_chi,
+        "projection_coefficient": torch.stack(
+            [
+                rotation["coefficient"],
+                translation["coefficient"],
+                chi["coefficient"],
+            ],
+            dim=-1,
+        ),
+        "rotation_projection_coefficient": rotation["coefficient"],
+        "translation_projection_coefficient": translation["coefficient"],
+        "chi_projection_coefficient": chi["coefficient"],
+        "active_mask": active_mask,
+        "rotation_tangent_active_mask": rotation["tangent_active_mask"],
+        "translation_tangent_active_mask": translation["tangent_active_mask"],
+        "chi_tangent_active_mask": chi["tangent_active_mask"],
+        "tangent_metric_norm": tangent_norm_sq.sqrt(),
+        "raw_residual_metric_norm": residual_norm_sq.sqrt(),
+        "projected_residual_metric_norm": projected_norm_sq.sqrt(),
+        "raw_parallel_cos_abs": torch.where(active_mask, raw_parallel_cos, zeros),
+        "projected_parallel_cos_abs": torch.where(
+            active_mask, projected_parallel_cos, zeros
+        ),
+        "rotation_raw_parallel_cos_abs": rotation["raw_parallel_cos_abs"],
+        "translation_raw_parallel_cos_abs": translation["raw_parallel_cos_abs"],
+        "chi_raw_parallel_cos_abs": chi["raw_parallel_cos_abs"],
+        "rotation_projected_parallel_cos_abs": rotation[
+            "projected_parallel_cos_abs"
+        ],
+        "translation_projected_parallel_cos_abs": translation[
+            "projected_parallel_cos_abs"
+        ],
+        "chi_projected_parallel_cos_abs": chi["projected_parallel_cos_abs"],
+    }

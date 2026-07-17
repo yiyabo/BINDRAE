@@ -36,6 +36,19 @@ class PhaseTeacherCacheTest(unittest.TestCase):
                 )
             )
 
+    def test_replica_cache_can_pin_first_replica_for_diagnostics(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            for replica in range(3):
+                (root / f"sample__silver_r{replica:02d}.npz").touch()
+
+            trainer = Stage2Trainer.__new__(Stage2Trainer)
+            trainer.config = SimpleNamespace(supervision_replica_mode="first")
+            trainer.current_epoch = 17
+
+            selected = trainer._replicated_supervision_cache_path(tmpdir, "sample")
+            self.assertEqual(selected.name, "sample__silver_r00.npz")
+
     def test_loads_interpolated_contact_event_targets(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             cache_path = Path(tmpdir) / "sample_1.npz"
@@ -109,6 +122,7 @@ class PhaseTeacherCacheTest(unittest.TestCase):
                 schema_version=np.array("md_phase_normal_v1"),
                 sample_id=np.array("sample/1"),
                 n_residues=np.array(2, dtype=np.int32),
+                phase_target_mode=np.array("inferred"),
                 t_values=np.array([0.0, 0.5, 1.0], dtype=np.float32),
                 tau_target=np.array(
                     [[0.0, 0.0], [0.25, 0.75], [1.0, 1.0]], dtype=np.float32
@@ -146,11 +160,13 @@ class PhaseTeacherCacheTest(unittest.TestCase):
                 phase_normal_cache_dir=tmpdir,
                 w_phase_normal_residual=1.0,
                 phase_normal_missing_policy="error",
+                phase_residual_tau_mode="learned",
                 phase_residual_bridge_mode="cartesian_backbone",
                 phase_residual_envelope="poly",
                 phase_residual_rotation_metric_scale=1.0,
                 phase_residual_translation_metric_scale=1.0,
                 phase_residual_chi_metric_scale=1.0,
+                phase_normal_residual_min_confidence=0.0,
             )
             phase_normal = trainer._load_phase_normal_residual_targets(
                 batch, [0.5]
@@ -160,6 +176,20 @@ class PhaseTeacherCacheTest(unittest.TestCase):
             self.assertTrue(bool(phase_normal["mask"][0, 0, 0]))
             self.assertFalse(bool(phase_normal["mask"][0, 0, 1]))
             self.assertAlmostEqual(float(phase_normal["weight"][0, 0, 0]), 0.25)
+            trainer.config.phase_normal_residual_min_confidence = 0.3
+            filtered = trainer._load_phase_normal_residual_targets(batch, [0.5])
+            self.assertFalse(bool(filtered["mask"][0, 0, 0]))
+            self.assertEqual(float(filtered["weight"][0, 0, 0]), 0.0)
+            trainer.model = SimpleNamespace(training=False)
+            validation_targets = trainer._load_phase_normal_residual_targets(
+                batch, [0.5]
+            )
+            self.assertTrue(bool(validation_targets["mask"][0, 0, 0]))
+            self.assertAlmostEqual(
+                float(validation_targets["weight"][0, 0, 0]), 0.25
+            )
+            del trainer.model
+            trainer.config.phase_normal_residual_min_confidence = 0.0
             summary = summarize_cache_file(
                 cache_path,
                 mask_mode="active",
@@ -167,6 +197,23 @@ class PhaseTeacherCacheTest(unittest.TestCase):
                 n_model_steps=2,
             )
             self.assertEqual(summary["supervised_points"], 2)
+
+            trainer.config.phase_residual_tau_mode = "identity"
+            with self.assertRaisesRegex(
+                ValueError,
+                "phase_target_mode='inferred'.*expected 'identity'",
+            ):
+                trainer._load_phase_normal_residual_targets(batch, [0.5])
+
+            trainer.config.phase_residual_tau_mode = "learned"
+            trainer.config.path_parameterization = (
+                "phase_block_orthogonal_residual_v2"
+            )
+            with self.assertRaisesRegex(
+                ValueError,
+                "normal_projection_mode='product'.*expected 'block'",
+            ):
+                trainer._load_phase_normal_residual_targets(batch, [0.5])
 
 
 if __name__ == "__main__":

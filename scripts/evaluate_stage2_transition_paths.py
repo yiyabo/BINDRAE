@@ -41,6 +41,7 @@ from src.stage2.modules.chain_internal import (  # noqa: E402
 )
 from src.stage2.modules import (  # noqa: E402
     endpoint_zero_envelope,
+    project_block_tangent_normal,
     project_product_tangent_normal,
     rigid_compose,
     rigid_inverse,
@@ -82,6 +83,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "pose_graph_projected_bridge_v1",
             "bridge_timewarp_v1",
             "phase_orthogonal_residual_v1",
+            "phase_block_orthogonal_residual_v2",
         ],
         help="Path construction to evaluate; checkpoint uses checkpoint config",
     )
@@ -378,7 +380,17 @@ def build_model_config_for_checkpoint(args, config, split: str) -> Tuple[Torsion
         repa_target_dim=int(stage1v2_settings["dim"]),
         phase_residual_enabled=(
             str(getattr(config, "path_parameterization", "flow"))
-            == "phase_orthogonal_residual_v1"
+            in {
+                "phase_orthogonal_residual_v1",
+                "phase_block_orthogonal_residual_v2",
+            }
+        ),
+        phase_residual_blockwise=(
+            str(getattr(config, "path_parameterization", "flow"))
+            == "phase_block_orthogonal_residual_v2"
+        ),
+        phase_residual_active_blocks=str(
+            getattr(config, "phase_residual_active_blocks", "all")
         ),
     )
     return model_config, interaction_settings, stage1v2_settings
@@ -441,6 +453,7 @@ def resolve_path_parameterization(args, config) -> str:
         "pose_graph_projected_bridge_v1",
         "bridge_timewarp_v1",
         "phase_orthogonal_residual_v1",
+        "phase_block_orthogonal_residual_v2",
     }
     if mode not in allowed:
         raise ValueError(f"Unsupported path_parameterization={mode}")
@@ -1016,6 +1029,7 @@ def phase_orthogonal_residual_path(
     chi_metric_scale: float,
     min_tangent_norm: float,
     max_metric_norm: float,
+    projection_mode: str = "product",
 ) -> Tuple[List[Rigid], List[torch.Tensor], List[float]]:
     """Evaluate the endpoint-exact phase plus normal-residual path family."""
     n_steps = int(n_steps)
@@ -1081,7 +1095,13 @@ def phase_orthogonal_residual_path(
             [out["residual_rigid_rot"], out["residual_rigid_trans"]],
             dim=-1,
         )
-        projection = project_product_tangent_normal(
+        projection_fn = {
+            "product": project_product_tangent_normal,
+            "block": project_block_tangent_normal,
+        }.get(projection_mode)
+        if projection_fn is None:
+            raise ValueError(f"Unsupported normal projection mode={projection_mode}")
+        projection = projection_fn(
             residual_rigid,
             out["residual_chi"],
             bridge_tangent_rigid,
@@ -1508,7 +1528,10 @@ def construct_path(
             ),
             correction,
         )
-    if path_mode == "phase_orthogonal_residual_v1":
+    if path_mode in {
+        "phase_orthogonal_residual_v1",
+        "phase_block_orthogonal_residual_v2",
+    }:
         def resolve_value(arg_name: str, default):
             value = getattr(args, arg_name)
             return value if value is not None else getattr(config, arg_name, default)
@@ -1544,6 +1567,11 @@ def construct_path(
             ),
             max_metric_norm=float(
                 resolve_value("phase_residual_max_metric_norm", 0.0)
+            ),
+            projection_mode=(
+                "block"
+                if path_mode == "phase_block_orthogonal_residual_v2"
+                else "product"
             ),
         )
         if bool(getattr(config, "phase_residual_peptide_retraction", False)):

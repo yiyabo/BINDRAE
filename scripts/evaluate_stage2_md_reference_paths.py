@@ -249,7 +249,10 @@ def predicted_tau_values(
     gate_context,
 ) -> List[torch.Tensor]:
     path_mode = base.resolve_path_parameterization(args, config)
-    if path_mode != "phase_orthogonal_residual_v1":
+    if path_mode not in {
+        "phase_orthogonal_residual_v1",
+        "phase_block_orthogonal_residual_v2",
+    }:
         bsz, n_res = batch.node_mask.shape
         return [
             torch.full(

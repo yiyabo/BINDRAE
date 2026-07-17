@@ -80,6 +80,11 @@ class TorsionFlowNetConfig:
     # Heads
     head_hidden: int = 256
     phase_residual_enabled: bool = False
+    phase_residual_blockwise: bool = False
+    phase_residual_active_blocks: str = "all"
+    phase_residual_rotation_gate_bias: float = -2.0
+    phase_residual_translation_gate_bias: float = -6.0
+    phase_residual_chi_gate_bias: float = -2.0
 
     # Dropout
     dropout: float = 0.1
@@ -91,6 +96,32 @@ class TorsionFlowNet(nn.Module):
     def __init__(self, config: Optional[TorsionFlowNetConfig] = None):
         super().__init__()
         self.config = config or TorsionFlowNetConfig()
+        valid_residual_block_modes = {
+            "all",
+            "rotation",
+            "translation",
+            "chi",
+            "rotation_translation",
+            "rotation_chi",
+            "translation_chi",
+        }
+        if self.config.phase_residual_active_blocks not in valid_residual_block_modes:
+            raise ValueError(
+                "Unsupported phase_residual_active_blocks="
+                f"{self.config.phase_residual_active_blocks}"
+            )
+        if (
+            not self.config.phase_residual_blockwise
+            and self.config.phase_residual_active_blocks != "all"
+        ):
+            raise ValueError(
+                "phase_residual_active_blocks is only available for blockwise residuals"
+            )
+        self.phase_residual_active_blocks = (
+            {"rotation", "translation", "chi"}
+            if self.config.phase_residual_active_blocks == "all"
+            else set(self.config.phase_residual_active_blocks.split("_"))
+        )
 
         # 1) ESM adapter
         if self.config.esm_fusion_enabled:
@@ -208,25 +239,76 @@ class TorsionFlowNet(nn.Module):
         self.residual_gate_mlp = None
         self.residual_chi_head = None
         self.residual_rigid_head = None
+        self.residual_rotation_gate_mlp = None
+        self.residual_translation_gate_mlp = None
+        self.residual_chi_gate_mlp = None
+        self.residual_rotation_head = None
+        self.residual_translation_head = None
         if self.config.phase_residual_enabled:
-            self.residual_gate_mlp = nn.Sequential(
-                nn.Linear(gate_in_dim, self.config.head_hidden),
-                nn.SiLU(),
-                nn.Linear(self.config.head_hidden, 1),
-            )
-            self.residual_chi_head = nn.Sequential(
-                nn.Linear(chi_in_dim, self.config.head_hidden),
-                nn.SiLU(),
-                nn.Linear(self.config.head_hidden, 4),
-            )
-            self.residual_rigid_head = nn.Sequential(
-                nn.Linear(rigid_in_dim, self.config.head_hidden),
-                nn.SiLU(),
-                nn.Linear(self.config.head_hidden, 6),
-            )
-            for head in (self.residual_chi_head, self.residual_rigid_head):
-                nn.init.zeros_(head[-1].weight)
-                nn.init.zeros_(head[-1].bias)
+            if self.config.phase_residual_blockwise:
+                def make_gate(input_dim: int, bias: float) -> nn.Sequential:
+                    gate_module = nn.Sequential(
+                        nn.Linear(input_dim, self.config.head_hidden),
+                        nn.SiLU(),
+                        nn.Linear(self.config.head_hidden, 1),
+                    )
+                    nn.init.zeros_(gate_module[-1].weight)
+                    nn.init.constant_(gate_module[-1].bias, bias)
+                    return gate_module
+
+                self.residual_rotation_gate_mlp = make_gate(
+                    gate_in_dim,
+                    self.config.phase_residual_rotation_gate_bias,
+                )
+                self.residual_translation_gate_mlp = make_gate(
+                    gate_in_dim,
+                    self.config.phase_residual_translation_gate_bias,
+                )
+                self.residual_chi_gate_mlp = make_gate(
+                    gate_in_dim,
+                    self.config.phase_residual_chi_gate_bias,
+                )
+                self.residual_rotation_head = nn.Sequential(
+                    nn.Linear(rigid_in_dim, self.config.head_hidden),
+                    nn.SiLU(),
+                    nn.Linear(self.config.head_hidden, 3),
+                )
+                self.residual_translation_head = nn.Sequential(
+                    nn.Linear(rigid_in_dim, self.config.head_hidden),
+                    nn.SiLU(),
+                    nn.Linear(self.config.head_hidden, 3),
+                )
+                self.residual_chi_head = nn.Sequential(
+                    nn.Linear(chi_in_dim, self.config.head_hidden),
+                    nn.SiLU(),
+                    nn.Linear(self.config.head_hidden, 4),
+                )
+                for head in (
+                    self.residual_rotation_head,
+                    self.residual_translation_head,
+                    self.residual_chi_head,
+                ):
+                    nn.init.zeros_(head[-1].weight)
+                    nn.init.zeros_(head[-1].bias)
+            else:
+                self.residual_gate_mlp = nn.Sequential(
+                    nn.Linear(gate_in_dim, self.config.head_hidden),
+                    nn.SiLU(),
+                    nn.Linear(self.config.head_hidden, 1),
+                )
+                self.residual_chi_head = nn.Sequential(
+                    nn.Linear(chi_in_dim, self.config.head_hidden),
+                    nn.SiLU(),
+                    nn.Linear(self.config.head_hidden, 4),
+                )
+                self.residual_rigid_head = nn.Sequential(
+                    nn.Linear(rigid_in_dim, self.config.head_hidden),
+                    nn.SiLU(),
+                    nn.Linear(self.config.head_hidden, 6),
+                )
+                for head in (self.residual_chi_head, self.residual_rigid_head):
+                    nn.init.zeros_(head[-1].weight)
+                    nn.init.zeros_(head[-1].bias)
 
     def forward(self,
                 chi: torch.Tensor,           # [B, N, 4]
@@ -395,13 +477,53 @@ class TorsionFlowNet(nn.Module):
             "time_warp_logits": time_warp_logits,
         }
         if self.config.phase_residual_enabled:
-            residual_gate = torch.sigmoid(self.residual_gate_mlp(gate_input))
-            residual_chi = self.residual_chi_head(chi_input) * residual_gate
-            residual_rigid = self.residual_rigid_head(rigid_input) * residual_gate
+            if self.config.phase_residual_blockwise:
+                residual_rotation_gate = torch.sigmoid(
+                    self.residual_rotation_gate_mlp(gate_input)
+                ) * float("rotation" in self.phase_residual_active_blocks)
+                residual_translation_gate = torch.sigmoid(
+                    self.residual_translation_gate_mlp(gate_input)
+                ) * float("translation" in self.phase_residual_active_blocks)
+                residual_chi_gate = torch.sigmoid(
+                    self.residual_chi_gate_mlp(gate_input)
+                ) * float("chi" in self.phase_residual_active_blocks)
+                residual_rotation = (
+                    self.residual_rotation_head(rigid_input)
+                    * residual_rotation_gate
+                )
+                residual_translation = (
+                    self.residual_translation_head(rigid_input)
+                    * residual_translation_gate
+                )
+                residual_chi = (
+                    self.residual_chi_head(chi_input)
+                    * residual_chi_gate
+                )
+                residual_rigid = torch.cat(
+                    [residual_rotation, residual_translation], dim=-1
+                )
+                active_gates = [
+                    gate_value
+                    for block_name, gate_value in (
+                        ("rotation", residual_rotation_gate),
+                        ("translation", residual_translation_gate),
+                        ("chi", residual_chi_gate),
+                    )
+                    if block_name in self.phase_residual_active_blocks
+                ]
+                residual_gate = torch.stack(active_gates, dim=-1).mean(dim=-1)
+            else:
+                residual_gate = torch.sigmoid(self.residual_gate_mlp(gate_input))
+                residual_chi = self.residual_chi_head(chi_input) * residual_gate
+                residual_rigid = self.residual_rigid_head(rigid_input) * residual_gate
             if node_mask is not None:
                 residual_gate = residual_gate * mask
                 residual_chi = residual_chi * mask
                 residual_rigid = residual_rigid * mask
+                if self.config.phase_residual_blockwise:
+                    residual_rotation_gate = residual_rotation_gate * mask
+                    residual_translation_gate = residual_translation_gate * mask
+                    residual_chi_gate = residual_chi_gate * mask
 
             # The legacy velocity heads remain part of the DDP graph in the new
             # parameterization, but cannot alter the spatial residual.
@@ -422,6 +544,12 @@ class TorsionFlowNet(nn.Module):
                 residual_rigid_trans=residual_rigid[..., 3:],
                 residual_gate=residual_gate,
             )
+            if self.config.phase_residual_blockwise:
+                out.update(
+                    residual_rotation_gate=residual_rotation_gate,
+                    residual_translation_gate=residual_translation_gate,
+                    residual_chi_gate=residual_chi_gate,
+                )
         if self.repa_student_proj is not None:
             repa_student = self.repa_student_proj(s_geo)
             if return_repa:

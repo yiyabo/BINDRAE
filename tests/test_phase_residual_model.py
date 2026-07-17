@@ -8,6 +8,100 @@ from src.stage2.models.torsion_flow import TorsionFlowNet, TorsionFlowNetConfig
 
 
 class PhaseResidualModelTest(unittest.TestCase):
+    def test_blockwise_heads_have_independent_closed_gates(self):
+        config = TorsionFlowNetConfig(
+            c_s=64,
+            c_p=32,
+            c_hidden=32,
+            no_heads=4,
+            depth=1,
+            no_qk_points=2,
+            no_v_points=4,
+            d_lig=16,
+            num_heads_cross=4,
+            time_dim=16,
+            head_hidden=32,
+            dropout=0.0,
+            phase_residual_enabled=True,
+            phase_residual_blockwise=True,
+        )
+        model = TorsionFlowNet(config)
+        self.assertIsNone(model.residual_gate_mlp)
+        self.assertIsNone(model.residual_rigid_head)
+        self.assertEqual(model.residual_rotation_head[-1].out_features, 3)
+        self.assertEqual(model.residual_translation_head[-1].out_features, 3)
+        self.assertEqual(model.residual_chi_head[-1].out_features, 4)
+        for head in (
+            model.residual_rotation_head,
+            model.residual_translation_head,
+            model.residual_chi_head,
+        ):
+            self.assertEqual(head[-1].weight.abs().sum().item(), 0.0)
+            self.assertEqual(head[-1].bias.abs().sum().item(), 0.0)
+        rotation_gate = torch.sigmoid(
+            model.residual_rotation_gate_mlp[-1].bias
+        ).item()
+        translation_gate = torch.sigmoid(
+            model.residual_translation_gate_mlp[-1].bias
+        ).item()
+        chi_gate = torch.sigmoid(model.residual_chi_gate_mlp[-1].bias).item()
+        self.assertAlmostEqual(rotation_gate, chi_gate, places=7)
+        self.assertLess(translation_gate, rotation_gate / 10.0)
+
+    def test_blockwise_active_blocks_are_explicit(self):
+        config = TorsionFlowNetConfig(
+            c_s=64,
+            c_p=32,
+            c_hidden=32,
+            no_heads=4,
+            depth=1,
+            no_qk_points=2,
+            no_v_points=4,
+            d_lig=16,
+            num_heads_cross=4,
+            time_dim=16,
+            head_hidden=32,
+            dropout=0.0,
+            phase_residual_enabled=True,
+            phase_residual_blockwise=True,
+            phase_residual_active_blocks="rotation_chi",
+        )
+        model = TorsionFlowNet(config)
+        self.assertEqual(model.phase_residual_active_blocks, {"rotation", "chi"})
+
+        with self.assertRaisesRegex(ValueError, "only available for blockwise"):
+            TorsionFlowNet(
+                TorsionFlowNetConfig(
+                    phase_residual_enabled=True,
+                    phase_residual_active_blocks="rotation",
+                )
+            )
+
+    def test_blockwise_gate_biases_are_configurable(self):
+        config = TorsionFlowNetConfig(
+            c_s=64,
+            c_p=32,
+            c_hidden=32,
+            no_heads=4,
+            depth=1,
+            no_qk_points=2,
+            no_v_points=4,
+            d_lig=16,
+            num_heads_cross=4,
+            time_dim=16,
+            head_hidden=32,
+            dropout=0.0,
+            phase_residual_enabled=True,
+            phase_residual_blockwise=True,
+            phase_residual_rotation_gate_bias=0.0,
+            phase_residual_translation_gate_bias=-4.0,
+            phase_residual_chi_gate_bias=1.0,
+        )
+        model = TorsionFlowNet(config)
+        self.assertEqual(model.residual_rotation_gate_mlp[-1].bias.item(), 0.0)
+        self.assertEqual(model.residual_translation_gate_mlp[-1].bias.item(), -4.0)
+        self.assertEqual(model.residual_chi_gate_mlp[-1].bias.item(), 1.0)
+
     @unittest.skipUnless(torch.cuda.is_available(), "FlashIPA forward requires CUDA")
     def test_dedicated_heads_are_zero_initialized_and_trainable(self):
         torch.manual_seed(3)
