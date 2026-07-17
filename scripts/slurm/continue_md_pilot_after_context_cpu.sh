@@ -19,6 +19,14 @@ COLLECTION_DIR="${COLLECTION_DIR:?Set COLLECTION_DIR}"
 REPLICA_OUTPUT_DIR="${REPLICA_OUTPUT_DIR:?Set REPLICA_OUTPUT_DIR}"
 MAX_CONCURRENT="${MAX_CONCURRENT:-4}"
 SEED_BASE="${SEED_BASE:-60716000}"
+PROTOCOL_TAG="${PROTOCOL_TAG:-global_ca_rmsd_fixed_v1}"
+PRE_EQUILIBRATION_STEPS="${PRE_EQUILIBRATION_STEPS:-500}"
+PULLING_STEPS="${PULLING_STEPS:-10000}"
+ENDPOINT_HOLD_STEPS="${ENDPOINT_HOLD_STEPS:-2000}"
+REPORT_INTERVAL="${REPORT_INTERVAL:-100}"
+RMSD_K_KJ_MOL_NM2="${RMSD_K_KJ_MOL_NM2:-200000}"
+FINAL_TARGET_RMSD_NM="${FINAL_TARGET_RMSD_NM:-0.025}"
+REPLICA_JOB_NAME="${REPLICA_JOB_NAME:-mdrep_pilot12}"
 
 export PATH=/data/soft/slurm/24.11.4/bin:$PATH
 cd "$ROOT"
@@ -51,19 +59,19 @@ python3 scripts/build_md_replica_matrix.py \
   --replica-start 0 \
   --replica-stop 4 \
   --seed-base "$SEED_BASE" \
-  --protocol-tag global_ca_rmsd_fixed_v1 \
-  --pre-equilibration-steps 500 \
-  --pulling-steps 10000 \
-  --endpoint-hold-steps 2000 \
-  --report-interval 100 \
-  --rmsd-k-kj-mol-nm2 200000 \
-  --final-target-rmsd-nm 0.025
+  --protocol-tag "$PROTOCOL_TAG" \
+  --pre-equilibration-steps "$PRE_EQUILIBRATION_STEPS" \
+  --pulling-steps "$PULLING_STEPS" \
+  --endpoint-hold-steps "$ENDPOINT_HOLD_STEPS" \
+  --report-interval "$REPORT_INTERVAL" \
+  --rmsd-k-kj-mol-nm2 "$RMSD_K_KJ_MOL_NM2" \
+  --final-target-rmsd-nm "$FINAL_TARGET_RMSD_NM"
 
 MATRIX="$REPLICA_OUTPUT_DIR/replica_matrix.jsonl"
 TASKS=$(wc -l < "$MATRIX" | tr -d ' ')
 LAST_INDEX=$((TASKS - 1))
 REPLICA_JOB=$(sbatch --parsable \
-  --job-name=mdrep_pilot12 \
+  --job-name="$REPLICA_JOB_NAME" \
   --array="0-${LAST_INDEX}%${MAX_CONCURRENT}" \
   --export=ALL,MATRIX="$MATRIX",PLATFORM=CPU \
   scripts/slurm/run_md_replica_pipeline_array_cpu.sh)

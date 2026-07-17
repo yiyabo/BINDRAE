@@ -29,6 +29,9 @@ records, not templates.
 - `submit_stage2_md_phase_normal_screen.sh` - submits the matched phase-only,
   identity-phase residual-only, and full APNB identification screen with one
   shared data/compute contract.
+- `submit_stage2_phase_block_v2_identification_screen.sh` - submits the Path-4
+  v2 phase/rotation/rotation-chi/all block-identification screen, including
+  train-scope, gate-bias, confidence-filter, and short-backfill controls.
 - `submit_stage2_24k_resumable.sh` - fixed-tag submitter for the 24k OracleMotion / ESM7 / REPA matrix; reuses the interrupted run directories and keeps `AUTO_RESUME=1` so resubmission continues from `last_checkpoint.pt`.
 - `evaluate_stage2_transition_paths_1gpu.sh` - residue-level transition evaluator.
 - `evaluate_stage2_md_reference_1gpu.sh` - one-GPU held-out MD-reference path evaluator.

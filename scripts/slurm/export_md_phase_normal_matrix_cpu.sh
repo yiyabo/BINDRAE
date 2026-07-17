@@ -15,6 +15,9 @@ COLLECTION_MANIFEST=${COLLECTION_MANIFEST:?COLLECTION_MANIFEST is required}
 OUTPUT_ROOT=${OUTPUT_ROOT:?OUTPUT_ROOT is required}
 PHASE_TARGET_MODE=${PHASE_TARGET_MODE:-identity}
 RESIDUAL_ENVELOPE=${RESIDUAL_ENVELOPE:-sin2}
+NORMAL_PROJECTION_MODE=${NORMAL_PROJECTION_MODE:-product}
+INDEX_OFFSET=${INDEX_OFFSET:-0}
+MATRIX_INDEX=$((SLURM_ARRAY_TASK_ID + INDEX_OFFSET))
 
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate BINDRAE-MD
@@ -26,7 +29,8 @@ export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-8}
 
 python scripts/export_md_phase_normal_matrix_entry.py \
   --collection-manifest "${COLLECTION_MANIFEST}" \
-  --index "${SLURM_ARRAY_TASK_ID}" \
+  --index "${MATRIX_INDEX}" \
   --output-root "${OUTPUT_ROOT}" \
   --phase-target-mode "${PHASE_TARGET_MODE}" \
-  --residual-envelope "${RESIDUAL_ENVELOPE}"
+  --residual-envelope "${RESIDUAL_ENVELOPE}" \
+  --normal-projection-mode "${NORMAL_PROJECTION_MODE}"

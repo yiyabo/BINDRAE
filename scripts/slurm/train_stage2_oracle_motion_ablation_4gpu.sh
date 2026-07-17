@@ -78,6 +78,10 @@ TIME_WARP_RATE_EPS="${TIME_WARP_RATE_EPS:-1e-3}"
 TIME_WARP_RATE_CLIP="${TIME_WARP_RATE_CLIP:-10.0}"
 PHASE_RESIDUAL_TAU_MODE="${PHASE_RESIDUAL_TAU_MODE:-learned}"
 PHASE_RESIDUAL_BRIDGE_MODE="${PHASE_RESIDUAL_BRIDGE_MODE:-se3_geodesic}"
+PHASE_RESIDUAL_ACTIVE_BLOCKS="${PHASE_RESIDUAL_ACTIVE_BLOCKS:-all}"
+PHASE_RESIDUAL_ROTATION_GATE_BIAS="${PHASE_RESIDUAL_ROTATION_GATE_BIAS:--2.0}"
+PHASE_RESIDUAL_TRANSLATION_GATE_BIAS="${PHASE_RESIDUAL_TRANSLATION_GATE_BIAS:--6.0}"
+PHASE_RESIDUAL_CHI_GATE_BIAS="${PHASE_RESIDUAL_CHI_GATE_BIAS:--2.0}"
 PHASE_RESIDUAL_ENVELOPE="${PHASE_RESIDUAL_ENVELOPE:-sin2}"
 PHASE_RESIDUAL_SCALE="${PHASE_RESIDUAL_SCALE:-1.0}"
 PHASE_RESIDUAL_ROTATION_METRIC_SCALE="${PHASE_RESIDUAL_ROTATION_METRIC_SCALE:-1.0}"
@@ -92,6 +96,7 @@ PHASE_RESIDUAL_PEPTIDE_RETRACTION_ANCHOR_STRENGTH="${PHASE_RESIDUAL_PEPTIDE_RETR
 PHASE_RESIDUAL_PEPTIDE_RETRACTION_MAX_TRANSLATION="${PHASE_RESIDUAL_PEPTIDE_RETRACTION_MAX_TRANSLATION:-1.0}"
 PHASE_RESIDUAL_PEPTIDE_RETRACTION_ACTIVATION_LOSS_THRESHOLD="${PHASE_RESIDUAL_PEPTIDE_RETRACTION_ACTIVATION_LOSS_THRESHOLD:-0.0}"
 INIT_FROM_CHECKPOINT="${INIT_FROM_CHECKPOINT:-}"
+INIT_FROM_CHECKPOINT_MODE="${INIT_FROM_CHECKPOINT_MODE:-strict}"
 TEACHER_RESIDUAL_CACHE_DIR="${TEACHER_RESIDUAL_CACHE_DIR:-}"
 W_TEACHER_RESIDUAL="${W_TEACHER_RESIDUAL:-0.0}"
 TEACHER_RESIDUAL_LOSS_TYPE="${TEACHER_RESIDUAL_LOSS_TYPE:-mse}"
@@ -110,10 +115,14 @@ PHASE_TEACHER_MIN_CONFIDENCE="${PHASE_TEACHER_MIN_CONFIDENCE:-0.05}"
 PHASE_TEACHER_MISSING_POLICY="${PHASE_TEACHER_MISSING_POLICY:-error}"
 PHASE_TEACHER_HEAD_ONLY="${PHASE_TEACHER_HEAD_ONLY:-0}"
 PHASE_TEACHER_RESIDUAL_HEADS_ONLY="${PHASE_TEACHER_RESIDUAL_HEADS_ONLY:-0}"
+SUPERVISION_REPLICA_MODE="${SUPERVISION_REPLICA_MODE:-cycle}"
 PHASE_NORMAL_CACHE_DIR="${PHASE_NORMAL_CACHE_DIR:-}"
 W_PHASE_NORMAL_RESIDUAL="${W_PHASE_NORMAL_RESIDUAL:-0.0}"
 PHASE_NORMAL_RESIDUAL_LOSS_TYPE="${PHASE_NORMAL_RESIDUAL_LOSS_TYPE:-huber}"
 PHASE_NORMAL_RESIDUAL_HUBER_DELTA="${PHASE_NORMAL_RESIDUAL_HUBER_DELTA:-0.25}"
+PHASE_NORMAL_RESIDUAL_MIN_CONFIDENCE="${PHASE_NORMAL_RESIDUAL_MIN_CONFIDENCE:-0.0}"
+PHASE_NORMAL_RESIDUAL_RIGID_WEIGHT="${PHASE_NORMAL_RESIDUAL_RIGID_WEIGHT:-1.0}"
+PHASE_NORMAL_RESIDUAL_CHI_WEIGHT="${PHASE_NORMAL_RESIDUAL_CHI_WEIGHT:-1.0}"
 PHASE_NORMAL_MISSING_POLICY="${PHASE_NORMAL_MISSING_POLICY:-error}"
 ESM_FUSION_ENABLED="${ESM_FUSION_ENABLED:-0}"
 ESM_NUM_LAYERS="${ESM_NUM_LAYERS:-1}"
@@ -196,7 +205,7 @@ case "$ESM_FUSION_MODE" in
     ;;
 esac
 case "$PATH_PARAMETERIZATION" in
-  flow|boundary_residual_v1|boundary_residual|projected_flow|bridge_timewarp_v1|phase_orthogonal_residual_v1) ;;
+  flow|boundary_residual_v1|boundary_residual|projected_flow|bridge_timewarp_v1|phase_orthogonal_residual_v1|phase_block_orthogonal_residual_v2) ;;
   *)
     echo "ERROR: unsupported PATH_PARAMETERIZATION=$PATH_PARAMETERIZATION"
     exit 1
@@ -204,7 +213,7 @@ case "$PATH_PARAMETERIZATION" in
 esac
 if [[ -z "$W_FM_CHI" ]]; then
   case "$PATH_PARAMETERIZATION" in
-    boundary_residual_v1|boundary_residual|bridge_timewarp_v1|phase_orthogonal_residual_v1)
+    boundary_residual_v1|boundary_residual|bridge_timewarp_v1|phase_orthogonal_residual_v1|phase_block_orthogonal_residual_v2)
       W_FM_CHI="0.1"
       ;;
     *)
@@ -214,7 +223,7 @@ if [[ -z "$W_FM_CHI" ]]; then
 fi
 if [[ -z "$W_FM_RIGID" ]]; then
   case "$PATH_PARAMETERIZATION" in
-    boundary_residual_v1|boundary_residual|bridge_timewarp_v1|phase_orthogonal_residual_v1)
+    boundary_residual_v1|boundary_residual|bridge_timewarp_v1|phase_orthogonal_residual_v1|phase_block_orthogonal_residual_v2)
       W_FM_RIGID="0.1"
       ;;
     *)
@@ -309,6 +318,17 @@ case "$PHASE_RESIDUAL_BRIDGE_MODE" in
     exit 1
     ;;
 esac
+case "$PHASE_RESIDUAL_ACTIVE_BLOCKS" in
+  all|rotation|translation|chi|rotation_translation|rotation_chi|translation_chi) ;;
+  *)
+    echo "ERROR: unsupported PHASE_RESIDUAL_ACTIVE_BLOCKS=$PHASE_RESIDUAL_ACTIVE_BLOCKS"
+    exit 1
+    ;;
+esac
+if [[ "$PATH_PARAMETERIZATION" != "phase_block_orthogonal_residual_v2" && "$PHASE_RESIDUAL_ACTIVE_BLOCKS" != "all" ]]; then
+  echo "ERROR: PHASE_RESIDUAL_ACTIVE_BLOCKS is only valid for phase_block_orthogonal_residual_v2"
+  exit 1
+fi
 case "$PHASE_RESIDUAL_ENVELOPE" in
   poly|sin2) ;;
   *)
@@ -317,6 +337,8 @@ case "$PHASE_RESIDUAL_ENVELOPE" in
     ;;
 esac
 python - <<PY
+import math
+
 residual_scale = float("$PHASE_RESIDUAL_SCALE")
 if residual_scale < 0.0:
     raise SystemExit("ERROR: PHASE_RESIDUAL_SCALE must be >= 0")
@@ -328,6 +350,13 @@ positive = {
 for name, value in positive.items():
     if value <= 0.0:
         raise SystemExit(f"ERROR: {name} must be > 0")
+gate_biases = {
+    "PHASE_RESIDUAL_ROTATION_GATE_BIAS": float("$PHASE_RESIDUAL_ROTATION_GATE_BIAS"),
+    "PHASE_RESIDUAL_TRANSLATION_GATE_BIAS": float("$PHASE_RESIDUAL_TRANSLATION_GATE_BIAS"),
+    "PHASE_RESIDUAL_CHI_GATE_BIAS": float("$PHASE_RESIDUAL_CHI_GATE_BIAS"),
+}
+if not all(math.isfinite(value) for value in gate_biases.values()):
+    raise SystemExit("ERROR: PHASE_RESIDUAL_*_GATE_BIAS values must be finite")
 if float("$PHASE_RESIDUAL_MIN_TANGENT_NORM") < 0.0:
     raise SystemExit("ERROR: PHASE_RESIDUAL_MIN_TANGENT_NORM must be >= 0")
 if float("$PHASE_RESIDUAL_MAX_METRIC_NORM") < 0.0:
@@ -352,8 +381,8 @@ for name, value in {
     if value < 0.0:
         raise SystemExit(f"ERROR: {name} must be >= 0")
 PY
-if [[ "$PATH_PARAMETERIZATION" == "phase_orthogonal_residual_v1" && "$GEOM_EVERY" != "1" ]]; then
-  echo "ERROR: phase_orthogonal_residual_v1 requires GEOM_EVERY=1"
+if [[ "$PATH_PARAMETERIZATION" =~ ^phase_(block_)?orthogonal_residual_v[12]$ && "$GEOM_EVERY" != "1" ]]; then
+  echo "ERROR: phase residual paths require GEOM_EVERY=1"
   exit 1
 fi
 case "$PHASE_NORMAL_RESIDUAL_LOSS_TYPE" in
@@ -370,17 +399,36 @@ case "$PHASE_NORMAL_MISSING_POLICY" in
     exit 1
     ;;
 esac
+case "$SUPERVISION_REPLICA_MODE" in
+  cycle|first) ;;
+  *)
+    echo "ERROR: SUPERVISION_REPLICA_MODE must be cycle or first"
+    exit 1
+    ;;
+esac
 python - <<PY
 weight = float("$W_PHASE_NORMAL_RESIDUAL")
 delta = float("$PHASE_NORMAL_RESIDUAL_HUBER_DELTA")
+min_confidence = float("$PHASE_NORMAL_RESIDUAL_MIN_CONFIDENCE")
+rigid_weight = float("$PHASE_NORMAL_RESIDUAL_RIGID_WEIGHT")
+chi_weight = float("$PHASE_NORMAL_RESIDUAL_CHI_WEIGHT")
 if weight < 0.0:
     raise SystemExit("ERROR: W_PHASE_NORMAL_RESIDUAL must be >= 0")
 if delta <= 0.0:
     raise SystemExit("ERROR: PHASE_NORMAL_RESIDUAL_HUBER_DELTA must be > 0")
+if not 0.0 <= min_confidence <= 1.0:
+    raise SystemExit("ERROR: PHASE_NORMAL_RESIDUAL_MIN_CONFIDENCE must be in [0, 1]")
+if rigid_weight < 0.0 or chi_weight < 0.0:
+    raise SystemExit("ERROR: phase-normal component weights must be >= 0")
+if weight > 0.0 and rigid_weight == 0.0 and chi_weight == 0.0:
+    raise SystemExit("ERROR: positive MD residual weight requires a positive component weight")
 if weight > 0.0 and not "$PHASE_NORMAL_CACHE_DIR":
     raise SystemExit("ERROR: positive MD residual weight requires PHASE_NORMAL_CACHE_DIR")
-if weight > 0.0 and "$PATH_PARAMETERIZATION" != "phase_orthogonal_residual_v1":
-    raise SystemExit("ERROR: MD phase-normal residual supervision requires phase_orthogonal_residual_v1")
+if weight > 0.0 and "$PATH_PARAMETERIZATION" not in {
+    "phase_orthogonal_residual_v1",
+    "phase_block_orthogonal_residual_v2",
+}:
+    raise SystemExit("ERROR: MD phase-normal residual supervision requires a phase residual path")
 PY
 case "$LIGAND_CLEARANCE_MASK_MODE" in
   pocket|node|motion_active|pocket_or_motion_active) ;;
@@ -856,7 +904,10 @@ if [[ -n "$RESUME_FROM" ]]; then
   RESUME_ARGS+=(--resume_from "$RESUME_FROM")
 fi
 if [[ -n "$INIT_FROM_CHECKPOINT" ]]; then
-  RESUME_ARGS+=(--init_from_checkpoint "$INIT_FROM_CHECKPOINT")
+  RESUME_ARGS+=(
+    --init_from_checkpoint "$INIT_FROM_CHECKPOINT"
+    --init_from_checkpoint_mode "$INIT_FROM_CHECKPOINT_MODE"
+  )
 fi
 if [[ "$AUTO_RESUME" != "1" ]]; then
   RESUME_ARGS+=(--no_auto_resume)
@@ -881,6 +932,7 @@ PHASE_TEACHER_ARGS=(
   --phase_teacher_mask_mode "$PHASE_TEACHER_MASK_MODE"
   --phase_teacher_min_confidence "$PHASE_TEACHER_MIN_CONFIDENCE"
   --phase_teacher_missing_policy "$PHASE_TEACHER_MISSING_POLICY"
+  --supervision_replica_mode "$SUPERVISION_REPLICA_MODE"
 )
 if [[ -n "$PHASE_TEACHER_CACHE_DIR" ]]; then
   PHASE_TEACHER_ARGS+=(--phase_teacher_cache_dir "$PHASE_TEACHER_CACHE_DIR")
@@ -895,6 +947,9 @@ PHASE_NORMAL_ARGS=(
   --w_phase_normal_residual "$W_PHASE_NORMAL_RESIDUAL"
   --phase_normal_residual_loss_type "$PHASE_NORMAL_RESIDUAL_LOSS_TYPE"
   --phase_normal_residual_huber_delta "$PHASE_NORMAL_RESIDUAL_HUBER_DELTA"
+  --phase_normal_residual_min_confidence "$PHASE_NORMAL_RESIDUAL_MIN_CONFIDENCE"
+  --phase_normal_residual_rigid_weight "$PHASE_NORMAL_RESIDUAL_RIGID_WEIGHT"
+  --phase_normal_residual_chi_weight "$PHASE_NORMAL_RESIDUAL_CHI_WEIGHT"
   --phase_normal_missing_policy "$PHASE_NORMAL_MISSING_POLICY"
 )
 if [[ -n "$PHASE_NORMAL_CACHE_DIR" ]]; then
@@ -972,6 +1027,8 @@ echo "timewarp eps:    $TIME_WARP_RATE_EPS"
 echo "timewarp clip:   $TIME_WARP_RATE_CLIP"
 echo "phase tau mode:  $PHASE_RESIDUAL_TAU_MODE"
 echo "phase bridge:    $PHASE_RESIDUAL_BRIDGE_MODE"
+echo "phase blocks:    $PHASE_RESIDUAL_ACTIVE_BLOCKS"
+echo "phase gates:     rot=$PHASE_RESIDUAL_ROTATION_GATE_BIAS trans=$PHASE_RESIDUAL_TRANSLATION_GATE_BIAS chi=$PHASE_RESIDUAL_CHI_GATE_BIAS"
 echo "phase envelope:  $PHASE_RESIDUAL_ENVELOPE"
 echo "phase scale:     $PHASE_RESIDUAL_SCALE"
 echo "phase metric:    rot=$PHASE_RESIDUAL_ROTATION_METRIC_SCALE trans=$PHASE_RESIDUAL_TRANSLATION_METRIC_SCALE chi=$PHASE_RESIDUAL_CHI_METRIC_SCALE"
@@ -980,6 +1037,7 @@ echo "phase max norm:  ${PHASE_RESIDUAL_MAX_METRIC_NORM:-OFF}"
 echo "phase pep retract:$PHASE_RESIDUAL_PEPTIDE_RETRACTION"
 echo "phase pep retract config: iter=$PHASE_RESIDUAL_PEPTIDE_RETRACTION_ITERATIONS relax=$PHASE_RESIDUAL_PEPTIDE_RETRACTION_RELAXATION anchor=$PHASE_RESIDUAL_PEPTIDE_RETRACTION_ANCHOR_STRENGTH max=$PHASE_RESIDUAL_PEPTIDE_RETRACTION_MAX_TRANSLATION"
 echo "init ckpt:       ${INIT_FROM_CHECKPOINT:-OFF}"
+echo "init mode:       $INIT_FROM_CHECKPOINT_MODE"
 echo "teacher cache:   ${TEACHER_RESIDUAL_CACHE_DIR:-OFF}"
 echo "w_teacher_resid: $W_TEACHER_RESIDUAL"
 echo "teacher loss:    $TEACHER_RESIDUAL_LOSS_TYPE"
@@ -993,8 +1051,11 @@ echo "w_phase_teacher: $W_PHASE_TEACHER"
 echo "phase teacher mask/conf: $PHASE_TEACHER_MASK_MODE/$PHASE_TEACHER_MIN_CONFIDENCE"
 echo "phase head only: $PHASE_TEACHER_HEAD_ONLY"
 echo "phase/resid heads only: $PHASE_TEACHER_RESIDUAL_HEADS_ONLY"
+echo "supervision replicas: $SUPERVISION_REPLICA_MODE"
 echo "phase-normal cache: ${PHASE_NORMAL_CACHE_DIR:-OFF}"
 echo "w_phase_normal_residual: $W_PHASE_NORMAL_RESIDUAL"
+echo "phase-normal train min confidence: $PHASE_NORMAL_RESIDUAL_MIN_CONFIDENCE"
+echo "phase-normal component weights: rigid=$PHASE_NORMAL_RESIDUAL_RIGID_WEIGHT chi=$PHASE_NORMAL_RESIDUAL_CHI_WEIGHT"
 echo "w_fm_chi:        $W_FM_CHI"
 echo "w_fm_rigid:      $W_FM_RIGID"
 echo "w_bg:            $W_BG"
@@ -1038,13 +1099,22 @@ echo "geom steps:      $N_GEOM_STEPS"
 echo "Save dir:        $SAVE_DIR"
 echo "Log dir:         $LOG_DIR"
 echo "GPU monitor:     ${GPU_MONITOR_LOG:-OFF}"
+if [[ "$NPROC_PER_NODE" -eq 1 ]]; then
+  TRAIN_LAUNCH=("$ENV_PREFIX/bin/python" -u scripts/train_stage2.py)
+  DISTRIBUTED_ARGS=()
+  echo "Launcher:        python (single GPU, no DDP)"
+else
+  TRAIN_LAUNCH=("$ENV_PREFIX/bin/torchrun" --standalone --nproc_per_node="$NPROC_PER_NODE" scripts/train_stage2.py)
+  DISTRIBUTED_ARGS=(--distributed)
+  echo "Launcher:        torchrun ($NPROC_PER_NODE-way DDP)"
+fi
 echo "Start:           $(date)"
 echo "=============================================="
 
 nvidia-smi --query-gpu=index,name,memory.total,memory.free --format=csv,noheader
 python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA {torch.version.cuda}, GPUs: {torch.cuda.device_count()}')"
 
-"$ENV_PREFIX/bin/torchrun" --standalone --nproc_per_node="$NPROC_PER_NODE" scripts/train_stage2.py \
+"${TRAIN_LAUNCH[@]}" \
   --data_dir processed_data/triplets \
   --batch_size "$BATCH_SIZE" \
   --val_batch_size "$VAL_BATCH_SIZE" \
@@ -1069,6 +1139,10 @@ python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA {torch.versio
   --time_warp_rate_clip "$TIME_WARP_RATE_CLIP" \
   --phase_residual_tau_mode "$PHASE_RESIDUAL_TAU_MODE" \
   --phase_residual_bridge_mode "$PHASE_RESIDUAL_BRIDGE_MODE" \
+  --phase_residual_active_blocks "$PHASE_RESIDUAL_ACTIVE_BLOCKS" \
+  --phase_residual_rotation_gate_bias "$PHASE_RESIDUAL_ROTATION_GATE_BIAS" \
+  --phase_residual_translation_gate_bias "$PHASE_RESIDUAL_TRANSLATION_GATE_BIAS" \
+  --phase_residual_chi_gate_bias "$PHASE_RESIDUAL_CHI_GATE_BIAS" \
   --phase_residual_envelope "$PHASE_RESIDUAL_ENVELOPE" \
   --phase_residual_scale "$PHASE_RESIDUAL_SCALE" \
   --phase_residual_rotation_metric_scale "$PHASE_RESIDUAL_ROTATION_METRIC_SCALE" \
@@ -1133,7 +1207,7 @@ python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA {torch.versio
   --log_dir "$LOG_DIR" \
   --device cuda \
   --amp_dtype "$AMP_DTYPE" \
-  --distributed
+  "${DISTRIBUTED_ARGS[@]}"
 
 echo ""
 echo "=============================================="

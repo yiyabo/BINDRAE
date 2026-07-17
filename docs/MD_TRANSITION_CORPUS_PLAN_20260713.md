@@ -559,3 +559,47 @@ suggest this is sufficient to exceed 100 accepted training systems, but this is
 only a planning estimate. The final corpus size is defined solely by passed
 setup, endpoint-basin, transition, atomistic, mapping, and supervision-density
 gates.
+
+## Path-4 v2 Identification Status (2026-07-18)
+
+The expanded atomistic lane produced 1,185 accepted replica targets over 283
+endpoint systems. After the blockwise phase-normal contract was enforced, the
+active inferred cache contains 1,180 replicas over 282 systems. Replica
+consensus with at least two paths per endpoint produced 266 deterministic
+system targets. Mean phase agreement is 0.9546 and mean spatial-residual
+agreement is 0.6999; both are agreement scores where higher is better. The
+current family/scaffold-disjoint consensus screen contains 208 train and 24
+validation systems.
+
+The following diagnostics separate implementation failure from generalization
+failure:
+
+1. An eight-system fixed-replica micro-overfit reduced validation rotation
+   residual loss from 0.018737 to 0.002697, an 85.6% reduction (lower is
+   better). The parameterization, projection, and gradient path can learn.
+2. Scratch training learns the phase schedule, but the validation rotation
+   residual changes by only about 0.2%, which is within run-level fluctuation.
+   Increasing the residual loss weight from 1 to 6 does not fix this.
+3. Initializing the rotation residual gate at 0.5 instead of about 0.12 reduces
+   training residual loss by 23.6%, while validation worsens by 3.9%. Gate cold
+   start is therefore not the bottleneck; opening it exposes overfitting.
+4. A frozen shared trunk initialized from the prior 64k endpoint model improves
+   validation rotation residual by 1.26%, whereas full-trunk fine-tuning gives
+   only a transient 0.63% gain. This is an upper-bound diagnostic only because
+   that checkpoint saw the current validation endpoint IDs during pretraining.
+
+The current decision is therefore to preserve the default closed residual
+gates, expand the number of independent endpoint systems, and later build a
+leakage-clean endpoint-pretrained trunk after the final MD split is frozen.
+Jobs `146385` and `146386` test residual-confidence thresholds 0.10 and 0.20;
+these retain approximately 80-84% and 63-67% of consensus supervision weight,
+respectively. Filtering applies only to optimization; every run is selected and
+reported on the same complete validation target set. They are the last
+label-filtering diagnostics before returning to data scale and clean
+pretraining.
+
+A final endpoint-pair-deduplicated lane contains 62 previously unprocessed
+systems. Context array `146368` is followed by continuation `146369`, which
+will launch five independent replicas per admitted context using the validated
+400,000 kJ/mol/nm2, 20,000-step protocol. Setup or context failures remain
+recorded data-quality outcomes and are not silently retried.

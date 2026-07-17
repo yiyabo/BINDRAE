@@ -17,6 +17,7 @@ MATRIX="${MATRIX:?Set MATRIX to replica_matrix.jsonl}"
 MATRIX_INDEX="${SLURM_ARRAY_TASK_ID:?Submit this launcher as a Slurm array}"
 PLATFORM="${PLATFORM:-CPU}"
 RESIDUAL_ENVELOPE="${RESIDUAL_ENVELOPE:-sin2}"
+NORMAL_PROJECTION_MODE="${NORMAL_PROJECTION_MODE:-product}"
 
 cd "$ROOT"
 mkdir -p logs/slurm
@@ -31,9 +32,11 @@ echo "Matrix: $MATRIX"
 echo "Matrix index: $MATRIX_INDEX"
 echo "Platform: $PLATFORM"
 echo "Residual envelope: $RESIDUAL_ENVELOPE"
+echo "Normal projection: $NORMAL_PROJECTION_MODE"
 
 python scripts/run_md_replica_pipeline.py \
   --matrix "$MATRIX" \
   --index "$MATRIX_INDEX" \
   --platform "$PLATFORM" \
-  --residual-envelope "$RESIDUAL_ENVELOPE"
+  --residual-envelope "$RESIDUAL_ENVELOPE" \
+  --normal-projection-mode "$NORMAL_PROJECTION_MODE"

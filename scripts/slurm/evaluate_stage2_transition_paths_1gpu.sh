@@ -91,7 +91,7 @@ case "$TRUST_PRECHECKED_SAMPLES" in
     ;;
 esac
 case "$PATH_PARAMETERIZATION" in
-  checkpoint|flow|projected_flow|boundary_residual_v1|boundary_residual|pure_bridge|cartesian_backbone_bridge_v1|cartesian_peptide_projected_bridge_v1|chain_internal_bridge_v1|peptide_projected_bridge_v1|pose_graph_projected_bridge_v1|bridge_timewarp_v1|phase_orthogonal_residual_v1) ;;
+  checkpoint|flow|projected_flow|boundary_residual_v1|boundary_residual|pure_bridge|cartesian_backbone_bridge_v1|cartesian_peptide_projected_bridge_v1|chain_internal_bridge_v1|peptide_projected_bridge_v1|pose_graph_projected_bridge_v1|bridge_timewarp_v1|phase_orthogonal_residual_v1|phase_block_orthogonal_residual_v2) ;;
   *)
     echo "ERROR: unsupported PATH_PARAMETERIZATION=$PATH_PARAMETERIZATION"
     exit 1
