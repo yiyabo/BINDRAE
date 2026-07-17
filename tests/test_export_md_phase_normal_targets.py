@@ -13,6 +13,7 @@ from scripts.export_md_phase_normal_targets import (
     _triple_sequence_alignment,
     contact_annotations,
     endpoint_envelope,
+    has_supervision_support,
     infer_monotone_phase,
     monotone_path_indices,
     smoothstep,
@@ -22,6 +23,23 @@ from scripts.export_md_phase_normal_targets import (
 
 
 class MdPhaseNormalTargetTest(unittest.TestCase):
+    def test_supervision_support_accepts_dense_or_large_sparse_targets(self):
+        self.assertTrue(
+            has_supervision_support(
+                density=0.06, points=32, min_density=0.05, min_points=128
+            )
+        )
+        self.assertTrue(
+            has_supervision_support(
+                density=0.02, points=128, min_density=0.05, min_points=128
+            )
+        )
+        self.assertFalse(
+            has_supervision_support(
+                density=0.02, points=127, min_density=0.05, min_points=128
+            )
+        )
+
     def test_sin2_envelope_is_c1_at_endpoints(self):
         epsilon = 1e-5
         values = np.asarray([0.0, epsilon, 0.5, 1.0 - epsilon, 1.0])

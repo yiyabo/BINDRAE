@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import subprocess
 import sys
@@ -214,7 +215,21 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
 
 def main() -> None:
     args = parse_args()
-    result = run_pipeline(args)
+    record = load_record(args.matrix, args.index)
+    lock_path = Path(record["setup_dir"]).parent / ".pipeline.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as lock_handle:
+        try:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            result = {
+                "matrix_index": args.index,
+                "status": "skipped_locked",
+                "system_sample_id": record["system_sample_id"],
+                "transition_id": record["transition_id"],
+            }
+        else:
+            result = run_pipeline(args)
     print(json.dumps(result, indent=2, sort_keys=True), flush=True)
 
 

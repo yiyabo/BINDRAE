@@ -100,12 +100,22 @@ def parse_args() -> argparse.Namespace:
             "displacement into the residual-head target."
         ),
     )
+    parser.add_argument(
+        "--normal-projection-mode",
+        choices=("product", "block"),
+        default="product",
+        help=(
+            "Project once in the joint product tangent (v1) or independently "
+            "within rotation, translation, and chi blocks (v2)."
+        ),
+    )
     parser.add_argument("--rotation-scale-rad", type=float, default=1.0)
     parser.add_argument("--translation-scale-a", type=float, default=1.0)
     parser.add_argument("--chi-scale-rad", type=float, default=1.0)
     parser.add_argument("--min-endpoint-motion-norm", type=float, default=0.5)
     parser.add_argument("--min-phase-confidence", type=float, default=0.05)
     parser.add_argument("--min-supervision-density", type=float, default=0.05)
+    parser.add_argument("--min-supervision-points", type=int, default=128)
     parser.add_argument("--min-residual-envelope", type=float, default=0.15)
     parser.add_argument("--max-normal-residual-norm", type=float, default=5.0)
     parser.add_argument("--max-mean-reconstruction-translation-a", type=float, default=0.75)
@@ -170,6 +180,17 @@ def endpoint_envelope(value: np.ndarray, kind: str = "sin2") -> np.ndarray:
     else:
         raise ValueError(f"Unsupported residual envelope: {kind}")
     return np.where((value > 0.0) & (value < 1.0), envelope, 0.0)
+
+
+def has_supervision_support(
+    *,
+    density: float,
+    points: int,
+    min_density: float,
+    min_points: int,
+) -> bool:
+    """Accept dense supervision or a sufficiently large sparse support."""
+    return density >= min_density or points >= min_points
 
 
 def temporal_moving_average(values: np.ndarray, window: int) -> np.ndarray:
@@ -706,7 +727,12 @@ def _normal_decomposition(
         "bindrae_md_phase_residual", "src/stage2/modules/phase_residual.py"
     )
     se3_module = load_geometry_module("bindrae_md_se3", "src/stage2/modules/se3.py")
-    project_product_tangent_normal = phase_module.project_product_tangent_normal
+    projection_functions = {
+        "product": phase_module.project_product_tangent_normal,
+        "block": phase_module.project_block_tangent_normal,
+    }
+    projection_mode = getattr(args, "normal_projection_mode", "product")
+    projection_fn = projection_functions[projection_mode]
     rigid_compose = se3_module.rigid_compose
     rigid_inverse = se3_module.rigid_inverse
     se3_exp = se3_module.se3_exp
@@ -778,7 +804,7 @@ def _normal_decomposition(
 
     node_t = torch.as_tensor(node_mask, dtype=torch.bool).unsqueeze(0).expand(tau.shape)
     chi_mask_t = torch.as_tensor(chi_mask, dtype=torch.bool).unsqueeze(0).expand(raw_chi.shape)
-    projection = project_product_tangent_normal(
+    projection = projection_fn(
         raw_rigid,
         raw_chi,
         bridge_tangent_rigid,
@@ -1238,11 +1264,17 @@ def export_targets(args: argparse.Namespace) -> Dict[str, Any]:
         "active_phase_support": int(active_mask.sum()) >= 5,
         "phase_confidence": median_confidence >= args.min_phase_confidence,
         "residual_support": int(residual_valid.sum()) >= 10,
-        "phase_supervision_density": (
-            confident_phase_density >= args.min_supervision_density
+        "phase_supervision_support": has_supervision_support(
+            density=confident_phase_density,
+            points=int(confident_points.sum()),
+            min_density=args.min_supervision_density,
+            min_points=args.min_supervision_points,
         ),
-        "residual_supervision_density": (
-            residual_supervision_density >= args.min_supervision_density
+        "residual_supervision_support": has_supervision_support(
+            density=residual_supervision_density,
+            points=int(residual_valid.sum()),
+            min_density=args.min_supervision_density,
+            min_points=args.min_supervision_points,
         ),
         "normal_projection": max_projected_parallel_cos <= 1e-4,
         "translation_reconstruction": (
@@ -1328,6 +1360,7 @@ def export_targets(args: argparse.Namespace) -> Dict[str, Any]:
         transition_id=np.array(args.transition_id),
         evidence_tier=np.array("silver_enhanced_sampling"),
         phase_target_mode=np.array(args.phase_target_mode),
+        normal_projection_mode=np.array(args.normal_projection_mode),
         bridge_mode=np.array("cartesian_backbone"),
         residual_envelope=np.array(args.residual_envelope),
         rotation_metric_scale=np.array(args.rotation_scale_rad, dtype=np.float32),
@@ -1375,6 +1408,7 @@ def export_targets(args: argparse.Namespace) -> Dict[str, Any]:
     audit = {
         "schema_version": SCHEMA_VERSION,
         "phase_target_mode": args.phase_target_mode,
+        "normal_projection_mode": args.normal_projection_mode,
         "residual_envelope": args.residual_envelope,
         "status": "md_phase_normal_targets_passed" if passed else "md_phase_normal_targets_failed",
         "passed": passed,
@@ -1392,6 +1426,9 @@ def export_targets(args: argparse.Namespace) -> Dict[str, Any]:
             "residual_candidate_points": residual_candidate_count,
             "phase_supervision_density": confident_phase_density,
             "residual_supervision_density": residual_supervision_density,
+            "min_supervision_density": args.min_supervision_density,
+            "min_supervision_points": args.min_supervision_points,
+            "supervision_support_gate": "density_or_count",
             "smoothing_window_frames": args.smoothing_window,
             "median_phase_confidence": median_confidence,
             "tau_identity_mae": tau_identity_mae,
@@ -1423,6 +1460,7 @@ def export_targets(args: argparse.Namespace) -> Dict[str, Any]:
                 "transition_id": args.transition_id,
                 "schema_version": SCHEMA_VERSION,
                 "phase_target_mode": args.phase_target_mode,
+                "normal_projection_mode": args.normal_projection_mode,
                 "residual_envelope": args.residual_envelope,
                 "relative_path": cache_path.name,
                 "status": audit["status"],

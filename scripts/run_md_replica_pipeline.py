@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import subprocess
 import sys
@@ -22,6 +23,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--platform", choices=["CPU", "CUDA", "OpenCL"], default="CPU")
     parser.add_argument(
         "--residual-envelope", choices=["sin2", "poly"], default="sin2"
+    )
+    parser.add_argument(
+        "--normal-projection-mode",
+        choices=["product", "block"],
+        default="product",
     )
     parser.add_argument("--force", action="store_true")
     return parser.parse_args()
@@ -192,6 +198,7 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
                 "--output-dir", str(target_dir),
                 "--sample-id", str(record["sample_id"]),
                 "--residual-envelope", args.residual_envelope,
+                "--normal-projection-mode", args.normal_projection_mode,
             ],
             target_dir / "target_audit.json",
             "md_phase_normal_targets_passed",
@@ -217,7 +224,22 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
 
 def main() -> None:
     args = parse_args()
-    result = run_pipeline(args)
+    record = load_record(args.matrix, args.index)
+    lock_path = Path(record["pull_dir"]) / ".pipeline.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as lock_handle:
+        try:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            result = {
+                "matrix_index": args.index,
+                "replica_index": record["replica_index"],
+                "sample_id": record["sample_id"],
+                "status": "skipped_locked",
+                "system_sample_id": record["system_sample_id"],
+            }
+        else:
+            result = run_pipeline(args)
     print(json.dumps(result, indent=2, sort_keys=True), flush=True)
 
 

@@ -58,6 +58,11 @@ def inspect_target(directory: Path) -> Dict[str, Any]:
             if "phase_target_mode" in data.files
             else "inferred"
         )
+        normal_projection_mode = (
+            str(data["normal_projection_mode"].item())
+            if "normal_projection_mode" in data.files
+            else "product"
+        )
         residual_envelope = (
             str(data["residual_envelope"].item())
             if "residual_envelope" in data.files
@@ -83,6 +88,7 @@ def inspect_target(directory: Path) -> Dict[str, Any]:
         "n_frames": n_frames,
         "valid_residual_points": valid_points,
         "phase_target_mode": phase_target_mode,
+        "normal_projection_mode": normal_projection_mode,
         "residual_envelope": residual_envelope,
         "metric_scales": metric_scales,
         "sha256": sha256(cache_path),
@@ -160,6 +166,14 @@ def main() -> None:
         raise ValueError(f"Mixed phase target modes: {phase_target_modes}")
     phase_target_mode = phase_target_modes[0]
     summary["phase_target_mode"] = phase_target_mode
+    normal_projection_modes = sorted(
+        {str(record["normal_projection_mode"]) for record in records}
+    )
+    if len(normal_projection_modes) != 1:
+        raise ValueError(
+            f"Mixed normal projection modes: {normal_projection_modes}"
+        )
+    summary["normal_projection_mode"] = normal_projection_modes[0]
     residual_envelopes = sorted(
         {str(record["residual_envelope"]) for record in records}
     )

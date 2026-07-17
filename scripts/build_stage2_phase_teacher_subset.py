@@ -21,6 +21,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", required=True)
     parser.add_argument("--summary", default=None)
     parser.add_argument(
+        "--candidate_list",
+        default=None,
+        help="Optional ordered sample list to intersect with usable cache entries.",
+    )
+    parser.add_argument(
         "--mask_mode",
         default="contact_event",
         choices=["contact_event", "formed_contact", "approach", "active", "pocket", "node"],
@@ -112,6 +117,26 @@ def main() -> None:
         )
         for path in sorted(cache_dir.glob("*.npz"))
     ]
+    candidate_ids = None
+    missing_candidates = []
+    if args.candidate_list:
+        candidate_path = Path(args.candidate_list)
+        candidate_ids = [
+            line.strip()
+            for line in candidate_path.read_text().splitlines()
+            if line.strip()
+        ]
+        if not candidate_ids:
+            raise ValueError(f"Candidate list is empty: {candidate_path}")
+        by_sample_id = {str(record["sample_id"]): record for record in records}
+        missing_candidates = [
+            sample_id for sample_id in candidate_ids if sample_id not in by_sample_id
+        ]
+        records = [
+            by_sample_id[sample_id]
+            for sample_id in candidate_ids
+            if sample_id in by_sample_id
+        ]
     selected = [
         record for record in records
         if int(record["supervised_points"]) >= int(args.min_supervised_points)
@@ -128,6 +153,9 @@ def main() -> None:
         "min_supervised_points": int(args.min_supervised_points),
         "samples_scanned": len(records),
         "samples_selected": len(selected),
+        "candidate_list": args.candidate_list,
+        "candidates_requested": len(candidate_ids) if candidate_ids is not None else None,
+        "candidates_missing_cache": missing_candidates,
         "selected_supervised_points": sum(int(r["supervised_points"]) for r in selected),
         "records": selected,
     }

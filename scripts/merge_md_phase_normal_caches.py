@@ -80,6 +80,11 @@ def inspect_collection(cache_dir: Path) -> List[Dict[str, Any]]:
                 if "phase_target_mode" in data.files
                 else "inferred"
             )
+            normal_projection_mode = (
+                str(data["normal_projection_mode"].item())
+                if "normal_projection_mode" in data.files
+                else "product"
+            )
             residual_envelope = (
                 str(data["residual_envelope"].item())
                 if "residual_envelope" in data.files
@@ -104,6 +109,7 @@ def inspect_collection(cache_dir: Path) -> List[Dict[str, Any]]:
             {
                 **record,
                 "phase_target_mode": phase_target_mode,
+                "normal_projection_mode": normal_projection_mode,
                 "residual_envelope": residual_envelope,
                 "metric_scales": metric_scales,
                 "source_cache_dir": str(cache_dir),
@@ -171,6 +177,13 @@ def merge_collections(input_dirs: Iterable[Path], output_dir: Path) -> Dict[str,
     )
     if len(phase_target_modes) != 1:
         raise ValueError(f"Mixed phase target modes: {phase_target_modes}")
+    normal_projection_modes = sorted(
+        {str(record["normal_projection_mode"]) for record in records}
+    )
+    if len(normal_projection_modes) != 1:
+        raise ValueError(
+            f"Mixed normal projection modes: {normal_projection_modes}"
+        )
     residual_envelopes = sorted(
         {str(record["residual_envelope"]) for record in records}
     )
@@ -238,6 +251,7 @@ def merge_collections(input_dirs: Iterable[Path], output_dir: Path) -> Dict[str,
         "base_sample_ids": base_sample_ids,
         "sample_ids": sample_ids,
         "phase_target_mode": phase_target_modes[0],
+        "normal_projection_mode": normal_projection_modes[0],
         "residual_envelope": residual_envelopes[0],
         "metric_scales": json.loads(next(iter(metric_contracts))),
     }

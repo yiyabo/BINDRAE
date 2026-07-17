@@ -29,6 +29,11 @@ def parse_args() -> argparse.Namespace:
         choices=("sin2", "poly"),
         default="sin2",
     )
+    parser.add_argument(
+        "--normal-projection-mode",
+        choices=("product", "block"),
+        default="product",
+    )
     return parser.parse_args()
 
 
@@ -101,6 +106,8 @@ def main() -> None:
         args.phase_target_mode,
         "--residual-envelope",
         args.residual_envelope,
+        "--normal-projection-mode",
+        args.normal_projection_mode,
     ]
     subprocess.run(command, cwd=PROJECT_ROOT, check=True)
     print(
@@ -110,6 +117,7 @@ def main() -> None:
                 "sample_id": replica["sample_id"],
                 "phase_target_mode": args.phase_target_mode,
                 "residual_envelope": args.residual_envelope,
+                "normal_projection_mode": args.normal_projection_mode,
                 "output_dir": str(output_dir),
             },
             sort_keys=True,

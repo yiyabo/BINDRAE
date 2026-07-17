@@ -18,7 +18,11 @@ to revive that lane.
 - `export_md_phase_normal_matrix_entry.py` - re-export one replica from a merged collection, including identity-phase targets for the residual-only matched ablation.
 - `assemble_md_phase_normal_cache.py` - assemble only passed MD target directories into an immutable multi-system training cache.
 - `merge_md_phase_normal_caches.py` - verify, deduplicate, and merge immutable MD phase-normal cache collections.
+- `analyze_md_replica_consistency.py` - quantify phase/residual reproducibility across replicas and the deterministic explained-energy ceiling before choosing a stochastic path latent.
+- `build_md_phase_normal_consensus_cache.py` - collapse repeated MD replicas
+  into confidence-weighted, support-audited deterministic system targets.
 - `split_md_phase_normal_systems.py` - create a deterministic system-disjoint train/validation split balanced over replica and supervision counts.
+- `split_md_phase_normal_groups.py` - create audited train/validation/test splits whose joint components are disjoint by protein sequence family and Bemis-Murcko ligand scaffold.
 - `audit_md_rmsd_pull.py` / `audit_md_atomistic_path.py` - path-progress and independent atomistic geometry gates for biased MD paths.
 - `build_md_context_matrix.py` / `run_md_context_pipeline.py` - immutable,
   resumable setup-to-NPT context preparation for selected MD pilot systems.
