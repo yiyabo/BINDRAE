@@ -22,6 +22,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--index", type=int, required=True)
     parser.add_argument("--platform", choices=["CPU", "CUDA", "OpenCL"], default="CPU")
     parser.add_argument(
+        "--cpu-threads",
+        type=int,
+        default=0,
+        help="OpenMM CPU Platform threads per replica; 0 keeps the default",
+    )
+    parser.add_argument(
         "--residual-envelope", choices=["sin2", "poly"], default="sin2"
     )
     parser.add_argument(
@@ -131,6 +137,7 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
         "seed": record["seed"],
         "protocol": record["protocol"],
         "residual_envelope": args.residual_envelope,
+        "cpu_threads": args.cpu_threads,
         "started_at": utc_now(),
         "stages": {},
     }
@@ -155,6 +162,8 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
     ]
     if protocol.get("resample_initial_velocities"):
         pull_command.append("--resample-initial-velocities")
+    if args.cpu_threads > 0:
+        pull_command.extend(["--cpu-threads", str(args.cpu_threads)])
 
     stages = [
         (
@@ -224,6 +233,8 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
 
 def main() -> None:
     args = parse_args()
+    if args.cpu_threads < 0:
+        raise ValueError("cpu_threads must be >= 0")
     record = load_record(args.matrix, args.index)
     lock_path = Path(record["pull_dir"]) / ".pipeline.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)

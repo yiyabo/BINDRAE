@@ -34,6 +34,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--npt-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--platform", choices=["CUDA", "OpenCL", "CPU"], default="CUDA")
+    parser.add_argument(
+        "--cpu-threads",
+        type=int,
+        default=0,
+        help="OpenMM CPU Platform threads; 0 keeps the platform default",
+    )
     parser.add_argument("--seed", type=int, default=20260713)
     parser.add_argument(
         "--resample-initial-velocities",
@@ -61,6 +67,17 @@ def kabsch_rmsd(mobile: np.ndarray, target: np.ndarray) -> float:
     rotation, translation = kabsch_transform(mobile, target)
     aligned = mobile @ rotation + translation
     return float(np.sqrt(np.mean(np.sum((aligned - target) ** 2, axis=1))))
+
+
+def platform_properties(platform_name: str, cpu_threads: int) -> Dict[str, str]:
+    if cpu_threads < 0:
+        raise ValueError("cpu_threads must be >= 0")
+    properties: Dict[str, str] = {}
+    if platform_name in {"CUDA", "OpenCL"}:
+        properties["Precision"] = "mixed"
+    elif platform_name == "CPU" and cpu_threads > 0:
+        properties["Threads"] = str(cpu_threads)
+    return properties
 
 
 def run_pull(args: argparse.Namespace) -> Dict[str, Any]:
@@ -134,9 +151,7 @@ def run_pull(args: argparse.Namespace) -> Dict[str, Any]:
     system.addForce(pull_force)
 
     platform = Platform.getPlatformByName(args.platform)
-    properties: Dict[str, str] = {}
-    if args.platform in {"CUDA", "OpenCL"}:
-        properties["Precision"] = "mixed"
+    properties = platform_properties(args.platform, args.cpu_threads)
     integrator = LangevinMiddleIntegrator(
         args.temperature_k * unit.kelvin,
         1.0 / unit.picosecond,

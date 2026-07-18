@@ -23,6 +23,15 @@ class MDGlobalRMSDPullTest(unittest.TestCase):
         transformed = points @ rotation + np.asarray([4.0, -2.0, 7.0])
         self.assertLess(MODULE.kabsch_rmsd(points, transformed), 1e-10)
 
+    def test_platform_properties_limit_cpu_threads(self):
+        self.assertEqual(MODULE.platform_properties("CPU", 1), {"Threads": "1"})
+        self.assertEqual(MODULE.platform_properties("CPU", 0), {})
+        self.assertEqual(
+            MODULE.platform_properties("CUDA", 0), {"Precision": "mixed"}
+        )
+        with self.assertRaisesRegex(ValueError, "cpu_threads must be >= 0"):
+            MODULE.platform_properties("CPU", -1)
+
 
 if __name__ == "__main__":
     unittest.main()
