@@ -43,6 +43,19 @@ Before a long 60k/full-scale Stage-2 run, submit a `PRECHECK_ONLY=1` job through
 the same launcher and cache settings. For 4-6 GPU jobs, keep Slurm `--gres` and
 `NPROC_PER_NODE` consistent; changing only one of them is an invalid setup.
 
+## Agent remote launch hygiene
+Full policy lives in the repo-root `AGENTS.md` section **Remote ops / anti false-positive cyber policy**. Scripts work must obey it.
+
+- **Edit launchers locally**, validate with `bash -n`, then batch the changed files into a small number of remote sync/submit operations. Do not use the chat agent as a Slurm watchdog.
+- Count `ssh`, `scp`, and `rsync` together; use at most 10 such calls per user
+  turn. Continue batching work even when the full allowance is available.
+- An occasional `squeue -u "$USER"` overview is allowed when the active JobID is unknown. Once known, prefer job-scoped `squeue`/`sacct` and matching `logs/slurm/...` reads.
+- After submit: capture the JobID and use a bounded initial status/log check. Waiting jobs do not need repeated interactive monitoring.
+- **Forbidden from agent loops**: `sleep`+`squeue` polling; `scontrol show nodes`; repeated `scancel`/`sbatch` churn; per-edit `rsync`/`scp`.
+- Put retries, dependency chains, and multi-step pipelines **inside** `scripts/slurm/*.sh` (or a single remote bash script), not as many interactive SSH round-trips.
+- Prefer host aliases from SSH config; do not default to `StrictHostKeyChecking=no` or raw user@IP:port in every command.
+- If a session hits `cyber_policy` / gateway `403` session block: stop remote tools, do not fork the thread, continue in a new session with local-first work.
+
 ## Editing launchers
 Keep launcher names and tags descriptive enough to recover the experiment intent from Slurm logs. When branching from checkpoints, set separate `save_dir` and `log_dir`; do not overwrite anchor runs. Match selection metrics to the scientific question, e.g. ligand-lift metrics for ligand-causality experiments rather than global rotamer accuracy.
 
@@ -51,7 +64,7 @@ If a launcher resumes from a checkpoint, record the source checkpoint path in th
 ## Validation
 Run `bash -n scripts/slurm/<script>.sh` after shell edits. Run `python -m py_compile scripts/<entry>.py` after CLI edits. For new training flags, verify the parser choices, config fields, trainer usage, and checkpoint resume semantics all agree before submitting a cluster job.
 
-After submission, verify the job reached the expected node/GPU setup and wrote metrics under the intended tag. A successful `sbatch` only proves scheduling, not model startup.
+After submission, a successful `sbatch` only proves scheduling. Prefer reading the job's `.out/.err` once it has clearly started (or when the user pastes status) over agent-side queue polling. Confirm node/GPU and metrics under the intended tag when logs exist—not via continuous `squeue` loops.
 
 For REPA runs, use `val_total_no_repa` plus endpoint/contact/path metrics for
 cross-run comparison. `val_total` includes auxiliary REPA loss, and `val_repa`

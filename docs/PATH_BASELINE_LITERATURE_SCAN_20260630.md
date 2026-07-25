@@ -57,6 +57,7 @@ These are the most defensible direct comparisons for the current paper.
 | eBDIMS | Established endpoint-conditioned coarse-grained Brownian/elastic pathway method. | Full validation set or large subset; use atomistic reconstruction/repacking if needed for side-chain metrics. |
 | eBDIMS2 | Modern optimized eBDIMS successor for large-scale transition pathways and intermediates, with code available. | Representative subset first, then scale if automation is clean. |
 | DeepPath | Closest deep-learning path generator: physics-guided/GAL, atomistic transition pathways between known states. | Must attempt reproducibility. If code/weights are usable, compare on a curated subset; otherwise report as paper-level/case-study context with access limitations. |
+| TPS-Flow | 2026 endpoint-conditioned SE(3) flow trained on MD paths, with public code, system-specific checkpoints, and data. | Reproduce its public ADK/system cases first. It enters the cross-system table only after matched retraining. |
 
 ### Tier 2: Strong Candidate Path Baselines
 
@@ -83,6 +84,19 @@ the task is explicitly changed.
 | Ligand-agnostic ensemble generators | AlphaFlow, P2DFlow, EigenFold/Str2Str-like models | Best-of-K holo/pocket coverage and ensemble validity, with ligand input difference stated explicitly. |
 
 ## Battle Cards
+
+### TPS-Flow
+
+TPS-Flow is the closest released generative transition-path implementation in
+the current scan. Its general SE(3), flow-matching, and endpoint-conditioning
+ingredients are not BINDRAE novelty claims. The direct comparison instead tests
+whether BINDRAE's endpoint-exact analytic bridge and learned phase deliver
+better cross-system path reconstruction and event ordering.
+
+The released checkpoints are system-specific (`base`, `recon_energy`, `1hpv`,
+`1brs`, and `adk`). Therefore they support a public-system case-study table but
+not inference-only evaluation on arbitrary AHoJ-DB pairs. Use
+`TPS_FLOW_REPRODUCTION_PLAN_20260719.md` as the reproduction contract.
 
 ### DeepPath
 
@@ -139,9 +153,11 @@ switches, and large induced-fit pocket changes. Report runtime honestly.
 2. Run Tier 0 controls on the exact validation split used for Stage-2 reliability.
 3. Add ANMPathway and eBDIMS on a large automated subset.
 4. Add eBDIMS2 on a representative subset, then expand if setup is stable.
-5. Audit DeepPath code/weights and run a curated subset if reproducible.
-6. Add MinActionPath2 / ICONGENI / SIDE only if automation is clean enough.
-7. Run TMD/SMD-lite or COMBAS on a 20-50 case curated physics panel.
+5. Reproduce TPS-Flow on ADK or another released public system, then decide
+   whether matched cross-system retraining is feasible.
+6. Audit DeepPath code/weights and run a curated subset if reproducible.
+7. Add MinActionPath2 / ICONGENI / SIDE only if automation is clean enough.
+8. Run TMD/SMD-lite or COMBAS on a 20-50 case curated physics panel.
 
 ## Downloaded PDFs
 
@@ -171,6 +187,8 @@ Not downloaded:
 ## Source Links To Recheck
 
 - DeepPath: https://pubs.rsc.org/en/content/articlehtml/2026/sc/d5sc08253f
+- TPS-Flow paper: https://doi.org/10.1021/acs.jcim.6c00807
+- TPS-Flow code: https://github.com/lfs119/TPS-Flow
 - eBDIMS2 paper: https://www.nature.com/articles/s41467-026-69809-y
 - eBDIMS2 code: https://github.com/domenicoscaramozzino/eBDIMS2
 - eBDIMS paper: https://www.nature.com/articles/ncomms12575

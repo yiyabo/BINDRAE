@@ -1,6 +1,6 @@
 # Current Project Status
 
-Date: 2026-07-16
+Date: 2026-07-20
 
 This is the operational source of truth for the current BINDRAE research track.
 For the method and manuscript logic, read
@@ -11,8 +11,8 @@ pilot, read `MD_TRANSITION_CORPUS_PLAN_20260713.md`.
 ## Current Objective
 
 Develop and validate an endpoint-exact, ligand-conditioned protein
-conformational path model whose main novelty is an identifiable decomposition
-between residue-wise asynchronous progress and off-bridge spatial correction.
+conformational path model whose promoted contribution is a learned,
+chain-coupled residue progress field over an analytic endpoint bridge.
 
 The current paper setting is:
 
@@ -25,24 +25,29 @@ It is not docking, apo-only holo prediction, or physical MD generation.
 
 ## Active Method
 
-Validated endpoint-corpus baseline:
+Frozen deterministic conference candidate:
 
 ```text
-PATH_PARAMETERIZATION=phase_orthogonal_residual_v1
-PHASE_RESIDUAL_TAU_MODE=identity
+PATH_PARAMETERIZATION=phase_block_orthogonal_residual_v2
+PHASE_WARP_VARIANT=chain_nonmonotone
+PHASE_CHAIN_RESIDUAL_SCALE=1.0
+PHASE_CHAIN_SMOOTHING_STEPS=1
 PHASE_RESIDUAL_BRIDGE_MODE=cartesian_backbone
 ```
 
-Research candidate retained for ground-truth path supervision:
+This candidate was selected on validation and evaluated once on the audited
+strict30 test. The deterministic normal-residual branch remains implemented as
+a matched negative result; it is not part of the promoted model.
 
-```text
-PHASE_RESIDUAL_TAU_MODE=learned
-Asynchronous Phase-Normal Bridge (APNB)
-```
-
-The learned-phase claim is currently unvalidated and must not be presented as
-an endpoint-only result. The normal-residual decomposition remains implemented;
-its scientific value must be judged against the synchronous Cartesian bridge.
+The preferred validation-time inference stabilization is an endpoint-fixed
+`cummax` projection of the learned phase. Across three seeds on the frozen
+30-system validation split it removes all predicted phase backtracking and all
+non-monotone residue traces. Product RMSE changes by only `-0.000089` in the
+lower-is-better convention (95% CI `[-0.000654, 0.001173]`), while phase tau MAE
+worsens by `0.000204`. This is a stability constraint, not evidence for physical
+kinetics. It was selected after the one-time strict30 evaluation and therefore
+must not be used to replace the already reported strict30 headline numbers; it
+requires a fresh independent holdout before promotion to the final test protocol.
 
 The path is
 
@@ -52,22 +57,123 @@ X_i(t)=
 \left[b(t)\Delta_i^\perp(t)\right].
 \]
 
+For the promoted phase-only candidate, `Delta_i^perp(t)=0`; the full expression
+is retained to define the residual-only and full negative ablations.
+
 Implemented properties:
 
 - exact apo/holo endpoints;
-- monotone learned residue phase;
+- endpoint-fixed learned residue phase with peptide-chain coupling;
 - tangent-normal residual projection on `SE(3) x T^k`;
 - explicit rotation/translation/chi metric scales;
 - dedicated zero-initialized residual heads;
 - residual magnitude, temporal, neighbor, and background controls;
 - atom14 endpoint-consistent FK decoding;
-- evaluator support for deterministic component ablations.
+- evaluator support for deterministic component ablations;
 - Cartesian `N/CA/C` endpoint bridge with locally differentiated tangents;
 - reproducible `se3_geodesic` reference-bridge ablation.
 - `sin^2(pi t)` residual envelope as the main contract, giving both zero
   displacement and zero residual slope at the two endpoints;
 - immutable MD-target cache contracts that record phase mode, residual
   envelope, and rotation/translation/chi metric scales.
+
+### Controlled identifiability benchmark (2026-07-20)
+
+`scripts/run_controlled_manifold_benchmark.py` instantiates the four-model
+decomposition on synthetic `SE(3) x T^2` paths with exact endpoints, known
+monotone residue phase, metric-normal detours, and known obstacle geometry.
+Every endpoint-conditioned input has two exactly opposite route modes. The
+benchmark compares a route-observed condition, where a one-bit route cue is
+available, with a route-hidden condition, where both modes have identical
+inputs and the deterministic conditional-mean residual is exactly zero.
+
+The three-seed run (`147041`; 256 endpoint pairs / 512 paths for training,
+64 / 128 for validation, and 128 / 256 for test) gives:
+
+| Route condition | Method | Product RMSE ↓ | Event-order accuracy ↑ | Predicted residual RMS | Collision fraction ↓ |
+|---|---|---:|---:|---:|---:|
+| observed | synchronous | 0.636607 | 0.5000 | 0.0000 | 1.0000 |
+| observed | warp-only | 0.616695 | 0.9962 | 0.0000 | 1.0000 |
+| observed | residual-only | 0.158134 | 0.5000 | 0.6207 | 0.0000 |
+| observed | full phase + normal | **0.007543** | **0.9963** | 0.6208 | **0.0000** |
+| hidden | warp-only | **0.616695** | **0.9962** | 0.0000 | 1.0000 |
+| hidden | residual-only | 0.636608 | 0.5000 | 0.0011 | 1.0000 |
+| hidden | full phase + normal | 0.616697 | 0.9961 | 0.0014 | 1.0000 |
+
+Endpoint maximum error is `2.38e-7` and the maximum tangent-normal dot product
+is `4.58e-7` in every arm. This result proves the parameterization is expressive
+and the two components are complementary when route-identifying information is
+present. It also reproduces the protein-corpus failure mechanism under exact
+control: when route information is hidden, the deterministic residual collapses
+to zero and the full model becomes warp-only. This is an identifiability result,
+not evidence that the protein model has recovered physical transition routes.
+
+### Inference-time peptide retraction screen (2026-07-20)
+
+The existing endpoint-preserving translation retraction was exposed as an
+explicit inference override and tested without retraining. Its default settings
+reduce the single-system maximum peptide-bond error from `0.989 A` to `0.532 A`,
+but worsen bond violation fraction from `0.0343` to `0.2468` and Product RMSE
+from `0.8657` to `0.9246`; they are rejected.
+
+On six validation systems, a conservative `2 iterations / relaxation 0.25 /
+anchor 0.10 / cap 0.25 A / activation threshold 0.01` setting is the only
+configuration that jointly lowers mean and maximum bond error, bond/angle
+violation fractions, and clash summaries. Its matched check on six systems and
+24 MD replicas also passed the predeclared 1% Product-RMSE non-inferiority
+margin. Product RMSE changed from `0.993737` to `0.993170` (lower is better;
+candidate improvement `+0.000567`, 95% CI `[+0.000024, +0.001194]`), while
+translation MAE changed from `0.693550 A` to `0.694028 A` (candidate improvement
+`-0.000478 A`, 95% CI `[-0.001567, +0.000252]`) and remained non-inferior. The
+other evaluated phase and event metrics were unchanged. This is a small
+validation-only result selected after the one-time strict30 evaluation; the
+setting remains an optional inference-time validity layer until it passes a
+fresh independent holdout.
+
+### Path-4 optimizer pivot (2026-07-20)
+
+The long-term Path-4 branch is no longer defined as direct deterministic
+regression from endpoint-derived features to one MD normal residual. A prior
+same-replica OpenMM-force upper-bound diagnostic found no transferable alignment
+between instantaneous generalized force and the silver normal residual: the
+30-system rigid relative-MSE reduction was `-0.000731`, mean cosine was
+`-0.01910`, and positive alignment was `0.4765`. This closes direct
+force-to-residual regression, not path-level physical optimization.
+
+The existing surrogate physical-normal optimizer has been extended with paired
+global route seeds, global-frame-consistent chain smoothing, tail-aware frame
+aggregation, backtracking descent acceptance, strict Path-3 fallback, and
+objective-call diagnostics. Five focused physical-path tests and 22 related
+evaluator/export tests pass remotely. Surrogate CUDA smoke job `147108` was
+cancelled before allocation and provides no evidence. CPU engineering smoke
+job `147139` completed the single-training-system Path-3 export and OpenMM
+scorer path, but did not exercise the OpenMM optimizer, CUDA, or Gate-0 cohort.
+
+The subsequent one-system optimizer/scorer audit found and closed a paired
+evaluation defect: candidate-specific warm starts changed endpoint energies,
+while direct per-frame resets created pathological hidden-atom nonbonded
+states. The active scorer now requires a frozen Path-3 all-atom frame-reference
+cache with per-frame force preflight and exact cache/endpoint contract checks.
+The direct CUDA engineering run on `3zw1-E-FUC-3` completed with zero paired
+endpoint-energy differences. The optimized candidate improved raw p95/max
+excess energy by `26.43%`/`37.03%` across all 19 interior frames. Its original
+relaxed `81.37%`/`96.92%` headline was dominated by one non-valid Path-3 frame
+at `t=0.25` (`18588.31 kJ/mol/nm` maximum residue-net force). Scorer v5 now
+freezes a `500 kJ/mol/nm` relaxed-frame threshold, and paired summary v2 uses
+only the intersection of valid frames while reporting failure incidence. A
+direct CUDA v5/v2 rescore
+(`path4_gate0_relaxed_validity_3zw1-E-FUC-3_direct_gpu33_20260721_183700_v1`)
+completed with `18/19` paired-valid frames: relaxed p95 is `4.26%` worse,
+relaxed maximum is `4.45%` better, invalid incidence is `1/19 -> 0/19`, and
+valid-frame residue-force p95 is `14.20%` worse. Raw p95/max improvements remain
+`26.43%`/`37.03%`. This validates the scorer contract on one old training
+system, not Gate-0 efficacy; the next step is a small diverse development panel
+before freezing the 40-60-system cohort.
+
+This scaffold remains a surrogate screen, not a validated OpenMM optimizer or a
+learned Path-4 result. The next scientific gate is a non-learned, multi-start
+physical necessity audit on 40-60 fresh systems before any 1,000-system data
+campaign or unrolled neural optimizer. See `PATH4_OPTIMIZER_GATE0_20260720.md`.
 
 ## What Has Been Validated
 
@@ -401,6 +507,89 @@ current deterministic anchor. Full APNB remains an implemented hypothesis and
 must not be presented as validated until more MD training systems and a
 controlled residual retest make it beat phase-only on independent path and
 geometry metrics.
+
+### Frozen-corpus deterministic residual decision (2026-07-19)
+
+The silver corpus now contains 326 systems and 1,340 accepted replicas. Its
+family/scaffold-disjoint consensus split has 241 train, 30 validation, and 32
+untouched test systems. The from-scratch ten-epoch screen confirms warp-only as
+the deterministic anchor: system-macro Product RMSE is 1.305897 versus 1.405388
+for the synchronous Cartesian bridge (lower is better).
+
+A same-system leave-one-replica-out consensus oracle reduces residual MSE by
+43.29%, proving that a shared deterministic residual exists within systems.
+However, a route-mode oracle is worse than consensus. The consensus target is
+also strongly low-rank: rank four explains 92.49% of median training residual
+energy and 93.67% on validation. These findings justified one graph-coupled
+rank-four residual test, not an open-ended architecture sweep.
+
+The rank-four implementation passed CPU, CUDA, and end-to-end trainer smokes,
+but did not generalize. In residual-only training, validation loss worsened
+from 0.3865 to 0.4394 while training loss fell. Rank-four full reaches Product
+RMSE 1.310484, which is worse than warp-only; its paired improvement is
+`-0.00459` with 95% CI `[-0.03484, 0.02522]`. Rotation and chi are
+significantly worse. A small contact-event coverage increase does not transfer
+to aggregate path quality.
+
+The deterministic normal residual is therefore frozen as a reproducible
+negative result. Do not sweep residual rank, gate bias, learning rate, or trunk
+initialization on this split. The controlled observed/hidden-route benchmark
+confirms that inference-time route information can recover the intended full
+decomposition, while hidden routes collapse to the deterministic mean. Reopen
+Path-4 only with such route-identifying conditioning or a substantially larger
+disjoint corpus that establishes a positive endpoint-conditioned learning
+curve. A stochastic latent remains future work and requires new evidence
+that route modes beat deterministic consensus. At this decision point the
+32-system test split was still untouched; the audited one-time strict30
+evaluation is recorded below.
+
+### Phase-specificity control and frozen strict test (2026-07-20)
+
+The matched phase screen is complete. It compared global monotone,
+residue-wise monotone, residue-wise endpoint-fixed non-monotone, and a
+chain-coupled endpoint-fixed non-monotone warp with the same trunk, head budget,
+MD supervision, split, and optimization protocol. Validation selected the
+chain-coupled non-monotone variant with unit scale and one graph-smoothing step.
+This is the frozen deterministic candidate; it should be described as a
+chain-coupled residue phase field, not as recovered physical kinetics.
+
+The original 32-system test manifest was audited before headline reporting.
+Two systems had incomplete production coordinate masks despite matching
+residue-identity hashes: `6y6n-A-ODQ-501` had no valid production nodes and
+`7k8h-C-9F2-302` had 261/265 valid nodes. The immutable benchmark is therefore
+the remaining 30 systems, for which production-loader and endpoint-cache
+coordinates agree exactly. The exclusions and generated manifest are recorded
+by `scripts/audit_stage2_md_reference_subset.py`.
+
+On this strict 30-system test, the three-seed chain candidate has system-macro
+Product RMSE `0.956221`, translation MAE `0.518536 A`, phase tau MAE `0.255128`,
+and pair-order accuracy `0.573426`. The global-monotone row has Product RMSE
+`1.046872` and translation MAE `0.524586 A`; the independent non-monotone row
+has `0.991824` and `0.535634 A`. The chain candidate has the best point
+estimates for path geometry, but its paired confidence intervals against both
+learned controls cross zero. It is also worse than the independent
+non-monotone control on tau MAE and pair ordering. Therefore the test supports
+learned endpoint-fixed temporal correction, but does not establish physical
+timing recovery or a statistically decisive chain-coupling gain.
+
+The external strict-test benchmark uses the same MD references and reports
+C-alpha/frame-origin translation error as the primary common metric. Analytic
+and ANM baselines now consume the canonical Stage-2 endpoint caches rather than
+raw PDB coordinates, and missing-system coverage is explicit. The complete
+table and paired intervals are tracked in
+`MD_REFERENCE_STRICT30_BENCHMARK_20260720.md`.
+
+Against endpoint-completed external paths, the chain model significantly beats
+smoothstep, ANM20, AdaptiveANM50, and eBDIMS2 on translation path error. The
+eBDIMS2 comparison is `+1.937439 A` improvement on 29 shared systems with 95%
+paired CI `[0.154900, 5.396881]`. The linear-morph mean is worse, but its
+interval crosses zero because of system-level heterogeneity. Pair-order
+accuracy is significantly better than all five external baselines.
+
+TPS-Flow reproduction is tracked separately in
+`docs/TPS_FLOW_REPRODUCTION_PLAN_20260719.md`. Its released system-specific
+checkpoints are eligible for a public-system case-study table, not automatic
+inference-only evaluation on the frozen 326-system corpus.
 
 ## Repository Posture
 

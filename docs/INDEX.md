@@ -6,19 +6,37 @@ operational truth.
 
 ## Start Here
 
-1. `BINDRAE_CONFERENCE_METHOD_BLUEPRINT_20260710.md`
+1. `PROJECT_HANDOFF_20260725.md`
+   - Current active lanes, frozen decisions, live AHoJ acquisition artifact,
+     safe ownership boundaries, and the next delegable tasks.
+2. `BINDRAE_CONFERENCE_METHOD_BLUEPRINT_20260710.md`
    - Canonical method definition, theory, deterministic architecture,
      stochastic multipath extension, evaluation program, and conference story.
-2. `CURRENT_PROJECT_STATUS_20260710.md`
+3. `CURRENT_PROJECT_STATUS_20260710.md`
    - Implemented state, smoke evidence, current data jobs, scientific claim
      boundary, and immediate execution order.
-3. `STAGE2_COMPARISON_METRICS_AND_BASELINES_20260701.md`
+4. `STAGE2_COMPARISON_METRICS_AND_BASELINES_20260701.md`
    - Metric definitions and internal/external comparison-table structure.
+5. `MD_REFERENCE_STRICT30_BENCHMARK_20260720.md`
+   - Frozen strict-test contract, selected phase model, external C-alpha
+     baselines, paired intervals, and reviewer-safe claim boundary.
+6. `CONTROLLED_MANIFOLD_BENCHMARK_20260720.md`
+   - Three-seed `SE(3) x T^2` phase-normal identifiability benchmark with
+     observed versus hidden route information and the Path-4 reopening rule.
+7. `PATH4_OPTIMIZER_GATE0_20260720.md`
+   - Long-term Path-4 pivot from direct residual regression to multi-start,
+     endpoint-exact physical path optimization, including the force diagnostic,
+     optimizer scaffold, and predeclared Gate-0 stop criteria.
+8. `PATH3_FINAL_EXPERIMENT_CONTRACT_20260725.md`
+   - Frozen higher-budget Path-3 training, ablation, external-baseline, metric,
+     test-reuse, and fresh-holdout contract for completing the paper evidence.
 
 ## Active Scientific References
 
 - `PATH_BASELINE_LITERATURE_SCAN_20260630.md`
   - Endpoint-conditioned path-method literature and reproduction notes.
+- `TPS_FLOW_REPRODUCTION_PLAN_20260719.md`
+  - Pinned release audit and fair public-system versus cross-system comparison contract.
 - `COMPETITOR_DATASETS_METRICS_20260624.md`
   - Adjacent model, dataset, and metric map. Use as background, not as the
     current task definition.
@@ -41,9 +59,12 @@ operational truth.
 
 ```text
 known apo/holo endpoints + aligned ligand
-  -> monotone residue phase + normal-space manifold residual
+  -> learned chain-coupled endpoint-fixed residue phase over an analytic bridge
   -> endpoint-exact atom14 conformational path
 ```
+
+The deterministic normal residual remains an implemented, reproducible
+negative ablation. It is not part of the current promoted deterministic model.
 
 The model produces path proposals, not physical MD trajectories. The proposed
 stochastic latent extension is documented but not yet implemented.
