@@ -3,6 +3,201 @@
 from typing import Dict, Optional
 
 import torch
+import torch.nn.functional as F
+
+
+PHASE_WARP_VARIANTS = {
+    "residue_monotone",
+    "global_monotone",
+    "global_chain_monotone",
+    "chain_nonmonotone",
+    "residue_nonmonotone",
+}
+
+
+def _smooth_chain_values(
+    values: torch.Tensor,
+    node_mask: torch.Tensor,
+    peptide_bond_mask: torch.Tensor,
+    steps: int,
+) -> torch.Tensor:
+    """Average residue values over valid peptide-chain neighbors."""
+    if peptide_bond_mask.shape != (
+        node_mask.shape[0],
+        max(node_mask.shape[1] - 1, 0),
+    ):
+        raise ValueError(
+            "peptide_bond_mask must have shape [batch, residues - 1]"
+        )
+    valid = node_mask.bool()
+    edge = peptide_bond_mask.bool()
+    if valid.shape[1] > 1:
+        edge = edge & valid[:, :-1] & valid[:, 1:]
+    mask = valid.to(dtype=values.dtype).unsqueeze(0)
+    result = values * mask
+    for _ in range(int(steps)):
+        total = result * mask
+        degree = mask.expand_as(result).clone()
+        if result.shape[-1] > 1:
+            edge_f = edge.to(dtype=result.dtype).unsqueeze(0)
+            total[..., :-1] = total[..., :-1] + result[..., 1:] * edge_f
+            total[..., 1:] = total[..., 1:] + result[..., :-1] * edge_f
+            degree[..., :-1] = degree[..., :-1] + edge_f
+            degree[..., 1:] = degree[..., 1:] + edge_f
+        result = torch.where(
+            mask.bool(),
+            total / degree.clamp_min(1.0),
+            torch.zeros_like(total),
+        )
+    return result
+
+
+def phase_tau_from_logits(
+    logits: torch.Tensor,
+    node_mask: torch.Tensor,
+    *,
+    variant: str = "residue_monotone",
+    logit_scale: float = 1.0,
+    rate_eps: float = 1e-3,
+    rate_clip: float = 10.0,
+    nonmonotone_max_offset: float = 0.5,
+    peptide_bond_mask: Optional[torch.Tensor] = None,
+    chain_residual_scale: float = 1.0,
+    chain_smoothing_steps: int = 2,
+) -> Dict[str, torch.Tensor]:
+    """Convert matched per-residue logits into endpoint-fixed phase values.
+
+    All variants consume the same ``[steps, batch, residues]`` logits. The
+    global control averages valid residue logits before applying the same
+    monotone construction. The chain-coupled controls add centered residue
+    corrections after peptide-neighbor smoothing. The non-monotone controls
+    predict bounded direct offsets from the uniform time grid, so they change
+    the inductive bias without adding parameters.
+    """
+    if logits.ndim != 3:
+        raise ValueError(
+            "phase logits must have shape [steps, batch, residues], got "
+            f"{tuple(logits.shape)}"
+        )
+    if node_mask.shape != logits.shape[1:]:
+        raise ValueError(
+            "node_mask must match the batch/residue dimensions of phase logits"
+        )
+    if variant not in PHASE_WARP_VARIANTS:
+        raise ValueError(f"Unsupported phase warp variant: {variant}")
+    if float(logit_scale) <= 0.0:
+        raise ValueError("logit_scale must be > 0")
+    if float(rate_eps) <= 0.0:
+        raise ValueError("rate_eps must be > 0")
+    if float(rate_clip) < 0.0:
+        raise ValueError("rate_clip must be >= 0")
+    if not 0.0 < float(nonmonotone_max_offset) <= 1.0:
+        raise ValueError("nonmonotone_max_offset must be in (0, 1]")
+    if float(chain_residual_scale) < 0.0:
+        raise ValueError("chain_residual_scale must be >= 0")
+    if int(chain_smoothing_steps) < 0:
+        raise ValueError("chain_smoothing_steps must be >= 0")
+
+    node_mask = node_mask.bool()
+    mask_f = node_mask.to(dtype=logits.dtype)
+    effective_logits = logits
+    if variant in {"global_monotone", "global_chain_monotone"}:
+        denominator = mask_f.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        global_logits = (logits * mask_f.unsqueeze(0)).sum(
+            dim=-1, keepdim=True
+        ) / denominator.unsqueeze(0)
+        effective_logits = global_logits.expand_as(logits)
+        if variant == "global_chain_monotone":
+            if peptide_bond_mask is None:
+                raise ValueError(
+                    "global_chain_monotone requires peptide_bond_mask"
+                )
+            residue_logits = _smooth_chain_values(
+                logits - effective_logits,
+                node_mask,
+                peptide_bond_mask,
+                int(chain_smoothing_steps),
+            )
+            residue_mean = (residue_logits * mask_f.unsqueeze(0)).sum(
+                dim=-1, keepdim=True
+            ) / denominator.unsqueeze(0)
+            residue_logits = (residue_logits - residue_mean) * mask_f.unsqueeze(0)
+            effective_logits = effective_logits + float(
+                chain_residual_scale
+            ) * torch.tanh(residue_logits)
+    elif variant == "chain_nonmonotone":
+        if peptide_bond_mask is None:
+            raise ValueError("chain_nonmonotone requires peptide_bond_mask")
+        denominator = mask_f.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        global_logits = (logits * mask_f.unsqueeze(0)).sum(
+            dim=-1, keepdim=True
+        ) / denominator.unsqueeze(0)
+        residue_logits = _smooth_chain_values(
+            logits - global_logits,
+            node_mask,
+            peptide_bond_mask,
+            int(chain_smoothing_steps),
+        )
+        residue_mean = (residue_logits * mask_f.unsqueeze(0)).sum(
+            dim=-1, keepdim=True
+        ) / denominator.unsqueeze(0)
+        residue_logits = (residue_logits - residue_mean) * mask_f.unsqueeze(0)
+        effective_logits = global_logits + float(
+            chain_residual_scale
+        ) * residue_logits
+
+    if variant in {
+        "residue_monotone",
+        "global_monotone",
+        "global_chain_monotone",
+    }:
+        rates = F.softplus(effective_logits * float(logit_scale)) + float(rate_eps)
+        if float(rate_clip) > 0.0:
+            rates = rates.clamp(max=float(rate_clip))
+        rates = torch.where(node_mask.unsqueeze(0), rates, torch.ones_like(rates))
+        cumulative = torch.cumsum(rates, dim=0)
+        total_rate = cumulative[-1].clamp_min(float(rate_eps))
+        tau = torch.cat(
+            [
+                torch.zeros_like(cumulative[:1]),
+                (cumulative / total_rate.unsqueeze(0)).clamp(0.0, 1.0),
+            ],
+            dim=0,
+        )
+        return {
+            "tau": tau,
+            "interval_rate": rates,
+            "effective_logits": effective_logits,
+        }
+
+    n_steps = logits.shape[0]
+    grid = torch.linspace(
+        0.0,
+        1.0,
+        steps=n_steps + 1,
+        device=logits.device,
+        dtype=logits.dtype,
+    ).view(n_steps + 1, 1, 1)
+    interior_grid = grid[1:]
+    envelope = torch.sin(torch.pi * interior_grid)
+    offsets = (
+        float(nonmonotone_max_offset)
+        * envelope
+        * torch.tanh(effective_logits * float(logit_scale))
+    )
+    predicted = (interior_grid + offsets).clamp(0.0, 1.0)
+    predicted = torch.cat(
+        [predicted[:-1], torch.ones_like(predicted[-1:])], dim=0
+    )
+    tau = torch.cat([torch.zeros_like(predicted[:1]), predicted], dim=0)
+    identity_tau = grid.expand_as(tau)
+    tau = torch.where(node_mask.unsqueeze(0), tau, identity_tau)
+    interval_rate = (tau[1:] - tau[:-1]) * float(n_steps)
+    return {
+        "tau": tau,
+        "interval_rate": interval_rate,
+        "effective_logits": effective_logits,
+    }
 
 
 def endpoint_zero_envelope(t: torch.Tensor, kind: str = "sin2") -> torch.Tensor:

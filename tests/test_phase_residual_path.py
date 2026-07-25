@@ -99,6 +99,8 @@ class PhaseResidualPathTest(unittest.TestCase):
         trainer.config = SimpleNamespace(
             n_integration_steps=4,
             phase_residual_tau_mode=tau_mode,
+            phase_warp_variant="residue_monotone",
+            phase_nonmonotone_max_offset=0.5,
             phase_residual_bridge_mode="se3_geodesic",
             time_warp_logit_scale=1.0,
             time_warp_rate_eps=1e-3,

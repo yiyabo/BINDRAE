@@ -1,6 +1,6 @@
 # BINDRAE Conference Method Blueprint
 
-Date: 2026-07-16
+Date: 2026-07-20
 
 Status: canonical method document for the current conference-oriented research
 track. It separates implemented components, near-term experiments, and proposed
@@ -8,10 +8,10 @@ extensions. Historical plans must not override this document.
 
 ## Working Title
 
-**Endpoint-Exact Asynchronous Phase-Normal Bridges for Protein Conformational
-Path Learning**
+**Endpoint-Exact Residue-Phase Bridges for Protein Conformational Path
+Reconstruction**
 
-Working method name: **BINDRAE-APNB** (Asynchronous Phase-Normal Bridge).
+Working method name: **BINDRAE-PhaseBridge**.
 
 The name is provisional. The method definition, rather than the acronym, is the
 stable contract.
@@ -19,9 +19,8 @@ stable contract.
 ## One-Sentence Method
 
 Given known apo and holo endpoints and an aligned ligand pose, BINDRAE learns an
-endpoint-exact conformational path on a product manifold by decomposing motion
-into a monotone residue-wise phase field and a controlled normal-space spatial
-residual.
+endpoint-exact conformational path on a product manifold by learning a
+chain-coupled residue progress field over an analytic endpoint bridge.
 
 ## Scope And Claim Boundary
 
@@ -64,11 +63,14 @@ It must never be described as deployable apo-only inference.
 ### Claims we may make
 
 - Endpoint-exact conformational path reconstruction.
-- Learned asynchronous residue progress.
-- Learned off-bridge geometric correction.
+- Learned endpoint-fixed residue-wise temporal correction.
+- Chain-coupled path progress over a geometry-preserving endpoint bridge.
 - Fast path proposals that can be compared with MD ensembles and used to
   initialize downstream physical sampling.
-- Ligand-aware pocket/contact transition modeling.
+- Ligand-aware pocket/contact transition reconstruction.
+
+The deterministic normal-space residual is a matched negative ablation, not a
+promoted component of the conference model.
 
 ### Claims we must not make
 
@@ -232,8 +234,11 @@ first and final states.
 - The endpoint envelope controls **where in path time** spatial freedom is
   available.
 
-This is the main identifiable decomposition that must be validated by the
-paper's four-model experiment.
+This is the intended decomposition. The controlled benchmark validates it when
+route-identifying information is supplied; the protein-corpus four-model screen
+shows that endpoint-derived conditioning does not currently identify the normal
+route. The paper must report both sides rather than calling the protein
+decomposition validated.
 
 ## Protein-Specific Network Instantiation
 
@@ -511,6 +516,16 @@ Primary metrics:
 - endpoint error: lower is better;
 - decomposition recovery: higher is better.
 
+The first implementation is complete. It uses synthetic `SE(3) x T^2` paths
+with exactly opposite normal-route pairs under identical endpoints. With an
+observed route cue, the full phase-normal model reaches Product RMSE `0.00754`
+versus `0.63661` for the synchronous bridge, recovers event order at `0.9963`,
+and reduces the obstacle collision fraction from `1.0` to `0.0`. When the route
+cue is hidden, the learned residual RMS collapses to `0.00144` and full becomes
+numerically equivalent to warp-only (`0.61670` versus `0.61670`). This validates
+the method's expressivity and identifies its conditioning requirement; it does
+not rescue deterministic Path-4 under endpoint-only protein conditioning.
+
 ### Track B: AHoJ-DB endpoint-conditioned benchmark
 
 Use strict train/validation/test separation, with protein-family and ligand-
@@ -610,38 +625,41 @@ ablations must test the proposed path decomposition.
 ## Main Contributions For A Conference Paper
 
 1. A general endpoint-exact path parameterization on product manifolds.
-2. An identifiable decomposition into monotone asynchronous phase and
-   normal-space spatial correction.
-3. A ligand-conditioned protein instantiation on residue `SE(3)` frames and chi
+2. A learned chain-coupled residue progress field that separates endpoint
+   correctness from asynchronous path scheduling without claiming physical
+   time.
+3. A controlled phase-normal identifiability study showing that off-bridge
+   correction is learnable when route information is supplied and collapses to
+   the deterministic mean when it is hidden.
+4. A ligand-conditioned protein instantiation on residue `SE(3)` frames and chi
    tori with atom14 decoding.
-4. A stochastic extension that preserves exact endpoints for every sampled
-   path and targets transition-ensemble coverage.
-5. Evaluation across controlled manifold tasks, large apo/holo pairs, held-out
-   MD transitions, and external physical/downstream tests.
+5. Evaluation across controlled manifold tasks, broad apo/holo pairs, held-out
+   MD transitions, external path baselines, and independent physical checks.
 
-The stochastic extension becomes a claimed contribution only after it is
-implemented and validated. Until then it is an explicit next method stage, not
-part of the reported model.
+The normal residual is a controlled-method component and a negative protein
+ablation, not a validated protein-model contribution. The stochastic extension
+becomes a claimed contribution only after it is implemented and validated; it
+is currently future work and not part of the reported model.
 
 ## Draft Abstract
 
 Protein conformational transitions are often studied from paired endpoint
-structures, yet standard morphing methods constrain all residues to synchronous
-endpoint interpolation while unconstrained learned flows do not guarantee
-arrival at the target state. We introduce an endpoint-exact asynchronous
-phase-normal bridge for conformational path learning on product manifolds. The
-method represents each residue using an `SE(3)` frame and side-chain torsions,
-learns a monotone residue-wise phase that controls progress along an analytic
-apo-to-holo bridge, and predicts a metric-orthogonal spatial residual for
-off-bridge detours. An endpoint-zero envelope guarantees exact boundary states,
-while the tangent-normal decomposition prevents the phase and residual branches
-from duplicating the same first-order motion. We instantiate the framework with
+structures, yet standard morphing methods impose one synchronous progress
+schedule on all residues while unconstrained learned flows do not guarantee
+arrival at the target state. We introduce an endpoint-exact residue-phase bridge
+for conformational path reconstruction on product manifolds. The method
+represents each residue using an `SE(3)` frame and side-chain torsions and learns
+a chain-coupled, endpoint-fixed progress field over an analytic apo-to-holo
+bridge. This separates guaranteed boundary geometry from learned heterochronic
+path progress without claiming physical time. We instantiate the framework with
 ligand-conditioned geometric attention and atom14 forward kinematics for
-protein-ligand induced-fit paths. [RESULT SENTENCE.] On held-out molecular-
-dynamics transitions, [RESULT SENTENCE], while external physical evaluation
-shows [RESULT SENTENCE]. These results position the method as a fast path
-proposal mechanism for interpreting and accelerating endpoint-conditioned
-conformational sampling rather than as a replacement for molecular dynamics.
+protein-ligand induced-fit paths. A matched phase-normal study further shows
+that deterministic off-bridge residuals do not improve held-out reconstruction
+under endpoint-derived conditioning. [RESULT SENTENCE.] On held-out molecular-
+dynamics references, [RESULT SENTENCE], while external path baselines show
+[RESULT SENTENCE]. These results position the method as a fast path proposal
+mechanism for endpoint-conditioned conformational sampling rather than as a
+replacement for molecular dynamics.
 
 ## Falsification Criteria
 
@@ -656,9 +674,14 @@ The method claim should be weakened or abandoned if any of the following hold:
 - stochastic samples are diverse but have poor ensemble precision or validity;
 - results disappear under protein-family or ligand-scaffold splits.
 
+The first criterion is now triggered for the deterministic normal-residual
+branch: neither the independent nor graph-coupled rank-four full model
+reliably beats warp-only on the frozen validation split. The residual is not a
+conference-version headline component.
+
 ## Implementation Status
 
-| Component | Status on 2026-07-10 |
+| Component | Status on 2026-07-20 |
 |---|---|
 | Deterministic phase-normal parameterization | Implemented |
 | Monotone normalized phase rates | Implemented |
@@ -672,31 +695,41 @@ The method claim should be weakened or abandoned if any of the following hold:
 | Independent SE(3) reference-bridge ablation | Implemented |
 | Endpoint-only four-model screen | Completed; phase collapsed and full matched residual-only |
 | Confidence-weighted free-flow phase pseudo-teacher | Tested; learnable but failed matched path evaluation |
-| Canonical full OracleMotion train cache | Re-export pending |
-| Controlled manifold benchmark | Not implemented |
-| Independent MD benchmark | 23-system silver pilot complete; six-system held-out capacity screen validates phase but not the normal residual; gold benchmark planned |
-| Global stochastic path latent | Proposed, not implemented |
+| Canonical 303-system OracleMotion cache | Re-exported and production-loader validated |
+| Controlled manifold benchmark | Implemented and three-seed tested; full succeeds with an observed route cue and collapses to warp-only when the route is hidden |
+| Independent MD benchmark | 326 systems / 1,340 replicas; frozen 241/30/32 family-scaffold split; audited strict30 test completed |
+| Replica oracle ladder | Completed; deterministic consensus helps, route-mode oracle does not |
+| Graph-coupled rank-four residual | Implemented and matched-tested; overfits and is worse than warp-only on key path metrics |
+| Global stochastic path latent | Proposed, not implemented, and not currently justified by route-mode evidence |
 | Multi-path ensemble objective | Proposed, not implemented |
 | Stage-1 replacement for OracleMotion | Future paper track |
 
 ## Execution Order
 
-1. Use MD-supervised phase-only as the current deterministic anchor; retain the
-   synchronous bridge and residual-only model as matched ablations.
-2. Expand MD supervision from 17 training systems toward at least 100 systems
-   under protein-family and ligand-scaffold separation.
-3. Diagnose normal-target coverage and retest the residual branch with
-   predeclared learning-rate, branch-weight, and magnitude-control settings;
-   do not tune against the final gold benchmark.
-4. Promote full APNB only if it beats phase-only and residual-only on held-out
-   path errors, event order, and independent physical validity.
-5. Run the controlled manifold benchmark and external gold MD benchmark.
-6. Implement the global stochastic path latent only after deterministic
-   component identification succeeds.
-7. Fine-tune stochastic APNB on MD path ensembles and evaluate coverage versus
-   precision.
-8. Run full AHoJ-DB training, external physics, and downstream acceleration.
-9. Write the method-first conference paper.
+1. Freeze the validation-selected chain-coupled endpoint-fixed non-monotone
+   phase model as the deterministic candidate; retain global monotone,
+   independent non-monotone, synchronous, residual-only, and full models as
+   matched controls.
+2. Treat the phase-specificity screen and strict30 MD-reference test as
+   completed. Report the chain model's geometry point gain together with the
+   non-significant paired interval and its tau/order tradeoff. The common-axis
+   linear, smoothstep, ANM, AdaptiveANM, and eBDIMS2 comparison is complete.
+3. Do not continue deterministic residual rank, gate, learning-rate, or trunk
+   sweeps on the current 241-system training set.
+4. Controlled manifold benchmark: completed; retain the observed/hidden-route
+   contrast as the method identifiability experiment. Continue independent
+   physical validation.
+5. Use the audited strict30 test exactly once; do not restore the two systems
+   that fail the production-coordinate contract or tune on strict30 outcomes.
+6. Reopen Path-4 only after adding inference-time information that can identify
+   an off-bridge route, or after a substantially larger disjoint corpus shows a
+   positive endpoint-conditioned residual learning curve. The controlled
+   benchmark establishes that additional residual capacity alone is not enough.
+7. Implement a stochastic global path latent only if a larger replica corpus
+   shows route-mode oracle benefit over deterministic consensus.
+8. Run downstream MD-initialization or flexible-docking acceleration studies.
+9. Write the method-first conference paper with bounded path-reconstruction,
+   not kinetics, claims.
 
 ## Venue Posture
 

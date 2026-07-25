@@ -94,6 +94,37 @@ def parse_args():
     parser.add_argument('--phase_residual_tau_mode', type=str, default='learned',
                         choices=['learned', 'identity'],
                         help='Use learned residue phase or synchronous identity phase')
+    parser.add_argument(
+        '--phase_warp_variant',
+        type=str,
+        default='residue_monotone',
+        choices=[
+            'residue_monotone',
+            'global_monotone',
+            'global_chain_monotone',
+            'chain_nonmonotone',
+            'residue_nonmonotone',
+        ],
+        help='Parameter-matched phase constraint used for specificity controls',
+    )
+    parser.add_argument(
+        '--phase_nonmonotone_max_offset',
+        type=float,
+        default=0.5,
+        help='Maximum endpoint-zero direct phase offset for the non-monotone control',
+    )
+    parser.add_argument(
+        '--phase_chain_residual_scale',
+        type=float,
+        default=1.0,
+        help='Bound on the centered residue log-rate correction around the global phase',
+    )
+    parser.add_argument(
+        '--phase_chain_smoothing_steps',
+        type=int,
+        default=2,
+        help='Number of peptide-chain averaging steps for coupled phase corrections',
+    )
     parser.add_argument('--phase_residual_bridge_mode', type=str,
                         default='se3_geodesic',
                         choices=['se3_geodesic', 'cartesian_backbone'],
@@ -112,6 +143,19 @@ def parse_args():
             'translation_chi',
         ],
         help='Active spatial residual blocks for the v2 blockwise path',
+    )
+    parser.add_argument(
+        '--phase_residual_decoder_mode',
+        type=str,
+        default='independent',
+        choices=['independent', 'low_rank'],
+        help='Independent per-residue heads or graph-coupled low-rank residual',
+    )
+    parser.add_argument(
+        '--phase_residual_rank',
+        type=int,
+        default=4,
+        help='Spatial basis rank for the low-rank residual decoder',
     )
     parser.add_argument('--phase_residual_rotation_gate_bias', type=float, default=-2.0,
                         help='Initial logit bias for the v2 rotation residual gate')
@@ -144,8 +188,8 @@ def parse_args():
     parser.add_argument('--init_from_checkpoint', type=str, default=None,
                         help='Warm-start model weights only; does not restore optimizer, scheduler, or epoch')
     parser.add_argument('--init_from_checkpoint_mode', type=str, default='strict',
-                        choices=['strict', 'shared_trunk'],
-                        help='strict loads an identical model; shared_trunk resets phase/residual heads')
+                        choices=['strict', 'shared_trunk', 'phase_warp'],
+                        help='strict loads all weights; shared_trunk resets phase/residual heads; phase_warp preserves phase and resets residual heads')
     parser.add_argument('--teacher_residual_cache_dir', type=str, default=None,
                         help='Optional cache of free-flow teacher residuals relative to the apo-holo bridge')
     parser.add_argument('--w_teacher_residual', type=float, default=0.0,
@@ -191,6 +235,8 @@ def parse_args():
                         help='Freeze all parameters except time_warp_head for a phase learnability diagnostic')
     parser.add_argument('--phase_teacher_residual_heads_only', action='store_true',
                         help='Freeze the shared trunk and train only phase/residual heads')
+    parser.add_argument('--phase_residual_heads_only', action='store_true',
+                        help='Freeze the trunk and learned phase; train only spatial residual heads')
     parser.add_argument('--supervision_replica_mode', type=str, default='cycle',
                         choices=['cycle', 'first'],
                         help='Cycle MD replicas by epoch or pin the first replica for diagnostics')
@@ -203,6 +249,14 @@ def parse_args():
     parser.add_argument('--phase_normal_residual_huber_delta', type=float, default=0.25)
     parser.add_argument('--phase_normal_residual_min_confidence', type=float, default=0.0,
                         help='Ignore low-confidence MD residuals in training only; validation remains complete')
+    parser.add_argument('--phase_normal_residual_weight_mode', type=str, default='uniform',
+                        choices=['uniform', 'target_magnitude', 'applied_path',
+                                 'applied_path_magnitude'],
+                        help='Training-only weighting for sparse physical residual targets')
+    parser.add_argument('--phase_normal_residual_magnitude_scale', type=float, default=0.05,
+                        help='Target metric norm that saturates magnitude weighting')
+    parser.add_argument('--phase_normal_residual_magnitude_boost', type=float, default=0.0,
+                        help='Maximum additive training weight for large residual targets')
     parser.add_argument('--phase_normal_residual_rigid_weight', type=float, default=1.0,
                         help='Relative weight of the six-component rigid residual loss')
     parser.add_argument('--phase_normal_residual_chi_weight', type=float, default=1.0,
@@ -472,8 +526,14 @@ def main():
         time_warp_rate_eps=args.time_warp_rate_eps,
         time_warp_rate_clip=args.time_warp_rate_clip,
         phase_residual_tau_mode=args.phase_residual_tau_mode,
+        phase_warp_variant=args.phase_warp_variant,
+        phase_nonmonotone_max_offset=args.phase_nonmonotone_max_offset,
+        phase_chain_residual_scale=args.phase_chain_residual_scale,
+        phase_chain_smoothing_steps=args.phase_chain_smoothing_steps,
         phase_residual_bridge_mode=args.phase_residual_bridge_mode,
         phase_residual_active_blocks=args.phase_residual_active_blocks,
+        phase_residual_decoder_mode=args.phase_residual_decoder_mode,
+        phase_residual_rank=args.phase_residual_rank,
         phase_residual_rotation_gate_bias=args.phase_residual_rotation_gate_bias,
         phase_residual_translation_gate_bias=args.phase_residual_translation_gate_bias,
         phase_residual_chi_gate_bias=args.phase_residual_chi_gate_bias,
@@ -510,12 +570,16 @@ def main():
         phase_teacher_missing_policy=args.phase_teacher_missing_policy,
         phase_teacher_head_only=args.phase_teacher_head_only,
         phase_teacher_residual_heads_only=args.phase_teacher_residual_heads_only,
+        phase_residual_heads_only=args.phase_residual_heads_only,
         supervision_replica_mode=args.supervision_replica_mode,
         phase_normal_cache_dir=args.phase_normal_cache_dir,
         w_phase_normal_residual=args.w_phase_normal_residual,
         phase_normal_residual_loss_type=args.phase_normal_residual_loss_type,
         phase_normal_residual_huber_delta=args.phase_normal_residual_huber_delta,
         phase_normal_residual_min_confidence=args.phase_normal_residual_min_confidence,
+        phase_normal_residual_weight_mode=args.phase_normal_residual_weight_mode,
+        phase_normal_residual_magnitude_scale=args.phase_normal_residual_magnitude_scale,
+        phase_normal_residual_magnitude_boost=args.phase_normal_residual_magnitude_boost,
         phase_normal_residual_rigid_weight=args.phase_normal_residual_rigid_weight,
         phase_normal_residual_chi_weight=args.phase_normal_residual_chi_weight,
         phase_normal_missing_policy=args.phase_normal_missing_policy,
@@ -696,8 +760,17 @@ def main():
     print(f"  - time_warp_rate_eps: {config.time_warp_rate_eps}")
     print(f"  - time_warp_rate_clip: {config.time_warp_rate_clip}")
     print(f"  - phase_residual_tau_mode: {config.phase_residual_tau_mode}")
+    print(f"  - phase_warp_variant: {config.phase_warp_variant}")
+    print(
+        "  - phase_nonmonotone_max_offset: "
+        f"{config.phase_nonmonotone_max_offset}"
+    )
+    print(f"  - phase_chain_residual_scale: {config.phase_chain_residual_scale}")
+    print(f"  - phase_chain_smoothing_steps: {config.phase_chain_smoothing_steps}")
     print(f"  - phase_residual_bridge_mode: {config.phase_residual_bridge_mode}")
     print(f"  - phase_residual_active_blocks: {config.phase_residual_active_blocks}")
+    print(f"  - phase_residual_decoder_mode: {config.phase_residual_decoder_mode}")
+    print(f"  - phase_residual_rank: {config.phase_residual_rank}")
     print(
         "  - phase_residual_gate_biases: "
         f"rot={config.phase_residual_rotation_gate_bias} "
@@ -720,11 +793,13 @@ def main():
     print(f"  - w_phase_teacher: {config.w_phase_teacher}")
     print(f"  - phase_teacher_head_only: {config.phase_teacher_head_only}")
     print(f"  - phase_teacher_residual_heads_only: {config.phase_teacher_residual_heads_only}")
+    print(f"  - phase_residual_heads_only: {config.phase_residual_heads_only}")
     print(f"  - supervision_replica_mode: {config.supervision_replica_mode}")
     print(f"  - phase_normal_cache_dir: {config.phase_normal_cache_dir or 'OFF'}")
     print(f"  - w_phase_normal_residual: {config.w_phase_normal_residual}")
     print(f"  - phase_normal_residual_loss_type: {config.phase_normal_residual_loss_type}")
     print(f"  - phase_normal_residual_train_min_confidence: {config.phase_normal_residual_min_confidence}")
+    print(f"  - phase_normal_residual_train_weighting: mode={config.phase_normal_residual_weight_mode} scale={config.phase_normal_residual_magnitude_scale} boost={config.phase_normal_residual_magnitude_boost}")
     print(f"  - phase_normal_residual_component_weights: rigid={config.phase_normal_residual_rigid_weight} chi={config.phase_normal_residual_chi_weight}")
     print(f"  - phase_normal_missing_policy: {config.phase_normal_missing_policy}")
     print(f"  - teacher_residual_loss_type: {config.teacher_residual_loss_type}")

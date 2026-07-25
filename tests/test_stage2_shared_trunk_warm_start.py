@@ -2,7 +2,10 @@ import unittest
 
 import torch
 
-from src.stage2.training.trainer import _select_shared_trunk_warm_start_state
+from src.stage2.training.trainer import (
+    _select_phase_warp_warm_start_state,
+    _select_shared_trunk_warm_start_state,
+)
 
 
 class Stage2SharedTrunkWarmStartTest(unittest.TestCase):
@@ -41,6 +44,28 @@ class Stage2SharedTrunkWarmStartTest(unittest.TestCase):
                 {"encoder.weight": torch.zeros(3, 2)},
                 {"encoder.weight": torch.zeros(2, 3)},
             )
+
+    def test_phase_warp_mode_preserves_phase_and_resets_residual(self):
+        source = {
+            "encoder.weight": torch.ones(2, 3),
+            "time_warp_head.0.weight": torch.ones(1, 3),
+            "residual_translation_head.0.weight": torch.ones(1, 3),
+        }
+        target = {
+            "encoder.weight": torch.zeros(2, 3),
+            "time_warp_head.0.weight": torch.zeros(1, 3),
+            "residual_translation_head.0.weight": torch.zeros(1, 3),
+        }
+        selected, reset_target, ignored_source = (
+            _select_phase_warp_warm_start_state(source, target)
+        )
+        self.assertEqual(
+            set(selected), {"encoder.weight", "time_warp_head.0.weight"}
+        )
+        self.assertEqual(
+            reset_target, ["residual_translation_head.0.weight"]
+        )
+        self.assertEqual(ignored_source, [])
 
 
 if __name__ == "__main__":

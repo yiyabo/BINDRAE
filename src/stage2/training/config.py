@@ -118,10 +118,19 @@ class TrainingConfig:
     time_warp_rate_eps: float = 1e-3
     time_warp_rate_clip: float = 10.0
     phase_residual_tau_mode: str = "learned"  # learned | identity
+    # Parameter-matched phase controls used to test whether residue-specific
+    # monotonicity, rather than generic time-correction capacity, is useful.
+    phase_warp_variant: str = "residue_monotone"
+    phase_nonmonotone_max_offset: float = 0.5
+    phase_chain_residual_scale: float = 1.0
+    phase_chain_smoothing_steps: int = 2
     phase_residual_bridge_mode: str = "se3_geodesic"  # se3_geodesic | cartesian_backbone
     # all | rotation | translation | chi | rotation_translation |
     # rotation_chi | translation_chi (v2 only)
     phase_residual_active_blocks: str = "all"
+    # independent | low_rank. The low-rank decoder is only valid for v2.
+    phase_residual_decoder_mode: str = "independent"
+    phase_residual_rank: int = 4
     phase_residual_rotation_gate_bias: float = -2.0
     phase_residual_translation_gate_bias: float = -6.0
     phase_residual_chi_gate_bias: float = -2.0
@@ -140,7 +149,9 @@ class TrainingConfig:
     phase_residual_peptide_retraction_max_translation: float = 1.0
     phase_residual_peptide_retraction_activation_loss_threshold: float = 0.0
     init_from_checkpoint: Optional[str] = None
-    init_from_checkpoint_mode: str = "strict"  # strict | shared_trunk
+    # strict | shared_trunk | phase_warp. phase_warp preserves the learned
+    # phase/trunk while resetting only spatial residual heads.
+    init_from_checkpoint_mode: str = "strict"
 
     # Boundary-residual teacher distillation. The cache stores free-flow
     # teacher residuals relative to the apo-holo bridge at interior times.
@@ -167,6 +178,7 @@ class TrainingConfig:
     phase_teacher_missing_policy: str = "error"  # error | skip
     phase_teacher_head_only: bool = False
     phase_teacher_residual_heads_only: bool = False
+    phase_residual_heads_only: bool = False
     # cycle exposes each MD replica across epochs; first is a deterministic
     # diagnostic used to separate optimization failure from path multimodality.
     supervision_replica_mode: str = "cycle"  # cycle | first
@@ -181,6 +193,13 @@ class TrainingConfig:
     # Applied only while optimizing; validation keeps the complete target set
     # so confidence-threshold screens remain directly comparable.
     phase_normal_residual_min_confidence: float = 0.0
+    # Physical teacher corrections are sparse. Optional target-magnitude
+    # weighting is training-only; validation remains on the uniform metric.
+    # applied_path multiplies by the squared endpoint envelope so the loss is
+    # proportional to error in the correction actually applied to the path.
+    phase_normal_residual_weight_mode: str = "uniform"  # uniform | target_magnitude | applied_path | applied_path_magnitude
+    phase_normal_residual_magnitude_scale: float = 0.05
+    phase_normal_residual_magnitude_boost: float = 0.0
     # The rigid target has six components while chi is averaged over valid
     # torsions. Use rigid=6, chi=1 to match the product-path metric; defaults
     # preserve the historical objective for controlled comparisons.

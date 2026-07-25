@@ -8,9 +8,12 @@ import torch.nn as nn
 from flash_ipa.rigid import Rigid, Rotation
 
 from scripts.evaluate_stage2_transition_paths import (
+    build_arg_parser,
     build_rigids_from_backbone,
     construct_path,
     phase_orthogonal_residual_path,
+    postprocess_phase_tau_values,
+    resolve_path_parameterization,
 )
 
 
@@ -50,6 +53,33 @@ def _rigid(translations):
 
 
 class PhaseResidualEvaluatorTest(unittest.TestCase):
+    def test_cummax_phase_projection_preserves_endpoints(self):
+        tau = [
+            torch.tensor([[0.0, 0.0]]),
+            torch.tensor([[0.4, 0.2]]),
+            torch.tensor([[0.3, 0.6]]),
+            torch.tensor([[1.0, 1.0]]),
+        ]
+        projected = torch.stack(postprocess_phase_tau_values(tau, "cummax"))
+        self.assertTrue(bool((projected[1:] >= projected[:-1]).all()))
+        torch.testing.assert_close(projected[0], torch.zeros_like(projected[0]))
+        torch.testing.assert_close(projected[-1], torch.ones_like(projected[-1]))
+        self.assertAlmostEqual(float(projected[2, 0, 0]), 0.4)
+
+    def test_parser_accepts_per_sample_metrics_flag(self):
+        args = build_arg_parser().parse_args(
+            ["--checkpoint", "dummy.pt", "--include_per_sample_metrics"]
+        )
+        self.assertTrue(args.include_per_sample_metrics)
+
+    def test_resolve_physical_normal_path_mode(self):
+        args = SimpleNamespace(path_parameterization="phase_physical_normal_v1")
+        config = SimpleNamespace(path_parameterization="flow")
+        self.assertEqual(
+            resolve_path_parameterization(args, config),
+            "phase_physical_normal_v1",
+        )
+
     def test_construct_path_replays_checkpoint_peptide_retraction(self):
         rigids_apo = _rigid(torch.zeros(1, 2, 3))
         rigids_holo = _rigid(torch.ones(1, 2, 3))
@@ -147,6 +177,8 @@ class PhaseResidualEvaluatorTest(unittest.TestCase):
             interaction_prior=None,
             esm_gate_context=None,
             tau_mode="identity",
+            warp_variant="residue_monotone",
+            nonmonotone_max_offset=0.5,
             bridge_mode="se3_geodesic",
             logit_scale=1.0,
             rate_eps=1e-3,
@@ -208,6 +240,8 @@ class PhaseResidualEvaluatorTest(unittest.TestCase):
             interaction_prior=None,
             esm_gate_context=None,
             tau_mode="identity",
+            warp_variant="residue_monotone",
+            nonmonotone_max_offset=0.5,
             bridge_mode="cartesian_backbone",
             logit_scale=1.0,
             rate_eps=1e-3,

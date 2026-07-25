@@ -4,12 +4,238 @@ import torch
 
 from src.stage2.modules.phase_residual import (
     endpoint_zero_envelope,
+    phase_tau_from_logits,
     project_block_tangent_normal,
     project_product_tangent_normal,
 )
 
 
 class PhaseResidualProjectionTest(unittest.TestCase):
+    def test_zero_logits_recover_identity_monotone_phase(self):
+        logits = torch.zeros(4, 2, 3)
+        node_mask = torch.tensor([[True, True, True], [True, True, False]])
+        peptide_bond_mask = torch.tensor([[True, True], [True, False]])
+        expected = torch.linspace(0.0, 1.0, 5).view(5, 1, 1)
+        for variant in (
+            "residue_monotone",
+            "global_monotone",
+            "global_chain_monotone",
+            "chain_nonmonotone",
+        ):
+            result = phase_tau_from_logits(
+                logits,
+                node_mask,
+                variant=variant,
+                peptide_bond_mask=peptide_bond_mask,
+            )
+            torch.testing.assert_close(
+                result["tau"], expected.expand_as(result["tau"])
+            )
+
+    def test_chain_monotone_is_endpoint_fixed_and_monotone(self):
+        torch.manual_seed(23)
+        logits = torch.randn(5, 2, 4)
+        node_mask = torch.tensor(
+            [[True, True, True, True], [True, True, True, False]]
+        )
+        peptide_bond_mask = torch.tensor(
+            [[True, True, True], [True, True, False]]
+        )
+        tau = phase_tau_from_logits(
+            logits,
+            node_mask,
+            variant="global_chain_monotone",
+            peptide_bond_mask=peptide_bond_mask,
+        )["tau"]
+        self.assertTrue(torch.equal(tau[0], torch.zeros_like(tau[0])))
+        self.assertTrue(torch.equal(tau[-1], torch.ones_like(tau[-1])))
+        self.assertTrue((torch.diff(tau, dim=0) >= 0.0).all().item())
+
+    def test_zero_chain_scale_exactly_recovers_global_monotone(self):
+        torch.manual_seed(29)
+        logits = torch.randn(5, 2, 4)
+        node_mask = torch.tensor(
+            [[True, True, True, True], [True, True, True, False]]
+        )
+        global_result = phase_tau_from_logits(
+            logits,
+            node_mask,
+            variant="global_monotone",
+        )
+        chain_result = phase_tau_from_logits(
+            logits,
+            node_mask,
+            variant="global_chain_monotone",
+            peptide_bond_mask=torch.tensor(
+                [[True, True, True], [True, True, False]]
+            ),
+            chain_residual_scale=0.0,
+        )
+        torch.testing.assert_close(chain_result["tau"], global_result["tau"])
+        torch.testing.assert_close(
+            chain_result["interval_rate"], global_result["interval_rate"]
+        )
+
+    def test_chain_smoothing_reduces_neighbor_phase_discontinuity(self):
+        alternating = torch.tensor(
+            [
+                [-4.0, 4.0, -4.0, 4.0, -4.0],
+                [4.0, -4.0, 4.0, -4.0, 4.0],
+                [-4.0, 4.0, -4.0, 4.0, -4.0],
+                [4.0, -4.0, 4.0, -4.0, 4.0],
+            ]
+        ).unsqueeze(1)
+        node_mask = torch.ones(1, 5, dtype=torch.bool)
+        peptide_bond_mask = torch.ones(1, 4, dtype=torch.bool)
+        unsmoothed = phase_tau_from_logits(
+            alternating,
+            node_mask,
+            variant="global_chain_monotone",
+            peptide_bond_mask=peptide_bond_mask,
+            chain_smoothing_steps=0,
+        )["tau"]
+        smoothed = phase_tau_from_logits(
+            alternating,
+            node_mask,
+            variant="global_chain_monotone",
+            peptide_bond_mask=peptide_bond_mask,
+            chain_smoothing_steps=2,
+        )["tau"]
+        unsmoothed_jump = torch.diff(unsmoothed[1:-1, 0], dim=-1).abs().mean()
+        smoothed_jump = torch.diff(smoothed[1:-1, 0], dim=-1).abs().mean()
+        self.assertLess(smoothed_jump.item(), unsmoothed_jump.item())
+
+    def test_chain_monotone_has_finite_gradients(self):
+        logits = torch.randn(4, 2, 3, requires_grad=True)
+        result = phase_tau_from_logits(
+            logits,
+            torch.ones(2, 3, dtype=torch.bool),
+            variant="global_chain_monotone",
+            peptide_bond_mask=torch.ones(2, 2, dtype=torch.bool),
+        )
+        result["tau"][1:-1].square().mean().backward()
+        self.assertTrue(torch.isfinite(logits.grad).all().item())
+
+    def test_global_monotone_uses_one_phase_per_system(self):
+        logits = torch.tensor(
+            [
+                [[-2.0, 1.0, 3.0], [2.0, -4.0, 100.0]],
+                [[3.0, -1.0, 0.0], [-2.0, 5.0, -100.0]],
+                [[0.0, 4.0, -2.0], [1.0, 1.0, 100.0]],
+            ]
+        )
+        node_mask = torch.tensor([[True, True, True], [True, True, False]])
+        tau = phase_tau_from_logits(
+            logits,
+            node_mask,
+            variant="global_monotone",
+        )["tau"]
+        torch.testing.assert_close(tau[:, 0, 0], tau[:, 0, 2])
+        torch.testing.assert_close(tau[:, 1, 0], tau[:, 1, 1])
+        torch.testing.assert_close(
+            tau[:, 1, 2], torch.linspace(0.0, 1.0, 4)
+        )
+
+    def test_nonmonotone_control_is_endpoint_fixed_but_can_backtrack(self):
+        logits = torch.tensor([5.0, -5.0, 5.0, 0.0]).view(4, 1, 1)
+        result = phase_tau_from_logits(
+            logits,
+            torch.ones(1, 1, dtype=torch.bool),
+            variant="residue_nonmonotone",
+            nonmonotone_max_offset=0.5,
+        )
+        tau = result["tau"][:, 0, 0]
+        self.assertEqual(tau[0].item(), 0.0)
+        self.assertEqual(tau[-1].item(), 1.0)
+        self.assertTrue((torch.diff(tau) < 0.0).any().item())
+
+    def test_chain_nonmonotone_is_endpoint_fixed_but_can_backtrack(self):
+        logits = torch.tensor([5.0, -5.0, 5.0, 0.0]).view(4, 1, 1)
+        result = phase_tau_from_logits(
+            logits,
+            torch.ones(1, 1, dtype=torch.bool),
+            variant="chain_nonmonotone",
+            nonmonotone_max_offset=0.5,
+            peptide_bond_mask=torch.ones(1, 0, dtype=torch.bool),
+        )
+        tau = result["tau"][:, 0, 0]
+        self.assertEqual(tau[0].item(), 0.0)
+        self.assertEqual(tau[-1].item(), 1.0)
+        self.assertTrue((torch.diff(tau) < 0.0).any().item())
+
+    def test_chain_nonmonotone_steps_zero_recovers_residue_nonmonotone(self):
+        torch.manual_seed(31)
+        logits = torch.randn(4, 2, 4)
+        node_mask = torch.tensor(
+            [[True, True, True, True], [True, True, True, False]]
+        )
+        residue_result = phase_tau_from_logits(
+            logits,
+            node_mask,
+            variant="residue_nonmonotone",
+        )
+        chain_result = phase_tau_from_logits(
+            logits,
+            node_mask,
+            variant="chain_nonmonotone",
+            peptide_bond_mask=torch.tensor(
+                [[True, True, True], [True, True, False]]
+            ),
+            chain_residual_scale=1.0,
+            chain_smoothing_steps=0,
+        )
+        torch.testing.assert_close(chain_result["tau"], residue_result["tau"])
+        torch.testing.assert_close(
+            chain_result["interval_rate"], residue_result["interval_rate"]
+        )
+
+    def test_chain_nonmonotone_smoothing_reduces_neighbor_phase_jumps(self):
+        logits = torch.tensor(
+            [
+                [-4.0, 4.0, -4.0, 4.0, -4.0],
+                [4.0, -4.0, 4.0, -4.0, 4.0],
+                [-4.0, 4.0, -4.0, 4.0, -4.0],
+                [4.0, -4.0, 4.0, -4.0, 4.0],
+            ]
+        ).unsqueeze(1)
+        node_mask = torch.ones(1, 5, dtype=torch.bool)
+        residue_tau = phase_tau_from_logits(
+            logits,
+            node_mask,
+            variant="residue_nonmonotone",
+        )["tau"]
+        chain_tau = phase_tau_from_logits(
+            logits,
+            node_mask,
+            variant="chain_nonmonotone",
+            peptide_bond_mask=torch.ones(1, 4, dtype=torch.bool),
+            chain_smoothing_steps=2,
+        )["tau"]
+        residue_jump = torch.diff(residue_tau[1:-1, 0], dim=-1).abs().mean()
+        chain_jump = torch.diff(chain_tau[1:-1, 0], dim=-1).abs().mean()
+        self.assertLess(chain_jump.item(), residue_jump.item())
+
+    def test_chain_nonmonotone_has_finite_gradients(self):
+        logits = torch.randn(4, 2, 3, requires_grad=True)
+        result = phase_tau_from_logits(
+            logits,
+            torch.ones(2, 3, dtype=torch.bool),
+            variant="chain_nonmonotone",
+            peptide_bond_mask=torch.ones(2, 2, dtype=torch.bool),
+        )
+        result["tau"][1:-1].square().mean().backward()
+        self.assertTrue(torch.isfinite(logits.grad).all().item())
+
+    def test_phase_controls_have_finite_gradients(self):
+        logits = torch.randn(4, 2, 3, requires_grad=True)
+        result = phase_tau_from_logits(
+            logits,
+            torch.ones(2, 3, dtype=torch.bool),
+            variant="residue_nonmonotone",
+        )
+        result["tau"][1:-1].square().mean().backward()
+        self.assertTrue(torch.isfinite(logits.grad).all().item())
+
     def test_endpoint_envelope_is_exact(self):
         t = torch.tensor([0.0, 0.25, 0.5, 0.75, 1.0])
         envelope = endpoint_zero_envelope(t)

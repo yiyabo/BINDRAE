@@ -32,6 +32,7 @@ conda activate BINDRAE
 
 CHECKPOINT="${CHECKPOINT:?CHECKPOINT is required}"
 TAG="${TAG:-$(basename "$(dirname "$CHECKPOINT")")_traj_reliability_$(date +%Y%m%d_%H%M%S)}"
+SPLIT="${SPLIT:-val}"
 STAGE1V2_MODE="${STAGE1V2_MODE:-}"
 STAGE1V2_CACHE_DIR="${STAGE1V2_CACHE_DIR:-logs/stage2_oracle_motion/oracle_motion_val512_direct_20260623_020114}"
 STAGE1V2_FEATURES="${STAGE1V2_FEATURES:-}"
@@ -51,7 +52,16 @@ INCLUDE_BOUNDARY_RESIDUAL="${INCLUDE_BOUNDARY_RESIDUAL:-0}"
 INCLUDE_BOUNDARY_NATIVE="${INCLUDE_BOUNDARY_NATIVE:-0}"
 BOUNDARY_RESIDUAL_ENVELOPE="${BOUNDARY_RESIDUAL_ENVELOPE:-sin2}"
 BOUNDARY_RESIDUAL_SCALE="${BOUNDARY_RESIDUAL_SCALE:-1.0}"
+PHASE_TAU_POSTPROCESS="${PHASE_TAU_POSTPROCESS:-none}"
+PHASE_RESIDUAL_PEPTIDE_RETRACTION="${PHASE_RESIDUAL_PEPTIDE_RETRACTION:-checkpoint}"
+PHASE_RESIDUAL_PEPTIDE_RETRACTION_ITERATIONS="${PHASE_RESIDUAL_PEPTIDE_RETRACTION_ITERATIONS:-8}"
+PHASE_RESIDUAL_PEPTIDE_RETRACTION_RELAXATION="${PHASE_RESIDUAL_PEPTIDE_RETRACTION_RELAXATION:-0.75}"
+PHASE_RESIDUAL_PEPTIDE_RETRACTION_ANCHOR_STRENGTH="${PHASE_RESIDUAL_PEPTIDE_RETRACTION_ANCHOR_STRENGTH:-0.02}"
+PHASE_RESIDUAL_PEPTIDE_RETRACTION_MAX_TRANSLATION="${PHASE_RESIDUAL_PEPTIDE_RETRACTION_MAX_TRANSLATION:-1.0}"
+PHASE_RESIDUAL_PEPTIDE_RETRACTION_ACTIVATION_LOSS_THRESHOLD="${PHASE_RESIDUAL_PEPTIDE_RETRACTION_ACTIVATION_LOSS_THRESHOLD:-0.0}"
 OUTPUT="${OUTPUT:-logs/stage2/trajectory_reliability/${TAG}.json}"
+PER_SAMPLE_OUTPUT="${PER_SAMPLE_OUTPUT:-}"
+TRUST_PRECHECKED_SAMPLES="${TRUST_PRECHECKED_SAMPLES:-0}"
 
 case "$BOUNDARY_RESIDUAL_ENVELOPE" in
   sin2|poly) ;;
@@ -93,6 +103,7 @@ echo "Job ID:            ${SLURM_JOB_ID:-NA}"
 echo "Node:              ${SLURM_NODELIST:-NA}"
 echo "Checkpoint:        $CHECKPOINT"
 echo "Tag:               $TAG"
+echo "Split:             $SPLIT"
 echo "Index file:        ${INDEX_FILE:-split_default}"
 echo "Valid samples:     $VALID_SAMPLES_FILE"
 echo "Stage1v2 mode:     ${STAGE1V2_MODE:-checkpoint_default}"
@@ -108,6 +119,8 @@ echo "Boundary residual: $INCLUDE_BOUNDARY_RESIDUAL"
 echo "Boundary native:   $INCLUDE_BOUNDARY_NATIVE"
 echo "Boundary env:      $BOUNDARY_RESIDUAL_ENVELOPE"
 echo "Boundary scale:    $BOUNDARY_RESIDUAL_SCALE"
+echo "Tau postprocess:   $PHASE_TAU_POSTPROCESS"
+echo "Peptide retract:   $PHASE_RESIDUAL_PEPTIDE_RETRACTION"
 echo "Output:            $OUTPUT"
 echo "Start:             $(date)"
 echo "=============================================="
@@ -115,13 +128,29 @@ echo "=============================================="
 ARGS=(
   --checkpoint "$CHECKPOINT"
   --data_dir processed_data/triplets
-  --split val
+  --split "$SPLIT"
   --batch_size "$BATCH_SIZE"
   --num_workers "$NUM_WORKERS"
   --n_integration_steps "$N_INTEGRATION_STEPS"
   --device cuda
   --output "$OUTPUT"
+  --phase_tau_postprocess "$PHASE_TAU_POSTPROCESS"
+  --phase_residual_peptide_retraction_iterations "$PHASE_RESIDUAL_PEPTIDE_RETRACTION_ITERATIONS"
+  --phase_residual_peptide_retraction_relaxation "$PHASE_RESIDUAL_PEPTIDE_RETRACTION_RELAXATION"
+  --phase_residual_peptide_retraction_anchor_strength "$PHASE_RESIDUAL_PEPTIDE_RETRACTION_ANCHOR_STRENGTH"
+  --phase_residual_peptide_retraction_max_translation "$PHASE_RESIDUAL_PEPTIDE_RETRACTION_MAX_TRANSLATION"
+  --phase_residual_peptide_retraction_activation_loss_threshold "$PHASE_RESIDUAL_PEPTIDE_RETRACTION_ACTIVATION_LOSS_THRESHOLD"
 )
+
+case "$PHASE_RESIDUAL_PEPTIDE_RETRACTION" in
+  checkpoint) ;;
+  on) ARGS+=(--phase_residual_peptide_retraction) ;;
+  off) ARGS+=(--no_phase_residual_peptide_retraction) ;;
+  *)
+    echo "ERROR: PHASE_RESIDUAL_PEPTIDE_RETRACTION must be checkpoint, on, or off"
+    exit 1
+    ;;
+esac
 
 if [[ -n "$INDEX_FILE" ]]; then
   ARGS+=(--index_file "$INDEX_FILE")
@@ -131,6 +160,12 @@ if [[ -n "$VALID_SAMPLES_FILE" ]]; then
 fi
 if [[ -n "$MAX_BATCHES" ]]; then
   ARGS+=(--max_batches "$MAX_BATCHES")
+fi
+if [[ -n "$PER_SAMPLE_OUTPUT" ]]; then
+  ARGS+=(--per_sample_output "$PER_SAMPLE_OUTPUT")
+fi
+if [[ "$TRUST_PRECHECKED_SAMPLES" == "1" ]]; then
+  ARGS+=(--trust_prechecked_samples)
 fi
 if [[ -n "$INTEGRATION_CHI_CLIP" ]]; then
   ARGS+=(--integration_chi_clip "$INTEGRATION_CHI_CLIP")

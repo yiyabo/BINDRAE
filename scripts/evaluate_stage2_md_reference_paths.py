@@ -46,6 +46,18 @@ def parse_args():
         type=float,
         default=0.02,
     )
+    parser.add_argument(
+        "--md_pause_rate_threshold",
+        type=float,
+        default=0.25,
+        help="absolute d(tau)/dt threshold used to label pause intervals",
+    )
+    parser.add_argument(
+        "--md_backtrack_rate_threshold",
+        type=float,
+        default=0.05,
+        help="negative d(tau)/dt magnitude required to label backtracking",
+    )
     args = parser.parse_args()
     if args.batch_size != 1:
         parser.error("MD-reference evaluation currently requires --batch_size 1")
@@ -53,6 +65,12 @@ def parse_args():
         parser.error("--output is required for MD-reference evaluation")
     if args.md_min_phase_confidence < 0.0:
         parser.error("--md_min_phase_confidence must be >= 0")
+    if args.md_pause_rate_threshold < 0.0:
+        parser.error("--md_pause_rate_threshold must be >= 0")
+    if args.md_backtrack_rate_threshold < 0.0:
+        parser.error("--md_backtrack_rate_threshold must be >= 0")
+    if args.phase_tau_postprocess is None:
+        args.phase_tau_postprocess = "none"
     return args
 
 
@@ -252,6 +270,7 @@ def predicted_tau_values(
     if path_mode not in {
         "phase_orthogonal_residual_v1",
         "phase_block_orthogonal_residual_v2",
+        "phase_physical_normal_v1",
     }:
         bsz, n_res = batch.node_mask.shape
         return [
@@ -272,13 +291,71 @@ def predicted_tau_values(
         interaction_prior,
         gate_context,
         tau_mode=str(resolve_value(args, config, "phase_residual_tau_mode", "learned")),
+        warp_variant=str(
+            resolve_value(args, config, "phase_warp_variant", "residue_monotone")
+        ),
+        nonmonotone_max_offset=float(
+            resolve_value(args, config, "phase_nonmonotone_max_offset", 0.5)
+        ),
         bridge_mode=str(
             resolve_value(args, config, "phase_residual_bridge_mode", "se3_geodesic")
         ),
         logit_scale=float(resolve_value(args, config, "time_warp_logit_scale", 1.0)),
         rate_eps=float(resolve_value(args, config, "time_warp_rate_eps", 1e-3)),
         rate_clip=float(resolve_value(args, config, "time_warp_rate_clip", 10.0)),
+        chain_residual_scale=float(
+            resolve_value(args, config, "phase_chain_residual_scale", 1.0)
+        ),
+        chain_smoothing_steps=int(
+            resolve_value(args, config, "phase_chain_smoothing_steps", 2)
+        ),
     )
+
+
+def postprocess_phase_tau(predicted_tau: np.ndarray, mode: str) -> np.ndarray:
+    predicted_tau = np.asarray(predicted_tau, dtype=np.float64)
+    if mode == "none":
+        return predicted_tau.copy()
+    if mode != "cummax":
+        raise ValueError(f"Unsupported phase tau postprocess: {mode}")
+    result = np.maximum.accumulate(np.clip(predicted_tau, 0.0, 1.0), axis=0)
+    result[0] = 0.0
+    result[-1] = 1.0
+    return result
+
+
+def phase_only_path_from_tau(
+    batch,
+    rigids_apo,
+    rigids_holo,
+    tau_values: np.ndarray,
+    bridge_mode: str,
+):
+    rigids = []
+    chi = []
+    for index, tau_value in enumerate(np.asarray(tau_values)):
+        if index == 0:
+            rigids.append(rigids_apo)
+            chi.append(batch.torsion_apo[..., 3:7])
+            continue
+        if index == len(tau_values) - 1:
+            rigids.append(rigids_holo)
+            chi.append(batch.torsion_holo[..., 3:7])
+            continue
+        tau_tensor = torch.from_numpy(np.asarray(tau_value)).to(
+            device=batch.node_mask.device, dtype=torch.float32
+        ).unsqueeze(0)
+        tau_tensor = torch.where(
+            batch.node_mask.bool(),
+            tau_tensor,
+            torch.full_like(tau_tensor, index / (len(tau_values) - 1)),
+        )
+        rigid_t, chi_t = base.phase_interpolate_endpoints_tensor(
+            batch, rigids_apo, rigids_holo, tau_tensor, bridge_mode
+        )
+        rigids.append(rigid_t)
+        chi.append(chi_t)
+    return rigids, chi
 
 
 def reconstruct_md_reference(
@@ -307,9 +384,16 @@ def reconstruct_md_reference(
     )
     nearest = nearest_time_indices(source_t, target_times)
     residual_valid = np.asarray(data["residual_valid_mask"])[nearest].astype(bool)
-    node_mask = np.asarray(data["node_mask"]).astype(bool)
-    chi_mask = np.asarray(data["chi_mask"]).astype(bool)
-    active_mask = np.asarray(data["active_mask"]).astype(bool)
+    batch_node_mask = batch.node_mask[0].detach().cpu().numpy().astype(bool)
+    batch_chi_mask = batch.chi_mask[0].detach().cpu().numpy().astype(bool)
+    node_mask = np.asarray(data["node_mask"]).astype(bool) & batch_node_mask
+    chi_mask = (
+        np.asarray(data["chi_mask"]).astype(bool)
+        & batch_chi_mask
+        & node_mask[:, None]
+    )
+    active_mask = np.asarray(data["active_mask"]).astype(bool) & node_mask
+    residual_valid &= node_mask[None, :]
     bridge_mode = str(data["bridge_mode"].item())
     envelope_kind = str(data["residual_envelope"].item())
     device = batch.node_mask.device
@@ -477,6 +561,119 @@ def phase_metrics(
     }
 
 
+def phase_dynamics_metrics(
+    predicted_tau: np.ndarray,
+    arrays: Dict[str, np.ndarray],
+    target_times: np.ndarray,
+    min_confidence: float,
+    pause_rate_threshold: float,
+    backtrack_rate_threshold: float,
+) -> Dict[str, float]:
+    """Measure whether a phase field actually pauses or backtracks."""
+    predicted_tau = np.asarray(predicted_tau, dtype=np.float64)
+    target_tau = np.asarray(arrays["tau"], dtype=np.float64)
+    target_times = np.asarray(target_times, dtype=np.float64)
+    confidence = np.asarray(arrays["phase_confidence"], dtype=np.float64)
+    if predicted_tau.shape != target_tau.shape or confidence.shape != target_tau.shape:
+        raise ValueError("predicted tau, target tau, and confidence must share shape")
+    if target_times.ndim != 1 or target_times.size != target_tau.shape[0]:
+        raise ValueError("target_times must match the phase time dimension")
+    delta_t = np.diff(target_times)
+    if np.any(delta_t <= 0.0):
+        raise ValueError("target_times must be strictly increasing")
+
+    predicted_delta = np.diff(predicted_tau, axis=0)
+    target_delta = np.diff(target_tau, axis=0)
+    predicted_rate = predicted_delta / delta_t[:, None]
+    target_rate = target_delta / delta_t[:, None]
+    interval_confidence = np.minimum(confidence[:-1], confidence[1:])
+    interval_mask = (
+        arrays["node_mask"][None]
+        & arrays["active_mask"][None]
+        & (interval_confidence >= float(min_confidence))
+    )
+    weights = interval_confidence * interval_mask.astype(np.float64)
+
+    predicted_pause = np.abs(predicted_rate) <= float(pause_rate_threshold)
+    target_pause = np.abs(target_rate) <= float(pause_rate_threshold)
+    predicted_backtrack = predicted_rate < -float(backtrack_rate_threshold)
+    target_backtrack = target_rate < -float(backtrack_rate_threshold)
+    active_residue = arrays["node_mask"] & arrays["active_mask"]
+    valid_residue = active_residue & np.any(interval_mask, axis=0)
+
+    predicted_total_variation = np.sum(np.abs(predicted_delta), axis=0)
+    target_total_variation = np.sum(np.abs(target_delta), axis=0)
+    residue_confidence = np.max(confidence[1:-1], axis=0)
+    residue_weights = residue_confidence * valid_residue.astype(np.float64)
+
+    target_backtrack_count = int(np.sum(target_backtrack & interval_mask))
+    predicted_backtrack_count = int(np.sum(predicted_backtrack & interval_mask))
+    shared_backtrack_count = int(
+        np.sum(predicted_backtrack & target_backtrack & interval_mask)
+    )
+    return {
+        "phase_pred_pause_interval_fraction": weighted_mean(
+            predicted_pause.astype(np.float64), weights
+        ),
+        "phase_target_pause_interval_fraction": weighted_mean(
+            target_pause.astype(np.float64), weights
+        ),
+        "phase_pause_interval_agreement": weighted_mean(
+            (predicted_pause == target_pause).astype(np.float64), weights
+        ),
+        "phase_pred_backtrack_interval_fraction": weighted_mean(
+            predicted_backtrack.astype(np.float64), weights
+        ),
+        "phase_target_backtrack_interval_fraction": weighted_mean(
+            target_backtrack.astype(np.float64), weights
+        ),
+        "phase_pred_backtrack_magnitude": weighted_mean(
+            np.maximum(-predicted_delta, 0.0), weights
+        ),
+        "phase_target_backtrack_magnitude": weighted_mean(
+            np.maximum(-target_delta, 0.0), weights
+        ),
+        "phase_pred_nonmonotone_residue_fraction": weighted_mean(
+            np.any(predicted_backtrack, axis=0).astype(np.float64),
+            residue_weights,
+        ),
+        "phase_target_nonmonotone_residue_fraction": weighted_mean(
+            np.any(target_backtrack, axis=0).astype(np.float64),
+            residue_weights,
+        ),
+        "phase_pred_total_variation_excess": weighted_mean(
+            np.maximum(predicted_total_variation - 1.0, 0.0), residue_weights
+        ),
+        "phase_target_total_variation_excess": weighted_mean(
+            np.maximum(target_total_variation - 1.0, 0.0), residue_weights
+        ),
+        "phase_interval_rate_spearman": spearman_correlation(
+            predicted_rate[interval_mask], target_rate[interval_mask]
+        ),
+        "phase_backtrack_precision": (
+            float(shared_backtrack_count / predicted_backtrack_count)
+            if predicted_backtrack_count
+            else math.nan
+        ),
+        "phase_backtrack_recall": (
+            float(shared_backtrack_count / target_backtrack_count)
+            if target_backtrack_count
+            else math.nan
+        ),
+        "phase_endpoint_max_error": float(
+            max(
+                np.max(np.abs(predicted_tau[0, active_residue]))
+                if np.any(active_residue)
+                else 0.0,
+                np.max(np.abs(predicted_tau[-1, active_residue] - 1.0))
+                if np.any(active_residue)
+                else 0.0,
+            )
+        ),
+        "phase_interval_count": int(np.sum(interval_mask)),
+    }
+
+
 def predicted_ligand_distances(batch, fk_module, rigids, chi, times) -> np.ndarray:
     distances = []
     for rigid_t, chi_t, t_value in zip(rigids, chi, times):
@@ -503,10 +700,16 @@ def contact_event_metrics(
     target_times: np.ndarray,
     data,
     contact_dist: float,
+    node_mask: Optional[np.ndarray] = None,
 ) -> Dict[str, float]:
-    formed = np.asarray(data["formed_contact_mask"]).astype(bool)
-    released = np.asarray(data["release_mask"]).astype(bool)
-    transient = np.asarray(data["transient_contact_mask"]).astype(bool)
+    valid_nodes = (
+        np.ones_like(np.asarray(data["formed_contact_mask"]), dtype=bool)
+        if node_mask is None
+        else np.asarray(node_mask, dtype=bool)
+    )
+    formed = np.asarray(data["formed_contact_mask"]).astype(bool) & valid_nodes
+    released = np.asarray(data["release_mask"]).astype(bool) & valid_nodes
+    transient = np.asarray(data["transient_contact_mask"]).astype(bool) & valid_nodes
     target_progress = np.asarray(data["contact_event_progress"], dtype=np.float64)
     formed_time = distance_event_times(
         predicted_distances, target_times, contact_dist, "formed"
@@ -569,7 +772,12 @@ def aggregate_records(records: Sequence[Dict[str, object]]) -> Dict[str, object]
         }
     )
     replica_macro = {
-        key: finite_mean(float(record["metrics"][key]) for record in records)
+        key: finite_mean(
+            float(record["metrics"][key])
+            for record in records
+            if key in record["metrics"]
+            and isinstance(record["metrics"][key], (int, float))
+        )
         for key in metric_names
     }
     by_system: Dict[str, List[Dict[str, object]]] = defaultdict(list)
@@ -579,7 +787,10 @@ def aggregate_records(records: Sequence[Dict[str, object]]) -> Dict[str, object]
     for system_records in by_system.values():
         for key in metric_names:
             value = finite_mean(
-                float(record["metrics"][key]) for record in system_records
+                float(record["metrics"][key])
+                for record in system_records
+                if key in record["metrics"]
+                and isinstance(record["metrics"][key], (int, float))
             )
             if math.isfinite(value):
                 system_values[key].append(value)
@@ -701,6 +912,9 @@ def main() -> None:
                 gate_context,
             )
             predicted_tau = torch.stack(tau_values, dim=0)[:, 0].cpu().numpy()
+            predicted_tau = postprocess_phase_tau(
+                predicted_tau, args.phase_tau_postprocess
+            )
             predicted_distances = predicted_ligand_distances(
                 batch,
                 fk_module,
@@ -723,6 +937,17 @@ def main() -> None:
                     expected_n = int(batch.n_residues[0])
                     if int(data["n_residues"].item()) != expected_n:
                         raise ValueError(f"Residue count mismatch for {path}")
+                    expected_hash = str(batch.residue_identity_hashes[0])
+                    cached_hash = (
+                        str(data["residue_identity_hash"].item())
+                        if "residue_identity_hash" in data
+                        else ""
+                    )
+                    if cached_hash != expected_hash:
+                        raise ValueError(
+                            f"Residue identity mismatch for {path}: "
+                            f"cache={cached_hash!r}, batch={expected_hash!r}"
+                        )
                     target_rigids, target_chi, arrays = reconstruct_md_reference(
                         batch,
                         rigids_apo,
@@ -748,11 +973,22 @@ def main() -> None:
                         )
                     )
                     metrics.update(
+                        phase_dynamics_metrics(
+                            predicted_tau,
+                            arrays,
+                            target_times,
+                            args.md_min_phase_confidence,
+                            args.md_pause_rate_threshold,
+                            args.md_backtrack_rate_threshold,
+                        )
+                    )
+                    metrics.update(
                         contact_event_metrics(
                             predicted_distances,
                             target_times,
                             data,
                             args.contact_dist,
+                            arrays["node_mask"],
                         )
                     )
                     records.append(
@@ -777,6 +1013,9 @@ def main() -> None:
         "systems": systems,
         "replicas": len(records),
         "md_min_phase_confidence": args.md_min_phase_confidence,
+        "md_pause_rate_threshold": args.md_pause_rate_threshold,
+        "md_backtrack_rate_threshold": args.md_backtrack_rate_threshold,
+        "phase_tau_postprocess": args.phase_tau_postprocess,
         "aggregate": aggregate,
         "records": records,
     }

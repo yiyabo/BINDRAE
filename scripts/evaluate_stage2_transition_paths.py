@@ -15,7 +15,7 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -40,7 +40,11 @@ from src.stage2.modules.chain_internal import (  # noqa: E402
     project_peptide_frame_translations,
 )
 from src.stage2.modules import (  # noqa: E402
+    PhysicalPathOptimizationConfig,
+    PhysicalPathOptimizationResult,
     endpoint_zero_envelope,
+    phase_tau_from_logits,
+    optimize_projected_normal_path,
     project_block_tangent_normal,
     project_product_tangent_normal,
     rigid_compose,
@@ -84,6 +88,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "bridge_timewarp_v1",
             "phase_orthogonal_residual_v1",
             "phase_block_orthogonal_residual_v2",
+            "phase_physical_normal_v1",
         ],
         help="Path construction to evaluate; checkpoint uses checkpoint config",
     )
@@ -114,6 +119,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=["learned", "identity"],
     )
     parser.add_argument(
+        "--phase_warp_variant",
+        default=None,
+        choices=[
+            "residue_monotone",
+            "global_monotone",
+            "global_chain_monotone",
+            "chain_nonmonotone",
+            "residue_nonmonotone",
+        ],
+    )
+    parser.add_argument(
+        "--phase_nonmonotone_max_offset",
+        type=float,
+        default=None,
+    )
+    parser.add_argument("--phase_chain_residual_scale", type=float, default=None)
+    parser.add_argument("--phase_chain_smoothing_steps", type=int, default=None)
+    parser.add_argument(
+        "--phase_tau_postprocess",
+        default=None,
+        choices=["none", "cummax"],
+        help=(
+            "optional endpoint-fixed phase projection; checkpoint/default keeps "
+            "the learned phase unchanged"
+        ),
+    )
+    parser.add_argument(
         "--phase_residual_bridge_mode",
         default=None,
         choices=["se3_geodesic", "cartesian_backbone"],
@@ -129,6 +161,86 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--phase_residual_chi_metric_scale", type=float, default=None)
     parser.add_argument("--phase_residual_min_tangent_norm", type=float, default=None)
     parser.add_argument("--phase_residual_max_metric_norm", type=float, default=None)
+    parser.add_argument(
+        "--phase_residual_peptide_retraction",
+        dest="phase_residual_peptide_retraction",
+        action="store_true",
+        default=None,
+        help="force endpoint-preserving peptide-geometry retraction at inference",
+    )
+    parser.add_argument(
+        "--no_phase_residual_peptide_retraction",
+        dest="phase_residual_peptide_retraction",
+        action="store_false",
+        help="disable checkpoint peptide-geometry retraction at inference",
+    )
+    parser.add_argument(
+        "--phase_residual_peptide_retraction_iterations", type=int, default=None
+    )
+    parser.add_argument(
+        "--phase_residual_peptide_retraction_relaxation", type=float, default=None
+    )
+    parser.add_argument(
+        "--phase_residual_peptide_retraction_anchor_strength", type=float, default=None
+    )
+    parser.add_argument(
+        "--phase_residual_peptide_retraction_max_translation", type=float, default=None
+    )
+    parser.add_argument(
+        "--phase_residual_peptide_retraction_activation_loss_threshold",
+        type=float,
+        default=None,
+    )
+    parser.add_argument("--physical_normal_iterations", type=int, default=24)
+    parser.add_argument("--physical_normal_learning_rate", type=float, default=0.05)
+    parser.add_argument(
+        "--physical_normal_envelope", choices=["poly", "sin2"], default="poly"
+    )
+    parser.add_argument(
+        "--physical_normal_projection_mode",
+        choices=["product", "block"],
+        default="block",
+    )
+    parser.add_argument(
+        "--physical_normal_components",
+        choices=["translation", "rigid", "all"],
+        default="translation",
+    )
+    parser.add_argument("--physical_normal_max_metric_norm", type=float, default=1.5)
+    parser.add_argument("--physical_normal_gradient_clip", type=float, default=10.0)
+    parser.add_argument("--physical_normal_protein_clash_dist", type=float, default=2.0)
+    parser.add_argument("--physical_normal_ligand_clash_dist", type=float, default=2.2)
+    parser.add_argument("--physical_normal_max_clash_atoms", type=int, default=512)
+    parser.add_argument("--physical_normal_weight_peptide", type=float, default=1.0)
+    parser.add_argument("--physical_normal_weight_protein_clash", type=float, default=1.0)
+    parser.add_argument("--physical_normal_weight_ligand_clash", type=float, default=1.0)
+    parser.add_argument("--physical_normal_weight_contact_anchor", type=float, default=0.25)
+    parser.add_argument("--physical_normal_weight_distance_anchor", type=float, default=1.0)
+    parser.add_argument("--physical_normal_weight_residual", type=float, default=0.05)
+    parser.add_argument("--physical_normal_weight_temporal", type=float, default=0.10)
+    parser.add_argument(
+        "--physical_normal_optimizer",
+        choices=["adam", "backtracking"],
+        default="adam",
+    )
+    parser.add_argument("--physical_normal_num_starts", type=int, default=1)
+    parser.add_argument("--physical_normal_route_seed_scale", type=float, default=0.0)
+    parser.add_argument("--physical_normal_route_seed_rank", type=int, default=2)
+    parser.add_argument(
+        "--physical_normal_route_seed_smoothing_steps", type=int, default=2
+    )
+    parser.add_argument("--physical_normal_route_seed", type=int, default=20260720)
+    parser.add_argument(
+        "--physical_normal_frame_aggregation",
+        choices=["mean", "max", "softmax"],
+        default="mean",
+    )
+    parser.add_argument("--physical_normal_frame_softmax_beta", type=float, default=10.0)
+    parser.add_argument("--physical_normal_line_search_steps", type=int, default=8)
+    parser.add_argument("--physical_normal_line_search_shrink", type=float, default=0.5)
+    parser.add_argument(
+        "--physical_normal_acceptance_tolerance", type=float, default=1e-8
+    )
     parser.add_argument("--peptide_projection_iterations", type=int, default=12)
     parser.add_argument("--peptide_projection_relaxation", type=float, default=0.75)
     parser.add_argument("--peptide_projection_anchor_strength", type=float, default=0.02)
@@ -148,6 +260,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--integration_rot_clip", type=float, default=None)
     parser.add_argument("--integration_trans_clip", type=float, default=None)
     parser.add_argument("--max_batches", type=int, default=None)
+    parser.add_argument(
+        "--include_per_sample_metrics",
+        action="store_true",
+        help="include system-level metric records; requires batch_size=1",
+    )
     parser.add_argument("--interaction_prior_ckpt", default=None)
     parser.add_argument(
         "--interaction_prior_feature_mode",
@@ -392,6 +509,10 @@ def build_model_config_for_checkpoint(args, config, split: str) -> Tuple[Torsion
         phase_residual_active_blocks=str(
             getattr(config, "phase_residual_active_blocks", "all")
         ),
+        phase_residual_decoder_mode=str(
+            getattr(config, "phase_residual_decoder_mode", "independent")
+        ),
+        phase_residual_rank=int(getattr(config, "phase_residual_rank", 4)),
     )
     return model_config, interaction_settings, stage1v2_settings
 
@@ -454,6 +575,7 @@ def resolve_path_parameterization(args, config) -> str:
         "bridge_timewarp_v1",
         "phase_orthogonal_residual_v1",
         "phase_block_orthogonal_residual_v2",
+        "phase_physical_normal_v1",
     }
     if mode not in allowed:
         raise ValueError(f"Unsupported path_parameterization={mode}")
@@ -940,10 +1062,14 @@ def phase_residual_tau_values(
     esm_gate_context: Optional[torch.Tensor],
     *,
     tau_mode: str,
+    warp_variant: str,
+    nonmonotone_max_offset: float,
     bridge_mode: str,
     logit_scale: float,
     rate_eps: float,
     rate_clip: float,
+    chain_residual_scale: float = 1.0,
+    chain_smoothing_steps: int = 2,
 ) -> List[torch.Tensor]:
     """Evaluate monotone per-residue phase values on a uniform time grid."""
     n_steps = int(n_steps)
@@ -967,7 +1093,7 @@ def phase_residual_tau_values(
     if tau_mode != "learned":
         raise ValueError(f"Unsupported phase residual tau_mode={tau_mode}")
 
-    rates: List[torch.Tensor] = []
+    logits_list: List[torch.Tensor] = []
     for k in range(n_steps):
         t_mid = (k + 0.5) / n_steps
         mid_tau = torch.full(
@@ -991,21 +1117,43 @@ def phase_residual_tau_values(
             esm_gate_context=esm_gate_context,
         )
         logits = out["time_warp_logits"].float().squeeze(-1) * node_mask_f
-        rate = F.softplus(logits * float(logit_scale)) + float(rate_eps)
-        if float(rate_clip) > 0.0:
-            rate = rate.clamp(max=float(rate_clip))
-        rates.append(torch.where(node_mask, rate, torch.ones_like(rate)))
-    rate_stack = torch.stack(rates, dim=0)
-    cumulative = torch.cumsum(rate_stack, dim=0)
-    total_rate = cumulative[-1].clamp(min=float(rate_eps))
-    tau_values = [
-        torch.zeros((bsz, n_res), dtype=torch.float32, device=device)
-    ]
-    tau_values.extend(
-        (cumulative[k] / total_rate).clamp(0.0, 1.0)
-        for k in range(n_steps)
+        logits_list.append(logits)
+    phase = phase_tau_from_logits(
+        torch.stack(logits_list, dim=0),
+        node_mask,
+        variant=warp_variant,
+        logit_scale=float(logit_scale),
+        rate_eps=float(rate_eps),
+        rate_clip=float(rate_clip),
+        nonmonotone_max_offset=float(nonmonotone_max_offset),
+        peptide_bond_mask=getattr(batch, "peptide_bond_mask", None),
+        chain_residual_scale=float(chain_residual_scale),
+        chain_smoothing_steps=int(chain_smoothing_steps),
     )
-    return tau_values
+    return list(phase["tau"].unbind(dim=0))
+
+
+def postprocess_phase_tau_values(
+    tau_values: List[torch.Tensor], mode: str
+) -> List[torch.Tensor]:
+    """Apply an endpoint-fixed projection to a phase trajectory."""
+    if mode == "none":
+        return list(tau_values)
+    if mode != "cummax":
+        raise ValueError(f"Unsupported phase tau postprocess={mode}")
+    if len(tau_values) < 2:
+        raise ValueError("phase tau postprocessing requires at least two time points")
+    stacked = torch.stack(tau_values, dim=0).float().clamp(0.0, 1.0)
+    projected = torch.cummax(stacked, dim=0).values
+    projected = torch.cat(
+        [
+            torch.zeros_like(projected[:1]),
+            projected[1:-1],
+            torch.ones_like(projected[-1:]),
+        ],
+        dim=0,
+    )
+    return list(projected.unbind(dim=0))
 
 
 def phase_orthogonal_residual_path(
@@ -1018,6 +1166,8 @@ def phase_orthogonal_residual_path(
     esm_gate_context: Optional[torch.Tensor],
     *,
     tau_mode: str,
+    warp_variant: str,
+    nonmonotone_max_offset: float,
     bridge_mode: str,
     logit_scale: float,
     rate_eps: float,
@@ -1030,6 +1180,9 @@ def phase_orthogonal_residual_path(
     min_tangent_norm: float,
     max_metric_norm: float,
     projection_mode: str = "product",
+    chain_residual_scale: float = 1.0,
+    chain_smoothing_steps: int = 2,
+    tau_postprocess: str = "none",
 ) -> Tuple[List[Rigid], List[torch.Tensor], List[float]]:
     """Evaluate the endpoint-exact phase plus normal-residual path family."""
     n_steps = int(n_steps)
@@ -1047,11 +1200,16 @@ def phase_orthogonal_residual_path(
         interaction_prior,
         esm_gate_context,
         tau_mode=tau_mode,
+        warp_variant=warp_variant,
+        nonmonotone_max_offset=nonmonotone_max_offset,
         bridge_mode=bridge_mode,
         logit_scale=logit_scale,
         rate_eps=rate_eps,
         rate_clip=rate_clip,
+        chain_residual_scale=chain_residual_scale,
+        chain_smoothing_steps=chain_smoothing_steps,
     )
+    tau_values = postprocess_phase_tau_values(tau_values, tau_postprocess)
 
     bridge_tangent_chi = wrap_to_pi(
         batch.torsion_holo[..., 3:7] - batch.torsion_apo[..., 3:7]
@@ -1365,6 +1523,189 @@ def pose_graph_projected_bridge_path(
     return projected_rigids, chi_list, t_list
 
 
+def phase_physical_normal_result(
+    args,
+    config,
+    model,
+    batch,
+    rigids_apo: Rigid,
+    rigids_holo: Rigid,
+    n_steps: int,
+    interaction_prior: Optional[torch.Tensor],
+    esm_gate_context: Optional[torch.Tensor],
+    fk_module,
+) -> Tuple[PhysicalPathOptimizationResult, torch.Tensor]:
+    """Build the learned guide and optimize its physical normal correction."""
+    if fk_module is None:
+        raise ValueError("phase_physical_normal_v1 requires an FK module")
+    if int(batch.node_mask.shape[0]) != 1:
+        raise ValueError(
+            "phase_physical_normal_v1 currently requires evaluation batch_size=1"
+        )
+
+    def resolve_value(arg_name: str, default):
+        value = getattr(args, arg_name, None)
+        return value if value is not None else getattr(config, arg_name, default)
+
+    bridge_mode = str(resolve_value("phase_residual_bridge_mode", "cartesian_backbone"))
+    tau_values = phase_residual_tau_values(
+        model,
+        batch,
+        rigids_apo,
+        rigids_holo,
+        n_steps,
+        interaction_prior,
+        esm_gate_context,
+        tau_mode=str(resolve_value("phase_residual_tau_mode", "learned")),
+        warp_variant=str(
+            resolve_value("phase_warp_variant", "residue_monotone")
+        ),
+        nonmonotone_max_offset=float(
+            resolve_value("phase_nonmonotone_max_offset", 0.5)
+        ),
+        bridge_mode=bridge_mode,
+        logit_scale=float(resolve_value("time_warp_logit_scale", 1.0)),
+        rate_eps=float(resolve_value("time_warp_rate_eps", 1e-3)),
+        rate_clip=float(resolve_value("time_warp_rate_clip", 10.0)),
+        chain_residual_scale=float(
+            resolve_value("phase_chain_residual_scale", 1.0)
+        ),
+        chain_smoothing_steps=int(
+            resolve_value("phase_chain_smoothing_steps", 2)
+        ),
+    )
+    tau_values = postprocess_phase_tau_values(
+        tau_values,
+        str(resolve_value("phase_tau_postprocess", "none")),
+    )
+    node_mask = batch.node_mask.bool()
+    base_rigids: List[Rigid] = [rigids_apo]
+    base_chi: List[torch.Tensor] = [batch.torsion_apo[..., 3:7]]
+    times: List[float] = [0.0]
+    tangent_rigid: List[torch.Tensor] = []
+    tangent_chi_value = wrap_to_pi(
+        batch.torsion_holo[..., 3:7] - batch.torsion_apo[..., 3:7]
+    )
+    tangent_chi: List[torch.Tensor] = []
+    for step in range(1, int(n_steps)):
+        t_value = step / int(n_steps)
+        tau = torch.where(
+            node_mask,
+            tau_values[step],
+            torch.full_like(tau_values[step], t_value),
+        )
+        rigid_t, chi_t = phase_interpolate_endpoints_tensor(
+            batch, rigids_apo, rigids_holo, tau, bridge_mode
+        )
+        base_rigids.append(rigid_t)
+        base_chi.append(chi_t)
+        times.append(t_value)
+        tangent_rigid.append(
+            phase_bridge_tangent(
+                batch, rigids_apo, rigids_holo, tau, bridge_mode
+            )
+        )
+        tangent_chi.append(tangent_chi_value)
+    base_rigids.append(rigids_holo)
+    base_chi.append(batch.torsion_holo[..., 3:7])
+    times.append(1.0)
+
+    optimization_config = PhysicalPathOptimizationConfig(
+        iterations=int(args.physical_normal_iterations),
+        learning_rate=float(args.physical_normal_learning_rate),
+        envelope=str(args.physical_normal_envelope),
+        projection_mode=str(args.physical_normal_projection_mode),
+        components=str(args.physical_normal_components),
+        rotation_metric_scale=float(
+            resolve_value("phase_residual_rotation_metric_scale", 1.0)
+        ),
+        translation_metric_scale=float(
+            resolve_value("phase_residual_translation_metric_scale", 1.0)
+        ),
+        chi_metric_scale=float(resolve_value("phase_residual_chi_metric_scale", 1.0)),
+        min_tangent_norm=float(resolve_value("phase_residual_min_tangent_norm", 1e-3)),
+        max_metric_norm=float(args.physical_normal_max_metric_norm),
+        gradient_clip=float(args.physical_normal_gradient_clip),
+        protein_clash_distance=float(args.physical_normal_protein_clash_dist),
+        ligand_clash_distance=float(args.physical_normal_ligand_clash_dist),
+        contact_distance=float(getattr(config, "contact_d0", 6.0)),
+        contact_temperature=float(getattr(config, "contact_tau", 1.0)),
+        pocket_threshold=float(args.pocket_threshold),
+        max_clash_atoms=int(args.physical_normal_max_clash_atoms),
+        weight_peptide=float(args.physical_normal_weight_peptide),
+        weight_protein_clash=float(args.physical_normal_weight_protein_clash),
+        weight_ligand_clash=float(args.physical_normal_weight_ligand_clash),
+        weight_contact_anchor=float(args.physical_normal_weight_contact_anchor),
+        weight_distance_anchor=float(args.physical_normal_weight_distance_anchor),
+        weight_residual_magnitude=float(args.physical_normal_weight_residual),
+        weight_temporal_smoothness=float(args.physical_normal_weight_temporal),
+        optimizer=str(getattr(args, "physical_normal_optimizer", "adam")),
+        num_starts=int(getattr(args, "physical_normal_num_starts", 1)),
+        route_seed_scale=float(
+            getattr(args, "physical_normal_route_seed_scale", 0.0)
+        ),
+        route_seed_rank=int(getattr(args, "physical_normal_route_seed_rank", 2)),
+        route_seed_smoothing_steps=int(
+            getattr(args, "physical_normal_route_seed_smoothing_steps", 2)
+        ),
+        route_seed=int(getattr(args, "physical_normal_route_seed", 20260720)),
+        frame_aggregation=str(
+            getattr(args, "physical_normal_frame_aggregation", "mean")
+        ),
+        frame_softmax_beta=float(
+            getattr(args, "physical_normal_frame_softmax_beta", 10.0)
+        ),
+        line_search_steps=int(
+            getattr(args, "physical_normal_line_search_steps", 8)
+        ),
+        line_search_shrink=float(
+            getattr(args, "physical_normal_line_search_shrink", 0.5)
+        ),
+        acceptance_tolerance=float(
+            getattr(args, "physical_normal_acceptance_tolerance", 1e-8)
+        ),
+    )
+    result = optimize_projected_normal_path(
+        fk_module,
+        batch,
+        base_rigids,
+        base_chi,
+        times,
+        torch.stack(tangent_rigid, dim=0),
+        torch.stack(tangent_chi, dim=0),
+        optimization_config,
+    )
+    return result, torch.stack(tau_values, dim=0)
+
+
+def phase_physical_normal_path(
+    args,
+    config,
+    model,
+    batch,
+    rigids_apo: Rigid,
+    rigids_holo: Rigid,
+    n_steps: int,
+    interaction_prior: Optional[torch.Tensor],
+    esm_gate_context: Optional[torch.Tensor],
+    fk_module,
+) -> Tuple[List[Rigid], List[torch.Tensor], List[float], Dict[str, object]]:
+    """Optimize a small physical correction normal to a learned warp path."""
+    result, _ = phase_physical_normal_result(
+        args,
+        config,
+        model,
+        batch,
+        rigids_apo,
+        rigids_holo,
+        n_steps,
+        interaction_prior,
+        esm_gate_context,
+        fk_module,
+    )
+    return result.rigids, result.chi, result.times, result.diagnostics
+
+
 def project_terminal_path(
     rigids_list: List[Rigid],
     chi_list: List[torch.Tensor],
@@ -1533,9 +1874,15 @@ def construct_path(
         "phase_block_orthogonal_residual_v2",
     }:
         def resolve_value(arg_name: str, default):
-            value = getattr(args, arg_name)
+            value = getattr(args, arg_name, None)
             return value if value is not None else getattr(config, arg_name, default)
 
+        residual_scale = float(resolve_value("phase_residual_scale", 1.0))
+        tau_postprocess = str(resolve_value("phase_tau_postprocess", "none"))
+        if tau_postprocess != "none" and residual_scale != 0.0:
+            raise ValueError(
+                "phase tau postprocessing is only valid for phase-only checkpoints"
+            )
         phase_path = phase_orthogonal_residual_path(
             model,
             batch,
@@ -1545,6 +1892,18 @@ def construct_path(
             interaction_prior=interaction_prior,
             esm_gate_context=esm_gate_context,
             tau_mode=str(resolve_value("phase_residual_tau_mode", "learned")),
+            warp_variant=str(
+                resolve_value("phase_warp_variant", "residue_monotone")
+            ),
+            nonmonotone_max_offset=float(
+                resolve_value("phase_nonmonotone_max_offset", 0.5)
+            ),
+            chain_residual_scale=float(
+                resolve_value("phase_chain_residual_scale", 1.0)
+            ),
+            chain_smoothing_steps=int(
+                resolve_value("phase_chain_smoothing_steps", 2)
+            ),
             bridge_mode=str(
                 resolve_value("phase_residual_bridge_mode", "se3_geodesic")
             ),
@@ -1552,7 +1911,7 @@ def construct_path(
             rate_eps=float(resolve_value("time_warp_rate_eps", 1e-3)),
             rate_clip=float(resolve_value("time_warp_rate_clip", 10.0)),
             envelope_kind=str(resolve_value("phase_residual_envelope", "poly")),
-            residual_scale=float(resolve_value("phase_residual_scale", 1.0)),
+            residual_scale=residual_scale,
             rotation_metric_scale=float(
                 resolve_value("phase_residual_rotation_metric_scale", 1.0)
             ),
@@ -1573,8 +1932,17 @@ def construct_path(
                 if path_mode == "phase_block_orthogonal_residual_v2"
                 else "product"
             ),
+            tau_postprocess=tau_postprocess,
         )
-        if bool(getattr(config, "phase_residual_peptide_retraction", False)):
+        retraction_override = getattr(
+            args, "phase_residual_peptide_retraction", None
+        )
+        retraction_enabled = (
+            bool(retraction_override)
+            if retraction_override is not None
+            else bool(getattr(config, "phase_residual_peptide_retraction", False))
+        )
+        if retraction_enabled:
             if fk_module is None:
                 raise ValueError(
                     "phase residual peptide retraction requires an FK module"
@@ -1584,36 +1952,23 @@ def construct_path(
                 *phase_path,
                 fk_module=fk_module,
                 n_iterations=int(
-                    getattr(
-                        config,
-                        "phase_residual_peptide_retraction_iterations",
-                        8,
-                    )
+                    resolve_value("phase_residual_peptide_retraction_iterations", 8)
                 ),
                 relaxation=float(
-                    getattr(
-                        config,
-                        "phase_residual_peptide_retraction_relaxation",
-                        0.75,
-                    )
+                    resolve_value("phase_residual_peptide_retraction_relaxation", 0.75)
                 ),
                 anchor_strength=float(
-                    getattr(
-                        config,
-                        "phase_residual_peptide_retraction_anchor_strength",
-                        0.02,
+                    resolve_value(
+                        "phase_residual_peptide_retraction_anchor_strength", 0.02
                     )
                 ),
                 max_translation=float(
-                    getattr(
-                        config,
-                        "phase_residual_peptide_retraction_max_translation",
-                        1.0,
+                    resolve_value(
+                        "phase_residual_peptide_retraction_max_translation", 1.0
                     )
                 ),
                 activation_loss_threshold=float(
-                    getattr(
-                        config,
+                    resolve_value(
                         "phase_residual_peptide_retraction_activation_loss_threshold",
                         0.0,
                     )
@@ -1622,6 +1977,25 @@ def construct_path(
         return (
             *phase_path,
             correction,
+        )
+    if path_mode == "phase_physical_normal_v1":
+        physical_path = phase_physical_normal_path(
+            args,
+            config,
+            model,
+            batch,
+            rigids_apo,
+            rigids_holo,
+            n_steps,
+            interaction_prior,
+            esm_gate_context,
+            fk_module,
+        )
+        return (
+            physical_path[0],
+            physical_path[1],
+            physical_path[2],
+            {"physical_optimizer": physical_path[3]},
         )
     if path_mode in {"boundary_residual_v1", "boundary_residual"}:
         envelope = args.boundary_residual_envelope or getattr(config, "boundary_residual_envelope", "sin2")
@@ -2079,7 +2453,7 @@ def evaluate_batch(
     terminal_correction_trans = d_final.new_zeros(d_final.shape)
     terminal_correction_rot = d_final.new_zeros(d_final.shape)
     terminal_correction_chi = d_final.new_zeros(d_final.shape)
-    if correction:
+    if "delta_xi" in correction:
         delta_xi = correction["delta_xi"]
         terminal_correction_trans = torch.linalg.norm(delta_xi[..., 3:], dim=-1)
         terminal_correction_rot = torch.linalg.norm(delta_xi[..., :3], dim=-1)
@@ -2126,6 +2500,18 @@ def evaluate_batch(
         stats[f"{name}/terminal_correction_trans"].add(terminal_correction_trans, mask)
         stats[f"{name}/terminal_correction_rot"].add(terminal_correction_rot, mask)
         stats[f"{name}/terminal_correction_chi"].add(terminal_correction_chi, mask)
+    physical_diagnostics = correction.get("physical_optimizer")
+    if physical_diagnostics:
+        sample_mask = torch.ones(
+            (batch.node_mask.shape[0],),
+            dtype=torch.bool,
+            device=batch.node_mask.device,
+        )
+        for name, value in physical_diagnostics.items():
+            if not isinstance(value, (int, float)):
+                continue
+            values = batch.w_res.new_full(sample_mask.shape, float(value))
+            stats[f"physical_optimizer/{name}"].add(values, sample_mask)
     return stats, counts
 
 
@@ -2137,6 +2523,8 @@ def merge_stats(total_stats, batch_stats):
 
 def main() -> None:
     args = parse_args()
+    if args.include_per_sample_metrics and int(args.batch_size) != 1:
+        raise ValueError("--include_per_sample_metrics requires --batch_size 1")
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     config = ckpt.get("config", SimpleNamespace())
@@ -2178,6 +2566,7 @@ def main() -> None:
     total_counts = defaultdict(int)
     total_batches = 0
     total_samples = 0
+    per_sample_metrics = []
     with torch.no_grad():
         for batch_idx, batch in enumerate(tqdm(loader, desc="Transition eval", ncols=120)):
             if args.max_batches is not None and batch_idx >= int(args.max_batches):
@@ -2194,6 +2583,16 @@ def main() -> None:
                 integration_clips,
             )
             merge_stats(total_stats, batch_stats)
+            if args.include_per_sample_metrics:
+                per_sample_metrics.append(
+                    {
+                        "sample_id": str(batch.pdb_ids[0]),
+                        "counts": {key: int(value) for key, value in counts.items()},
+                        "metrics": {
+                            key: stat.mean for key, stat in sorted(batch_stats.items())
+                        },
+                    }
+                )
             for key, value in counts.items():
                 total_counts[key] += int(value)
             total_batches += 1
@@ -2244,6 +2643,31 @@ def main() -> None:
             if args.phase_residual_tau_mode is not None
             else getattr(config, "phase_residual_tau_mode", None)
         ),
+        "phase_warp_variant": (
+            args.phase_warp_variant
+            if args.phase_warp_variant is not None
+            else getattr(config, "phase_warp_variant", "residue_monotone")
+        ),
+        "phase_nonmonotone_max_offset": (
+            args.phase_nonmonotone_max_offset
+            if args.phase_nonmonotone_max_offset is not None
+            else getattr(config, "phase_nonmonotone_max_offset", 0.5)
+        ),
+        "phase_chain_residual_scale": (
+            args.phase_chain_residual_scale
+            if args.phase_chain_residual_scale is not None
+            else getattr(config, "phase_chain_residual_scale", 1.0)
+        ),
+        "phase_chain_smoothing_steps": (
+            args.phase_chain_smoothing_steps
+            if args.phase_chain_smoothing_steps is not None
+            else getattr(config, "phase_chain_smoothing_steps", 2)
+        ),
+        "phase_tau_postprocess": (
+            args.phase_tau_postprocess
+            if args.phase_tau_postprocess is not None
+            else getattr(config, "phase_tau_postprocess", "none")
+        ),
         "phase_residual_bridge_mode": (
             args.phase_residual_bridge_mode
             if args.phase_residual_bridge_mode is not None
@@ -2284,36 +2708,85 @@ def main() -> None:
             if args.phase_residual_min_tangent_norm is not None
             else getattr(config, "phase_residual_min_tangent_norm", None)
         ),
-        "phase_residual_peptide_retraction": bool(
-            getattr(config, "phase_residual_peptide_retraction", False)
+        "phase_residual_peptide_retraction": (
+            bool(args.phase_residual_peptide_retraction)
+            if args.phase_residual_peptide_retraction is not None
+            else bool(getattr(config, "phase_residual_peptide_retraction", False))
         ),
         "phase_residual_peptide_retraction_iterations": int(
-            getattr(config, "phase_residual_peptide_retraction_iterations", 8)
+            args.phase_residual_peptide_retraction_iterations
+            if args.phase_residual_peptide_retraction_iterations is not None
+            else getattr(config, "phase_residual_peptide_retraction_iterations", 8)
         ),
         "phase_residual_peptide_retraction_relaxation": float(
-            getattr(config, "phase_residual_peptide_retraction_relaxation", 0.75)
+            args.phase_residual_peptide_retraction_relaxation
+            if args.phase_residual_peptide_retraction_relaxation is not None
+            else getattr(config, "phase_residual_peptide_retraction_relaxation", 0.75)
         ),
         "phase_residual_peptide_retraction_anchor_strength": float(
-            getattr(
-                config,
-                "phase_residual_peptide_retraction_anchor_strength",
-                0.02,
+            args.phase_residual_peptide_retraction_anchor_strength
+            if args.phase_residual_peptide_retraction_anchor_strength is not None
+            else getattr(
+                config, "phase_residual_peptide_retraction_anchor_strength", 0.02
             )
         ),
         "phase_residual_peptide_retraction_max_translation": float(
-            getattr(
-                config,
-                "phase_residual_peptide_retraction_max_translation",
-                1.0,
+            args.phase_residual_peptide_retraction_max_translation
+            if args.phase_residual_peptide_retraction_max_translation is not None
+            else getattr(
+                config, "phase_residual_peptide_retraction_max_translation", 1.0
             )
         ),
         "phase_residual_peptide_retraction_activation_loss_threshold": float(
-            getattr(
+            args.phase_residual_peptide_retraction_activation_loss_threshold
+            if args.phase_residual_peptide_retraction_activation_loss_threshold
+            is not None
+            else getattr(
                 config,
                 "phase_residual_peptide_retraction_activation_loss_threshold",
                 0.0,
             )
         ),
+        "physical_normal_optimization": {
+            "iterations": int(args.physical_normal_iterations),
+            "learning_rate": float(args.physical_normal_learning_rate),
+            "envelope": args.physical_normal_envelope,
+            "projection_mode": args.physical_normal_projection_mode,
+            "components": args.physical_normal_components,
+            "max_metric_norm": float(args.physical_normal_max_metric_norm),
+            "gradient_clip": float(args.physical_normal_gradient_clip),
+            "protein_clash_dist": float(args.physical_normal_protein_clash_dist),
+            "ligand_clash_dist": float(args.physical_normal_ligand_clash_dist),
+            "max_clash_atoms": int(args.physical_normal_max_clash_atoms),
+            "weight_peptide": float(args.physical_normal_weight_peptide),
+            "weight_protein_clash": float(
+                args.physical_normal_weight_protein_clash
+            ),
+            "weight_ligand_clash": float(args.physical_normal_weight_ligand_clash),
+            "weight_contact_anchor": float(
+                args.physical_normal_weight_contact_anchor
+            ),
+            "weight_distance_anchor": float(
+                args.physical_normal_weight_distance_anchor
+            ),
+            "weight_residual": float(args.physical_normal_weight_residual),
+            "weight_temporal": float(args.physical_normal_weight_temporal),
+            "optimizer": args.physical_normal_optimizer,
+            "num_starts": int(args.physical_normal_num_starts),
+            "route_seed_scale": float(args.physical_normal_route_seed_scale),
+            "route_seed_rank": int(args.physical_normal_route_seed_rank),
+            "route_seed_smoothing_steps": int(
+                args.physical_normal_route_seed_smoothing_steps
+            ),
+            "route_seed": int(args.physical_normal_route_seed),
+            "frame_aggregation": args.physical_normal_frame_aggregation,
+            "frame_softmax_beta": float(args.physical_normal_frame_softmax_beta),
+            "line_search_steps": int(args.physical_normal_line_search_steps),
+            "line_search_shrink": float(args.physical_normal_line_search_shrink),
+            "acceptance_tolerance": float(
+                args.physical_normal_acceptance_tolerance
+            ),
+        },
         "n_integration_steps": n_steps,
         "integration_clips": integration_clips,
         "active_delta": args.active_delta,
@@ -2336,8 +2809,14 @@ def main() -> None:
         "counts": dict(total_counts),
         "metrics": {key: stat.mean for key, stat in sorted(total_stats.items())},
     }
+    if args.include_per_sample_metrics:
+        summary["per_sample_metrics"] = per_sample_metrics
     text = json.dumps(summary, indent=2, sort_keys=True)
-    print(text)
+    printable_summary = dict(summary)
+    if args.include_per_sample_metrics:
+        printable_summary.pop("per_sample_metrics", None)
+        printable_summary["per_sample_metric_records"] = len(per_sample_metrics)
+    print(json.dumps(printable_summary, indent=2, sort_keys=True))
     if args.output:
         out = Path(args.output)
         out.parent.mkdir(parents=True, exist_ok=True)

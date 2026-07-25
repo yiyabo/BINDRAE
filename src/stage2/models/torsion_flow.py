@@ -27,6 +27,7 @@ from src.stage1.models.ipa import FlashIPAModule, FlashIPAModuleConfig
 from src.stage1.models.ligand_condition import LigandConditioner, LigandConditionerConfig
 from src.stage1.modules.edge_embed import EdgeEmbedderAdapter, ProjectEdgeConfig
 from src.stage2.modules.time_embed import SinusoidalTimeEmbedding
+from src.stage2.modules.low_rank_residual import GraphCoupledLowRankResidualDecoder
 from src.stage2.modules import se3_log, rigid_inverse, rigid_compose, wrap_to_pi
 
 
@@ -82,6 +83,8 @@ class TorsionFlowNetConfig:
     phase_residual_enabled: bool = False
     phase_residual_blockwise: bool = False
     phase_residual_active_blocks: str = "all"
+    phase_residual_decoder_mode: str = "independent"
+    phase_residual_rank: int = 4
     phase_residual_rotation_gate_bias: float = -2.0
     phase_residual_translation_gate_bias: float = -6.0
     phase_residual_chi_gate_bias: float = -2.0
@@ -117,6 +120,18 @@ class TorsionFlowNet(nn.Module):
             raise ValueError(
                 "phase_residual_active_blocks is only available for blockwise residuals"
             )
+        if self.config.phase_residual_decoder_mode not in {"independent", "low_rank"}:
+            raise ValueError(
+                "Unsupported phase_residual_decoder_mode="
+                f"{self.config.phase_residual_decoder_mode}"
+            )
+        if (
+            self.config.phase_residual_decoder_mode == "low_rank"
+            and not self.config.phase_residual_blockwise
+        ):
+            raise ValueError("low_rank residual decoding requires blockwise residuals")
+        if self.config.phase_residual_rank <= 0:
+            raise ValueError("phase_residual_rank must be positive")
         self.phase_residual_active_blocks = (
             {"rotation", "translation", "chi"}
             if self.config.phase_residual_active_blocks == "all"
@@ -244,8 +259,21 @@ class TorsionFlowNet(nn.Module):
         self.residual_chi_gate_mlp = None
         self.residual_rotation_head = None
         self.residual_translation_head = None
+        self.low_rank_residual_decoder = None
         if self.config.phase_residual_enabled:
-            if self.config.phase_residual_blockwise:
+            if self.config.phase_residual_decoder_mode == "low_rank":
+                static_residue_dim = rigid_in_dim - self.config.time_dim
+                self.low_rank_residual_decoder = GraphCoupledLowRankResidualDecoder(
+                    residue_dim=static_residue_dim,
+                    time_dim=self.config.time_dim,
+                    hidden_dim=self.config.head_hidden,
+                    rank=self.config.phase_residual_rank,
+                    active_blocks=self.phase_residual_active_blocks,
+                    rotation_gate_bias=self.config.phase_residual_rotation_gate_bias,
+                    translation_gate_bias=self.config.phase_residual_translation_gate_bias,
+                    chi_gate_bias=self.config.phase_residual_chi_gate_bias,
+                )
+            elif self.config.phase_residual_blockwise:
                 def make_gate(input_dim: int, bias: float) -> nn.Sequential:
                     gate_module = nn.Sequential(
                         nn.Linear(input_dim, self.config.head_hidden),
@@ -326,8 +354,13 @@ class TorsionFlowNet(nn.Module):
                 stage1_chi_mask: Optional[torch.Tensor] = None, # [B, N]
                  interaction_prior: Optional[torch.Tensor] = None, # [B, N] or [B, N, D]
                  esm_gate_context: Optional[torch.Tensor] = None,
-                 current_step: Optional[int] = None,
-                 return_repa: bool = False) -> Dict[str, torch.Tensor]:
+                current_step: Optional[int] = None,
+                return_repa: bool = False,
+                chi_mask: Optional[torch.Tensor] = None,
+                residual_basis_rigids: Optional[Rigid] = None,
+                residual_endpoint_delta_f: Optional[torch.Tensor] = None,
+                residual_endpoint_delta_chi: Optional[torch.Tensor] = None,
+                ) -> Dict[str, torch.Tensor]:
         """
         Returns:
             Vector-field outputs plus optional dedicated phase-residual heads.
@@ -477,7 +510,84 @@ class TorsionFlowNet(nn.Module):
             "time_warp_logits": time_warp_logits,
         }
         if self.config.phase_residual_enabled:
-            if self.config.phase_residual_blockwise:
+            basis_ipa_dependency = chi.new_tensor(0.0)
+            if self.config.phase_residual_decoder_mode == "low_rank":
+                s_basis_geo = s_geo
+                if residual_basis_rigids is not None:
+                    basis_edge_outputs = self.edge_embedder(
+                        s,
+                        residual_basis_rigids.get_trans(),
+                        node_mask,
+                    )
+                    s_basis_geo, basis_rigids_geo = self.ipa_module(
+                        s,
+                        residual_basis_rigids,
+                        basis_edge_outputs['z_f1'],
+                        basis_edge_outputs['z_f2'],
+                        node_mask,
+                        ligand_conditioner=self.ligand_conditioner,
+                        lig_points=lig_points,
+                        lig_types=lig_types,
+                        protein_mask=node_mask,
+                        ligand_mask=lig_mask,
+                        current_step=current_step,
+                    )
+                    basis_ipa_dependency = (
+                        basis_rigids_geo.get_trans().sum()
+                        + basis_rigids_geo.get_rots().get_rot_mats().sum()
+                    ) * 0.0
+
+                endpoint_delta_f = (
+                    delta_f
+                    if residual_endpoint_delta_f is None
+                    else residual_endpoint_delta_f
+                )
+                endpoint_delta_chi = (
+                    delta_chi
+                    if residual_endpoint_delta_chi is None
+                    else residual_endpoint_delta_chi
+                )
+                if endpoint_delta_f.shape != (B, N, self.config.delta_f_dim):
+                    raise ValueError("residual_endpoint_delta_f shape mismatch")
+                if endpoint_delta_chi.shape != (B, N, self.config.delta_chi_dim):
+                    raise ValueError("residual_endpoint_delta_chi shape mismatch")
+                static_residual_input = torch.cat(
+                    [
+                        s_basis_geo,
+                        *scalar_features,
+                        endpoint_delta_f,
+                        endpoint_delta_chi,
+                    ],
+                    dim=-1,
+                )
+                if self.config.nma_dim > 0:
+                    static_residual_input = torch.cat(
+                        [static_residual_input, nma_features],
+                        dim=-1,
+                    )
+                if chi_mask is None:
+                    chi_mask = torch.ones_like(chi, dtype=torch.bool)
+                low_rank = self.low_rank_residual_decoder(
+                    static_residual_input,
+                    t_emb[:, 0],
+                    (
+                        node_mask
+                        if node_mask is not None
+                        else torch.ones((B, N), dtype=torch.bool, device=chi.device)
+                    ),
+                    chi_mask,
+                )
+                residual_rotation = low_rank['residual_rotation']
+                residual_translation = low_rank['residual_translation']
+                residual_chi = low_rank['residual_chi']
+                residual_rotation_gate = low_rank['residual_rotation_gate']
+                residual_translation_gate = low_rank['residual_translation_gate']
+                residual_chi_gate = low_rank['residual_chi_gate']
+                residual_gate = low_rank['residual_gate']
+                residual_rigid = torch.cat(
+                    [residual_rotation, residual_translation], dim=-1
+                )
+            elif self.config.phase_residual_blockwise:
                 residual_rotation_gate = torch.sigmoid(
                     self.residual_rotation_gate_mlp(gate_input)
                 ) * float("rotation" in self.phase_residual_active_blocks)
@@ -533,7 +643,7 @@ class TorsionFlowNet(nn.Module):
                 + d_trans.sum()
                 + gate.sum()
                 + time_warp_logits.sum()
-            ) * 0.0 + ipa_update_dependency
+            ) * 0.0 + ipa_update_dependency + basis_ipa_dependency
             residual_chi = residual_chi + legacy_dependency
             out["d_chi"] = out["d_chi"] + (
                 residual_chi.sum() + residual_rigid.sum() + residual_gate.sum()
@@ -549,6 +659,18 @@ class TorsionFlowNet(nn.Module):
                     residual_rotation_gate=residual_rotation_gate,
                     residual_translation_gate=residual_translation_gate,
                     residual_chi_gate=residual_chi_gate,
+                )
+            if self.config.phase_residual_decoder_mode == "low_rank":
+                out.update(
+                    residual_rotation_coefficients=low_rank[
+                        'residual_rotation_coefficients'
+                    ],
+                    residual_translation_coefficients=low_rank[
+                        'residual_translation_coefficients'
+                    ],
+                    residual_chi_coefficients=low_rank[
+                        'residual_chi_coefficients'
+                    ],
                 )
         if self.repa_student_proj is not None:
             repa_student = self.repa_student_proj(s_geo)

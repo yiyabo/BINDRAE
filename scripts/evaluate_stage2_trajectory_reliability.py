@@ -28,13 +28,14 @@ flash_ipa_path = project_root / "vendor" / "flash_ipa" / "src"
 if flash_ipa_path.exists():
     sys.path.insert(0, str(flash_ipa_path))
 
-from evaluate_stage2_transition_paths import (  # noqa: E402
+from scripts.evaluate_stage2_transition_paths import (  # noqa: E402
     batch_to_device,
     build_model_config_for_checkpoint,
     build_rigids_from_backbone,
     combined_prior_features,
     compute_interaction_prior_feature,
-    integrate_path,
+    construct_path,
+    esm_gate_context,
     load_model_state_allow_timewarp_head,
     min_sc_ligand_dist,
     rigid_to_rt,
@@ -65,6 +66,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split", default="val", choices=["train", "val", "test"])
     parser.add_argument("--index_file", default=None)
     parser.add_argument("--valid_samples_file", default=None)
+    parser.add_argument("--trust_prechecked_samples", action="store_true")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--device", default="cuda")
@@ -126,6 +128,39 @@ def parse_args() -> argparse.Namespace:
         help="Endpoint-zero envelope for --include_boundary_native.",
     )
     parser.add_argument("--boundary_residual_scale", type=float, default=1.0)
+    parser.add_argument(
+        "--phase_tau_postprocess",
+        choices=["none", "cummax"],
+        default=None,
+    )
+    parser.add_argument(
+        "--phase_residual_peptide_retraction",
+        dest="phase_residual_peptide_retraction",
+        action="store_true",
+        default=None,
+    )
+    parser.add_argument(
+        "--no_phase_residual_peptide_retraction",
+        dest="phase_residual_peptide_retraction",
+        action="store_false",
+    )
+    parser.add_argument(
+        "--phase_residual_peptide_retraction_iterations", type=int, default=None
+    )
+    parser.add_argument(
+        "--phase_residual_peptide_retraction_relaxation", type=float, default=None
+    )
+    parser.add_argument(
+        "--phase_residual_peptide_retraction_anchor_strength", type=float, default=None
+    )
+    parser.add_argument(
+        "--phase_residual_peptide_retraction_max_translation", type=float, default=None
+    )
+    parser.add_argument(
+        "--phase_residual_peptide_retraction_activation_loss_threshold",
+        type=float,
+        default=None,
+    )
     parser.add_argument("--output", default=None, help="optional JSON output path")
     parser.add_argument(
         "--per_sample_output",
@@ -373,26 +408,50 @@ def build_model_path(
         stage1v2_settings,
         interaction_settings,
     )
-    model_path = integrate_path(
+    path_args = SimpleNamespace(**vars(args))
+    for name in (
+        "path_parameterization",
+        "time_warp_logit_scale",
+        "time_warp_rate_eps",
+        "time_warp_rate_clip",
+        "phase_residual_tau_mode",
+        "phase_warp_variant",
+        "phase_nonmonotone_max_offset",
+        "phase_chain_residual_scale",
+        "phase_chain_smoothing_steps",
+        "phase_tau_postprocess",
+        "phase_residual_bridge_mode",
+        "phase_residual_envelope",
+        "phase_residual_scale",
+        "phase_residual_rotation_metric_scale",
+        "phase_residual_translation_metric_scale",
+        "phase_residual_chi_metric_scale",
+        "phase_residual_min_tangent_norm",
+        "phase_residual_max_metric_norm",
+        "phase_residual_peptide_retraction",
+        "phase_residual_peptide_retraction_iterations",
+        "phase_residual_peptide_retraction_relaxation",
+        "phase_residual_peptide_retraction_anchor_strength",
+        "phase_residual_peptide_retraction_max_translation",
+        "phase_residual_peptide_retraction_activation_loss_threshold",
+    ):
+        if not hasattr(path_args, name):
+            setattr(path_args, name, None)
+    gate_context = esm_gate_context(args.config, batch, stage1v2_settings)
+    rigids, chi, times, _ = construct_path(
+        path_args,
+        args.config,
         model,
         batch,
         rigids_apo,
-        batch.torsion_apo[..., 3:7],
-        n_steps=n_steps,
-        interaction_prior=prior_features,
-        chi_clip=integration_clips["chi"],
-        rot_clip=integration_clips["rot"],
-        trans_clip=integration_clips["trans"],
+        rigids_holo,
+        n_steps,
+        prior_features,
+        gate_context,
+        integration_clips,
+        fk_module=fk_module,
     )
-    if getattr(args.config, "path_parameterization", "flow") == "projected_flow":
-        schedule = getattr(args.config, "terminal_projection_schedule", "smootherstep")
-        return project_terminal_path(
-            model_path,
-            rigids_holo,
-            batch.torsion_holo[..., 3:7],
-            schedule,
-        )
-    return model_path
+    return rigids, chi, times
 
 
 def class_masks(args, batch, d_apo: torch.Tensor, d_holo: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -459,8 +518,156 @@ def add_geometry_scores(args, stats, prefix: str, batch, atom14_list: List[Dict]
             )
         )
         stats[prefix + "path/peptide_loss"].add_scalar(
-            compute_peptide_loss(atom14_pos, atom14_mask, batch.node_mask)
+            compute_peptide_loss(
+                atom14_pos,
+                atom14_mask,
+                batch.node_mask,
+                peptide_bond_mask=batch.peptide_bond_mask,
+            )
         )
+
+
+def _dihedral_angle(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    c: torch.Tensor,
+    d: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    b0 = b - a
+    b1 = c - b
+    b2 = d - c
+    b1_unit = b1 / torch.linalg.vector_norm(b1, dim=-1, keepdim=True).clamp_min(eps)
+    v = b0 - (b0 * b1_unit).sum(dim=-1, keepdim=True) * b1_unit
+    w = b2 - (b2 * b1_unit).sum(dim=-1, keepdim=True) * b1_unit
+    x = (v * w).sum(dim=-1)
+    y = (torch.cross(b1_unit, v, dim=-1) * w).sum(dim=-1)
+    return torch.atan2(y, x)
+
+
+def _masked_sample_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    weights = mask.float()
+    return (values * weights).sum(dim=-1) / weights.sum(dim=-1).clamp(min=1.0)
+
+
+def _masked_sample_max(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    masked = values.masked_fill(~mask, float("-inf"))
+    result = masked.max(dim=-1).values
+    return torch.where(torch.isfinite(result), result, torch.zeros_like(result))
+
+
+def peptide_geometry_metrics(
+    atom14_pos: torch.Tensor,
+    atom14_mask: torch.Tensor,
+    node_mask: torch.Tensor,
+    peptide_bond_mask: torch.Tensor,
+) -> Dict[str, torch.Tensor]:
+    """Return per-sample covalent geometry diagnostics for valid peptide bonds."""
+    n = atom14_pos[:, :, 0]
+    ca = atom14_pos[:, :, 1]
+    c = atom14_pos[:, :, 2]
+    valid = (
+        peptide_bond_mask.bool()
+        & node_mask[:, :-1].bool()
+        & node_mask[:, 1:].bool()
+        & atom14_mask[:, :-1, 1].bool()
+        & atom14_mask[:, :-1, 2].bool()
+        & atom14_mask[:, 1:, 0].bool()
+        & atom14_mask[:, 1:, 1].bool()
+    )
+    bond_error = torch.abs(torch.linalg.vector_norm(c[:, :-1] - n[:, 1:], dim=-1) - 1.33)
+
+    def angle(v1: torch.Tensor, v2: torch.Tensor) -> torch.Tensor:
+        v1 = v1 / torch.linalg.vector_norm(v1, dim=-1, keepdim=True).clamp_min(1e-8)
+        v2 = v2 / torch.linalg.vector_norm(v2, dim=-1, keepdim=True).clamp_min(1e-8)
+        return torch.acos((v1 * v2).sum(dim=-1).clamp(-1.0, 1.0))
+
+    angle_cacn = angle(ca[:, :-1] - c[:, :-1], n[:, 1:] - c[:, :-1])
+    angle_cnca = angle(c[:, :-1] - n[:, 1:], ca[:, 1:] - n[:, 1:])
+    angle_error = 0.5 * (
+        torch.abs(angle_cacn - 2.035) + torch.abs(angle_cnca - 2.124)
+    )
+    omega = _dihedral_angle(ca[:, :-1], c[:, :-1], n[:, 1:], ca[:, 1:])
+    omega_planarity_error = torch.minimum(
+        torch.abs(wrap_to_pi(omega)),
+        torch.abs(wrap_to_pi(omega - math.pi)),
+    )
+    return {
+        "peptide_bond_count": valid.sum(dim=-1).float(),
+        "peptide_bond_mae_a": _masked_sample_mean(bond_error, valid),
+        "peptide_bond_max_error_a": _masked_sample_max(bond_error, valid),
+        "peptide_bond_violation_frac": _masked_sample_mean(
+            (bond_error > 0.10).float(), valid
+        ),
+        "peptide_angle_mae_rad": _masked_sample_mean(angle_error, valid),
+        "peptide_angle_violation_frac": _masked_sample_mean(
+            (angle_error > math.radians(15.0)).float(), valid
+        ),
+        "peptide_omega_planarity_mae_rad": _masked_sample_mean(
+            omega_planarity_error, valid
+        ),
+        "peptide_omega_violation_frac": _masked_sample_mean(
+            (omega_planarity_error > math.radians(30.0)).float(), valid
+        ),
+    }
+
+
+def per_sample_path_geometry(
+    args,
+    batch,
+    atom14_list: List[Dict],
+) -> List[Dict[str, float]]:
+    """Aggregate interior-frame physical metrics without endpoint dilution."""
+    batch_size = int(batch.node_mask.shape[0])
+    values: List[Dict[str, List[float]]] = [defaultdict(list) for _ in range(batch_size)]
+    interior = atom14_list[1:-1] if len(atom14_list) > 2 else atom14_list
+    for atom14 in interior:
+        positions = atom14["atom14_pos"].float().clamp(min=-1000.0, max=1000.0)
+        valid = atom14["atom14_mask"].bool() & batch.node_mask.unsqueeze(-1)
+        peptide = peptide_geometry_metrics(
+            positions,
+            valid,
+            batch.node_mask,
+            batch.peptide_bond_mask,
+        )
+        for batch_index in range(batch_size):
+            for key, tensor in peptide.items():
+                values[batch_index][key].append(float(tensor[batch_index].item()))
+            flat_valid = valid[batch_index].reshape(-1)
+            flat_all_positions = positions[batch_index].reshape(-1, 3)
+            flat_positions = flat_all_positions[flat_valid]
+            ligand_valid = batch.lig_mask[batch_index].bool()
+            ligand = batch.lig_points[batch_index][ligand_valid].float()
+            if flat_positions.numel() and ligand.numel():
+                min_ligand = torch.cdist(flat_positions.float(), ligand).min(dim=-1).values
+                values[batch_index]["ligand_clash_atom_fraction"].append(
+                    float((min_ligand < float(args.clash_threshold)).float().mean().item())
+                )
+                values[batch_index]["ligand_min_heavy_atom_distance_a"].append(
+                    float(min_ligand.min().item())
+                )
+            if int(flat_valid.sum()) >= 2:
+                values[batch_index]["all_atom_clash_penalty"].append(
+                    float(
+                        clash_penalty(
+                            flat_all_positions.unsqueeze(0),
+                            clash_threshold=float(args.clash_threshold),
+                            aatype=batch.aatype[batch_index : batch_index + 1],
+                            atom_mask=flat_valid.unsqueeze(0),
+                            sample_size=int(args.clash_sample_size),
+                        ).item()
+                    )
+                )
+    result: List[Dict[str, float]] = []
+    for sample_values in values:
+        row = {}
+        for key, entries in sample_values.items():
+            if not entries:
+                continue
+            reducer = max if "max_error" in key else min if key.startswith("ligand_min") else None
+            row[key] = float(reducer(entries) if reducer else sum(entries) / len(entries))
+        result.append(row)
+    return result
 
 
 def _masked_mean_value(values: torch.Tensor, mask: torch.Tensor):
@@ -495,6 +702,7 @@ def build_per_sample_rows(
     atom_err: torch.Tensor,
     atom_overlap: torch.Tensor,
     pred_contact: torch.Tensor,
+    path_geometry: Optional[List[Dict[str, float]]] = None,
 ) -> List[Dict[str, object]]:
     rows: List[Dict[str, object]] = []
     bsz = int(batch.node_mask.shape[0])
@@ -529,6 +737,8 @@ def build_per_sample_rows(
         row["formed_contact/recall"] = _masked_mean_value(pred_contact[b].float(), formed)
         row["released_contact/release_success"] = _masked_mean_value((~pred_contact[b]).float(), released)
         row["stable_contact/retention"] = _masked_mean_value(pred_contact[b].float(), stable_contact)
+        if path_geometry is not None:
+            row.update(path_geometry[b])
         rows.append(row)
     return rows
 
@@ -639,6 +849,7 @@ def evaluate_path(
         batch.chi_mask.bool(),
     )
     add_geometry_scores(args, stats, prefix, batch, atom14_list)
+    path_geometry = per_sample_path_geometry(args, batch, atom14_list)
     return build_per_sample_rows(
         args,
         method,
@@ -654,6 +865,7 @@ def evaluate_path(
         atom_err,
         atom_overlap,
         pred_contact,
+        path_geometry,
     )
 
 
@@ -661,6 +873,27 @@ def summarize(stats: Dict[str, RunningMean]) -> Dict[str, object]:
     return {
         "metrics": {key: stat.mean for key, stat in sorted(stats.items())},
         "metric_counts": {key: stat.count for key, stat in sorted(stats.items())},
+    }
+
+
+def summarize_per_sample_rows(rows: List[Dict[str, object]]) -> Dict[str, object]:
+    by_method: Dict[str, Dict[str, List[float]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    for row in rows:
+        method = str(row["method"])
+        for key, value in row.items():
+            if key in {"sample_id", "method", "n_residues"}:
+                continue
+            if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                by_method[method][key].append(float(value))
+    return {
+        method: {
+            key: float(sum(values) / len(values))
+            for key, values in sorted(metric_values.items())
+            if values
+        }
+        for method, metric_values in sorted(by_method.items())
     }
 
 
@@ -692,6 +925,7 @@ def main() -> None:
         require_nma=bool(getattr(config, "use_nma", False)),
         index_file=args.index_file,
         valid_samples_file=args.valid_samples_file,
+        trust_prechecked_samples=args.trust_prechecked_samples,
         stage1v2_posterior_cache_dir=stage1v2_settings["cache_dir"],
         stage1v2_posterior_feature_mode=stage1v2_settings["mode"],
         stage1v2_posterior_feature_names=stage1v2_settings["names_raw"],
@@ -803,7 +1037,18 @@ def main() -> None:
         "include_boundary_native": bool(args.include_boundary_native),
         "boundary_residual_envelope": args.boundary_residual_envelope,
         "boundary_residual_scale": float(args.boundary_residual_scale),
+        "phase_tau_postprocess": (
+            args.phase_tau_postprocess
+            if args.phase_tau_postprocess is not None
+            else getattr(config, "phase_tau_postprocess", "none")
+        ),
+        "phase_residual_peptide_retraction": (
+            bool(args.phase_residual_peptide_retraction)
+            if args.phase_residual_peptide_retraction is not None
+            else bool(getattr(config, "phase_residual_peptide_retraction", False))
+        ),
         "counts": dict(counts),
+        "per_sample_metric_summary": summarize_per_sample_rows(per_sample_rows),
         **summarize(stats),
     }
     text = json.dumps(summary, indent=2, sort_keys=True)

@@ -43,6 +43,8 @@ from ..modules import (
     compute_peptide_loss,
     compute_w_eff,
     endpoint_zero_envelope,
+    PHASE_WARP_VARIANTS,
+    phase_tau_from_logits,
     project_block_tangent_normal,
     project_product_tangent_normal,
     project_peptide_frame_translations,
@@ -61,21 +63,27 @@ from src.stage1.modules.losses import clash_penalty, fape_loss
 _SHARED_TRUNK_REINIT_PREFIXES = (
     'time_warp_head.',
     'residual_',
+    'low_rank_residual_decoder.',
+)
+_PHASE_WARP_REINIT_PREFIXES = (
+    'residual_',
+    'low_rank_residual_decoder.',
 )
 
 
-def _select_shared_trunk_warm_start_state(
+def _select_warm_start_state(
     source_state: Mapping[str, torch.Tensor],
     target_state: Mapping[str, torch.Tensor],
+    reset_prefixes: Tuple[str, ...],
 ) -> Tuple[Dict[str, torch.Tensor], List[str], List[str]]:
-    """Select compatible shared weights while resetting path-specific heads."""
+    """Select compatible weights while resetting a named module family."""
     selected: Dict[str, torch.Tensor] = {}
     reset_target = []
     ignored_source = []
     incompatible = []
 
     for name, target_value in target_state.items():
-        if name.startswith(_SHARED_TRUNK_REINIT_PREFIXES):
+        if name.startswith(reset_prefixes):
             reset_target.append(name)
             continue
         source_value = source_state.get(name)
@@ -92,7 +100,7 @@ def _select_shared_trunk_warm_start_state(
 
     for name in source_state:
         if name not in target_state:
-            if name.startswith(_SHARED_TRUNK_REINIT_PREFIXES):
+            if name.startswith(reset_prefixes):
                 ignored_source.append(name)
             else:
                 incompatible.append(f"unexpected source key {name}")
@@ -100,10 +108,90 @@ def _select_shared_trunk_warm_start_state(
     if incompatible:
         shown = '; '.join(incompatible[:8])
         extra = '' if len(incompatible) <= 8 else f" ... (+{len(incompatible) - 8})"
-        raise RuntimeError(f"Incompatible shared-trunk checkpoint: {shown}{extra}")
+        raise RuntimeError(f"Incompatible warm-start checkpoint: {shown}{extra}")
     if not selected:
-        raise RuntimeError("Shared-trunk checkpoint selected no parameters")
+        raise RuntimeError("Warm-start checkpoint selected no parameters")
     return selected, reset_target, ignored_source
+
+
+def _select_shared_trunk_warm_start_state(
+    source_state: Mapping[str, torch.Tensor],
+    target_state: Mapping[str, torch.Tensor],
+) -> Tuple[Dict[str, torch.Tensor], List[str], List[str]]:
+    """Select compatible shared weights while resetting path-specific heads."""
+    return _select_warm_start_state(
+        source_state, target_state, _SHARED_TRUNK_REINIT_PREFIXES
+    )
+
+
+def _select_phase_warp_warm_start_state(
+    source_state: Mapping[str, torch.Tensor],
+    target_state: Mapping[str, torch.Tensor],
+) -> Tuple[Dict[str, torch.Tensor], List[str], List[str]]:
+    """Preserve the learned phase/trunk and reset spatial residual heads."""
+    return _select_warm_start_state(
+        source_state, target_state, _PHASE_WARP_REINIT_PREFIXES
+    )
+
+
+def _phase_normal_target_weights(
+    base_weight: torch.Tensor,
+    target_rigid: torch.Tensor,
+    target_chi: torch.Tensor,
+    target_chi_mask: torch.Tensor,
+    *,
+    mode: str,
+    magnitude_scale: float,
+    magnitude_boost: float,
+    time_envelope: Optional[torch.Tensor] = None,
+    rotation_scale: float = 1.0,
+    translation_scale: float = 1.0,
+    chi_scale: float = 1.0,
+) -> torch.Tensor:
+    """Build training weights without changing the validation metric."""
+    valid_modes = {
+        'uniform',
+        'target_magnitude',
+        'applied_path',
+        'applied_path_magnitude',
+    }
+    if mode not in valid_modes:
+        raise ValueError(f"Unsupported phase-normal target weight mode={mode!r}")
+    weight = base_weight
+    if mode in {'applied_path', 'applied_path_magnitude'}:
+        if time_envelope is None:
+            raise ValueError("applied-path weighting requires a time envelope")
+        envelope = time_envelope.to(device=weight.device, dtype=weight.dtype)
+        if envelope.ndim == 1:
+            envelope = envelope.view(-1, 1, 1)
+        if envelope.shape[0] != weight.shape[0]:
+            raise ValueError("time envelope and target time grid do not match")
+        weight = weight * envelope.square()
+    if mode in {'uniform', 'applied_path'}:
+        return weight
+    if magnitude_scale <= 0.0:
+        raise ValueError("phase-normal magnitude scale must be > 0")
+    if magnitude_boost < 0.0:
+        raise ValueError("phase-normal magnitude boost must be >= 0")
+
+    rigid_metric = torch.cat(
+        [
+            target_rigid[..., :3] / float(rotation_scale),
+            target_rigid[..., 3:] / float(translation_scale),
+        ],
+        dim=-1,
+    )
+    chi_metric = (
+        target_chi / float(chi_scale)
+    ) * target_chi_mask.to(dtype=target_chi.dtype)
+    magnitude = torch.sqrt(
+        (
+            rigid_metric.square().sum(dim=-1)
+            + chi_metric.square().sum(dim=-1)
+        ).clamp_min(0.0)
+    )
+    relative = (magnitude / float(magnitude_scale)).clamp(0.0, 1.0)
+    return weight * (1.0 + float(magnitude_boost) * relative)
 
 
 class Stage2Trainer:
@@ -509,6 +597,16 @@ class Stage2Trainer:
             raise ValueError(
                 f"Unsupported phase_residual_tau_mode={config.phase_residual_tau_mode}"
             )
+        if config.phase_warp_variant not in PHASE_WARP_VARIANTS:
+            raise ValueError(
+                f"Unsupported phase_warp_variant={config.phase_warp_variant}"
+            )
+        if not 0.0 < float(config.phase_nonmonotone_max_offset) <= 1.0:
+            raise ValueError("phase_nonmonotone_max_offset must be in (0, 1]")
+        if float(config.phase_chain_residual_scale) < 0.0:
+            raise ValueError("phase_chain_residual_scale must be >= 0")
+        if int(config.phase_chain_smoothing_steps) < 0:
+            raise ValueError("phase_chain_smoothing_steps must be >= 0")
         if config.phase_residual_bridge_mode not in {
             'se3_geodesic', 'cartesian_backbone'
         }:
@@ -538,6 +636,21 @@ class Stage2Trainer:
                 "phase_residual_active_blocks is only valid for "
                 "phase_block_orthogonal_residual_v2"
             )
+        if config.phase_residual_decoder_mode not in {'independent', 'low_rank'}:
+            raise ValueError(
+                "Unsupported phase_residual_decoder_mode="
+                f"{config.phase_residual_decoder_mode}"
+            )
+        if (
+            config.phase_residual_decoder_mode == 'low_rank'
+            and config.path_parameterization != 'phase_block_orthogonal_residual_v2'
+        ):
+            raise ValueError(
+                "phase_residual_decoder_mode=low_rank requires "
+                "phase_block_orthogonal_residual_v2"
+            )
+        if config.phase_residual_rank <= 0:
+            raise ValueError("phase_residual_rank must be positive")
         if config.phase_residual_envelope not in {'poly', 'sin2'}:
             raise ValueError(
                 f"Unsupported phase_residual_envelope={config.phase_residual_envelope}"
@@ -565,6 +678,24 @@ class Stage2Trainer:
         if not 0.0 <= float(config.phase_normal_residual_min_confidence) <= 1.0:
             raise ValueError(
                 "phase_normal_residual_min_confidence must be in [0, 1]"
+            )
+        if config.phase_normal_residual_weight_mode not in {
+            'uniform',
+            'target_magnitude',
+            'applied_path',
+            'applied_path_magnitude',
+        }:
+            raise ValueError(
+                "Unsupported phase_normal_residual_weight_mode="
+                f"{config.phase_normal_residual_weight_mode}"
+            )
+        if float(config.phase_normal_residual_magnitude_scale) <= 0.0:
+            raise ValueError(
+                "phase_normal_residual_magnitude_scale must be > 0"
+            )
+        if float(config.phase_normal_residual_magnitude_boost) < 0.0:
+            raise ValueError(
+                "phase_normal_residual_magnitude_boost must be >= 0"
             )
         if int(config.phase_residual_peptide_retraction_iterations) < 0:
             raise ValueError(
@@ -709,6 +840,18 @@ class Stage2Trainer:
             raise ValueError(
                 "phase_teacher_head_only and phase_teacher_residual_heads_only "
                 "are mutually exclusive"
+            )
+        if config.phase_residual_heads_only and config.w_phase_normal_residual <= 0.0:
+            raise ValueError(
+                "phase_residual_heads_only requires phase-normal supervision"
+            )
+        if config.phase_residual_heads_only and (
+            config.phase_teacher_head_only
+            or config.phase_teacher_residual_heads_only
+        ):
+            raise ValueError(
+                "phase_residual_heads_only is mutually exclusive with phase teacher "
+                "head-only modes"
             )
         if config.supervision_replica_mode not in {'cycle', 'first'}:
             raise ValueError(
@@ -895,6 +1038,8 @@ class Stage2Trainer:
                 config.path_parameterization == 'phase_block_orthogonal_residual_v2'
             ),
             phase_residual_active_blocks=config.phase_residual_active_blocks,
+            phase_residual_decoder_mode=config.phase_residual_decoder_mode,
+            phase_residual_rank=config.phase_residual_rank,
             phase_residual_rotation_gate_bias=(
                 config.phase_residual_rotation_gate_bias
             ),
@@ -911,7 +1056,11 @@ class Stage2Trainer:
             self._init_model_from_checkpoint(config.init_from_checkpoint)
         elif config.init_from_checkpoint and self.is_main_process:
             print("[Init] Skipping init_from_checkpoint because this run will resume from its own checkpoint")
-        if config.phase_teacher_head_only or config.phase_teacher_residual_heads_only:
+        if (
+            config.phase_teacher_head_only
+            or config.phase_teacher_residual_heads_only
+            or config.phase_residual_heads_only
+        ):
             trainable_prefixes = ('time_warp_head.',)
             scope_name = 'phase head'
             if config.phase_teacher_residual_heads_only:
@@ -925,8 +1074,22 @@ class Stage2Trainer:
                     'residual_rigid_head.',
                     'residual_rotation_head.',
                     'residual_translation_head.',
+                    'low_rank_residual_decoder.',
                 )
                 scope_name = 'phase/residual heads'
+            if config.phase_residual_heads_only:
+                trainable_prefixes = (
+                    'residual_gate_mlp.',
+                    'residual_rotation_gate_mlp.',
+                    'residual_translation_gate_mlp.',
+                    'residual_chi_gate_mlp.',
+                    'residual_chi_head.',
+                    'residual_rigid_head.',
+                    'residual_rotation_head.',
+                    'residual_translation_head.',
+                    'low_rank_residual_decoder.',
+                )
+                scope_name = 'spatial residual heads'
             for name, parameter in self.model.named_parameters():
                 parameter.requires_grad_(name.startswith(trainable_prefixes))
             trainable = sum(
@@ -935,7 +1098,7 @@ class Stage2Trainer:
                 if parameter.requires_grad
             )
             if trainable <= 0:
-                raise RuntimeError("phase_teacher_head_only left no trainable parameters")
+                raise RuntimeError("head-only training left no trainable parameters")
             if self.is_main_process:
                 print(
                     f"[PhaseTeacher] {scope_name}-only diagnostic: "
@@ -1202,10 +1365,10 @@ class Stage2Trainer:
         if not path.is_file():
             raise FileNotFoundError(f"init_from_checkpoint='{checkpoint_path}' not found")
         mode = str(getattr(self.config, 'init_from_checkpoint_mode', 'strict'))
-        if mode not in {'strict', 'shared_trunk'}:
+        if mode not in {'strict', 'shared_trunk', 'phase_warp'}:
             raise ValueError(
                 f"Unsupported init_from_checkpoint_mode={mode!r}; expected "
-                "'strict' or 'shared_trunk'"
+                "'strict', 'shared_trunk', or 'phase_warp'"
             )
         if self.is_main_process:
             print(f"[Init] Loading model weights only from: {path} (mode={mode})")
@@ -1224,6 +1387,13 @@ class Stage2Trainer:
                     self.model.state_dict(),
                 )
             )
+        elif mode == 'phase_warp':
+            load_state, reset_target, ignored_source = (
+                _select_phase_warp_warm_start_state(
+                    state,
+                    self.model.state_dict(),
+                )
+            )
         result = self.model.load_state_dict(load_state, strict=False)
         unexpected = list(result.unexpected_keys)
         missing = list(result.missing_keys)
@@ -1236,7 +1406,7 @@ class Stage2Trainer:
             )
         if self.is_main_process:
             detail = ""
-            if mode == 'shared_trunk':
+            if mode in {'shared_trunk', 'phase_warp'}:
                 detail = (
                     f" loaded={len(load_state)} reset={len(reset_target)} "
                     f"ignored_source={len(ignored_source)}"
@@ -2349,7 +2519,6 @@ class Stage2Trainer:
             }
             return tau_values
 
-        rates: List[torch.Tensor] = []
         logits_list: List[torch.Tensor] = []
         for k in range(n_steps):
             t_mid = (k + 0.5) / n_steps
@@ -2384,26 +2553,32 @@ class Stage2Trainer:
                 current_step=self.global_step,
             )
             logits = out['time_warp_logits'].squeeze(-1).float() * node_mask_f
-            scaled_logits = logits * float(self.config.time_warp_logit_scale)
-            rate = F.softplus(scaled_logits) + float(self.config.time_warp_rate_eps)
-            if float(self.config.time_warp_rate_clip) > 0.0:
-                rate = rate.clamp(max=float(self.config.time_warp_rate_clip))
-            rate = torch.where(node_mask, rate, torch.ones_like(rate))
-            rates.append(rate)
             logits_list.append(logits)
 
-        rate_stack = torch.stack(rates, dim=0)
-        cumulative = torch.cumsum(rate_stack, dim=0)
-        total_rate = cumulative[-1].clamp(min=float(self.config.time_warp_rate_eps))
-        tau_values = [
-            torch.zeros((bsz, n_res), dtype=torch.float32, device=self.device)
-        ]
-        tau_values.extend(
-            (cumulative[k] / total_rate).clamp(0.0, 1.0)
-            for k in range(n_steps)
+        logits_stack = torch.stack(logits_list, dim=0)
+        phase = phase_tau_from_logits(
+            logits_stack,
+            node_mask,
+            variant=self.config.phase_warp_variant,
+            logit_scale=float(self.config.time_warp_logit_scale),
+            rate_eps=float(self.config.time_warp_rate_eps),
+            rate_clip=float(self.config.time_warp_rate_clip),
+            nonmonotone_max_offset=float(
+                self.config.phase_nonmonotone_max_offset
+            ),
+            peptide_bond_mask=getattr(batch, 'peptide_bond_mask', None),
+            chain_residual_scale=float(
+                getattr(self.config, 'phase_chain_residual_scale', 1.0)
+            ),
+            chain_smoothing_steps=int(
+                getattr(self.config, 'phase_chain_smoothing_steps', 2)
+            ),
         )
+        tau_stack = phase['tau']
+        rate_stack = phase['interval_rate']
+        effective_logits_stack = phase['effective_logits']
+        tau_values = list(tau_stack.unbind(dim=0))
 
-        tau_stack = torch.stack(tau_values, dim=0)
         base_grid = torch.linspace(
             0.0,
             1.0,
@@ -2416,7 +2591,6 @@ class Stage2Trainer:
         valid_tau_count = valid_tau.float().sum().clamp(min=1.0)
         valid_rate_count = valid_rate.float().sum().clamp(min=1.0)
         tau_abs = (tau_stack - base_grid).abs()
-        logits_stack = torch.stack(logits_list, dim=0)
         self._last_timewarp_stats = {
             "time_warp_tau_abs_mean": (
                 tau_abs[valid_tau].sum() / valid_tau_count
@@ -2425,13 +2599,14 @@ class Stage2Trainer:
                 tau_abs.masked_fill(~valid_tau, 0.0).max()
             ).detach(),
             "time_warp_rate_mean": (
-                rate_stack[valid_rate].sum() / valid_rate_count
+                rate_stack.abs()[valid_rate].sum() / valid_rate_count
             ).detach(),
             "time_warp_rate_max": (
-                rate_stack.masked_fill(~valid_rate, 0.0).max()
+                rate_stack.abs().masked_fill(~valid_rate, 0.0).max()
             ).detach(),
             "time_warp_logit_abs_mean": (
-                logits_stack.abs()[valid_rate].sum() / valid_rate_count
+                effective_logits_stack.abs()[valid_rate].sum()
+                / valid_rate_count
             ).detach(),
         }
         return tau_values
@@ -2472,6 +2647,23 @@ class Stage2Trainer:
         bridge_tangent_chi = wrap_to_pi(
             batch.torsion_holo[..., 3:7] - batch.torsion_apo[..., 3:7]
         )
+        R_apo, t_apo = self._rigid_to_rt(rigids_apo)
+        R_holo, t_holo = self._rigid_to_rt(rigids_holo)
+        R_apo_inv, t_apo_inv = rigid_inverse(R_apo, t_apo)
+        R_endpoint, t_endpoint = rigid_compose(
+            R_apo_inv,
+            t_apo_inv,
+            R_holo,
+            t_holo,
+        )
+        endpoint_delta_f = se3_log(R_endpoint, t_endpoint)
+        endpoint_delta_chi = bridge_tangent_chi * float(
+            getattr(self.config, 'stage1_chi_feature_scale', 1.0)
+        )
+        endpoint_delta_f = endpoint_delta_f * node_mask.unsqueeze(-1).float()
+        endpoint_delta_chi = endpoint_delta_chi * (
+            batch.chi_mask.bool() & node_mask.unsqueeze(-1)
+        ).float()
         out = self._model_forward(
             chi=bridge_chi,
             rigids=bridge_rigids,
@@ -2489,6 +2681,10 @@ class Stage2Trainer:
             interaction_prior=interaction_prior,
             esm_gate_context=esm_gate_context,
             current_step=self.global_step,
+            chi_mask=batch.chi_mask,
+            residual_basis_rigids=rigids_apo,
+            residual_endpoint_delta_f=endpoint_delta_f,
+            residual_endpoint_delta_chi=endpoint_delta_chi,
         )
         residual_rigid = torch.cat(
             [out['residual_rigid_rot'], out['residual_rigid_trans']],
@@ -2496,7 +2692,11 @@ class Stage2Trainer:
         )
         projection_fn = (
             project_block_tangent_normal
-            if self.config.path_parameterization
+            if getattr(
+                self.config,
+                'path_parameterization',
+                'phase_orthogonal_residual_v1',
+            )
             == 'phase_block_orthogonal_residual_v2'
             else project_product_tangent_normal
         )
@@ -3079,10 +3279,10 @@ class Stage2Trainer:
                     if 'normal_projection_mode' in data
                     else 'product'
                 )
-                expected_phase_target_mode = (
-                    'identity'
+                expected_phase_target_modes = (
+                    {'identity'}
                     if self.config.phase_residual_tau_mode == 'identity'
-                    else 'inferred'
+                    else {'inferred', 'learned_teacher'}
                 )
                 expected_projection_mode = (
                     'block'
@@ -3104,10 +3304,15 @@ class Stage2Trainer:
                         f"{path} residual_envelope={envelope!r}, expected "
                         f"{self.config.phase_residual_envelope!r}"
                     )
-                if phase_target_mode != expected_phase_target_mode:
+                if phase_target_mode not in expected_phase_target_modes:
+                    expected_description = (
+                        repr(next(iter(expected_phase_target_modes)))
+                        if len(expected_phase_target_modes) == 1
+                        else f"one of {sorted(expected_phase_target_modes)!r}"
+                    )
                     raise ValueError(
                         f"{path} phase_target_mode={phase_target_mode!r}, expected "
-                        f"{expected_phase_target_mode!r} for "
+                        f"{expected_description} for "
                         f"phase_residual_tau_mode={self.config.phase_residual_tau_mode!r}"
                     )
                 if normal_projection_mode != expected_projection_mode:
@@ -3202,12 +3407,17 @@ class Stage2Trainer:
             return None
 
         target_mask = target_mask.to(self.device) & batch.node_mask.bool().unsqueeze(0)
+        target_rigid = target_rigid.to(self.device)
+        target_chi = target_chi.to(self.device)
         target_weight = target_weight.to(self.device).clamp(0.0, 1.0)
         min_confidence = float(
             getattr(self.config, 'phase_normal_residual_min_confidence', 0.0)
         )
-        model = getattr(self, 'model', None)
-        is_training = True if model is None else bool(model.training)
+        # Residual-head-only distillation deliberately keeps the frozen trunk
+        # in eval mode during optimization. Use the trainer's explicit
+        # validation guard instead of model.training so training-only target
+        # filtering/weighting is still applied in that regime.
+        is_training = not bool(getattr(self, '_validation_mode', False))
         if is_training and min_confidence > 0.0:
             target_mask = target_mask & (target_weight >= min_confidence)
         target_weight = target_weight * target_mask.float()
@@ -3216,9 +3426,41 @@ class Stage2Trainer:
             & batch.chi_mask.bool().unsqueeze(0)
             & target_mask.unsqueeze(-1)
         )
+        if is_training:
+            time_envelope = torch.stack(
+                [
+                    endpoint_zero_envelope(
+                        target_weight.new_tensor(float(t_value)),
+                        kind=self.config.phase_residual_envelope,
+                    )
+                    for t_value in model_t_values
+                ],
+                dim=0,
+            )
+            target_weight = _phase_normal_target_weights(
+                target_weight,
+                target_rigid,
+                target_chi,
+                target_chi_mask,
+                mode=self.config.phase_normal_residual_weight_mode,
+                magnitude_scale=float(
+                    self.config.phase_normal_residual_magnitude_scale
+                ),
+                magnitude_boost=float(
+                    self.config.phase_normal_residual_magnitude_boost
+                ),
+                time_envelope=time_envelope,
+                rotation_scale=float(
+                    self.config.phase_residual_rotation_metric_scale
+                ),
+                translation_scale=float(
+                    self.config.phase_residual_translation_metric_scale
+                ),
+                chi_scale=float(self.config.phase_residual_chi_metric_scale),
+            )
         return {
-            'rigid': target_rigid.to(self.device),
-            'chi': target_chi.to(self.device),
+            'rigid': target_rigid,
+            'chi': target_chi,
             'tau': target_tau.to(self.device),
             'mask': target_mask,
             'weight': target_weight,
@@ -4896,8 +5138,15 @@ class Stage2Trainer:
             **esm_layer_weight_logs,
         }
 
+    def _set_model_training_mode(self) -> None:
+        """Keep a frozen phase teacher deterministic during residual distillation."""
+        if self.config.phase_residual_heads_only:
+            self.model.eval()
+        else:
+            self.model.train()
+
     def train_step(self, batch, *, accum_steps: int, should_step: bool) -> Dict[str, float]:
-        self.model.train()
+        self._set_model_training_mode()
 
         batch = self._batch_to_device(batch)
         t = torch.rand(batch.esm.shape[0], device=self.device)
@@ -4981,7 +5230,7 @@ class Stage2Trainer:
         return batch
 
     def train_epoch(self) -> Dict[str, float]:
-        self.model.train()
+        self._set_model_training_mode()
         self.optimizer.zero_grad()
 
         epoch_losses = {key: 0.0 for key in self._LOSS_KEYS}
@@ -5165,8 +5414,14 @@ class Stage2Trainer:
             'time_warp_rate_eps',
             'time_warp_rate_clip',
             'phase_residual_tau_mode',
+            'phase_warp_variant',
+            'phase_nonmonotone_max_offset',
+            'phase_chain_residual_scale',
+            'phase_chain_smoothing_steps',
             'phase_residual_bridge_mode',
             'phase_residual_active_blocks',
+            'phase_residual_decoder_mode',
+            'phase_residual_rank',
             'phase_residual_rotation_gate_bias',
             'phase_residual_translation_gate_bias',
             'phase_residual_chi_gate_bias',
@@ -5201,12 +5456,16 @@ class Stage2Trainer:
             'phase_teacher_missing_policy',
             'phase_teacher_head_only',
             'phase_teacher_residual_heads_only',
+            'phase_residual_heads_only',
             'supervision_replica_mode',
             'phase_normal_cache_dir',
             'w_phase_normal_residual',
             'phase_normal_residual_loss_type',
             'phase_normal_residual_huber_delta',
             'phase_normal_residual_min_confidence',
+            'phase_normal_residual_weight_mode',
+            'phase_normal_residual_magnitude_scale',
+            'phase_normal_residual_magnitude_boost',
             'phase_normal_residual_rigid_weight',
             'phase_normal_residual_chi_weight',
             'phase_normal_missing_policy',
@@ -5229,8 +5488,14 @@ class Stage2Trainer:
             'time_warp_rate_eps': 1e-3,
             'time_warp_rate_clip': 10.0,
             'phase_residual_tau_mode': 'learned',
+            'phase_warp_variant': 'residue_monotone',
+            'phase_nonmonotone_max_offset': 0.5,
+            'phase_chain_residual_scale': 1.0,
+            'phase_chain_smoothing_steps': 2,
             'phase_residual_bridge_mode': 'se3_geodesic',
             'phase_residual_active_blocks': 'all',
+            'phase_residual_decoder_mode': 'independent',
+            'phase_residual_rank': 4,
             'phase_residual_rotation_gate_bias': -2.0,
             'phase_residual_translation_gate_bias': -6.0,
             'phase_residual_chi_gate_bias': -2.0,
@@ -5259,12 +5524,16 @@ class Stage2Trainer:
             'phase_teacher_missing_policy': 'error',
             'phase_teacher_head_only': False,
             'phase_teacher_residual_heads_only': False,
+            'phase_residual_heads_only': False,
             'supervision_replica_mode': 'cycle',
             'phase_normal_cache_dir': None,
             'w_phase_normal_residual': 0.0,
             'phase_normal_residual_loss_type': 'huber',
             'phase_normal_residual_huber_delta': 0.25,
             'phase_normal_residual_min_confidence': 0.0,
+            'phase_normal_residual_weight_mode': 'uniform',
+            'phase_normal_residual_magnitude_scale': 0.05,
+            'phase_normal_residual_magnitude_boost': 0.0,
             'phase_normal_residual_rigid_weight': 1.0,
             'phase_normal_residual_chi_weight': 1.0,
             'phase_normal_missing_policy': 'error',

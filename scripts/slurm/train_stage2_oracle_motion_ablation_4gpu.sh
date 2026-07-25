@@ -77,8 +77,14 @@ TIME_WARP_LOGIT_SCALE="${TIME_WARP_LOGIT_SCALE:-1.0}"
 TIME_WARP_RATE_EPS="${TIME_WARP_RATE_EPS:-1e-3}"
 TIME_WARP_RATE_CLIP="${TIME_WARP_RATE_CLIP:-10.0}"
 PHASE_RESIDUAL_TAU_MODE="${PHASE_RESIDUAL_TAU_MODE:-learned}"
+PHASE_WARP_VARIANT="${PHASE_WARP_VARIANT:-residue_monotone}"
+PHASE_NONMONOTONE_MAX_OFFSET="${PHASE_NONMONOTONE_MAX_OFFSET:-0.5}"
+PHASE_CHAIN_RESIDUAL_SCALE="${PHASE_CHAIN_RESIDUAL_SCALE:-1.0}"
+PHASE_CHAIN_SMOOTHING_STEPS="${PHASE_CHAIN_SMOOTHING_STEPS:-2}"
 PHASE_RESIDUAL_BRIDGE_MODE="${PHASE_RESIDUAL_BRIDGE_MODE:-se3_geodesic}"
 PHASE_RESIDUAL_ACTIVE_BLOCKS="${PHASE_RESIDUAL_ACTIVE_BLOCKS:-all}"
+PHASE_RESIDUAL_DECODER_MODE="${PHASE_RESIDUAL_DECODER_MODE:-independent}"
+PHASE_RESIDUAL_RANK="${PHASE_RESIDUAL_RANK:-4}"
 PHASE_RESIDUAL_ROTATION_GATE_BIAS="${PHASE_RESIDUAL_ROTATION_GATE_BIAS:--2.0}"
 PHASE_RESIDUAL_TRANSLATION_GATE_BIAS="${PHASE_RESIDUAL_TRANSLATION_GATE_BIAS:--6.0}"
 PHASE_RESIDUAL_CHI_GATE_BIAS="${PHASE_RESIDUAL_CHI_GATE_BIAS:--2.0}"
@@ -115,12 +121,16 @@ PHASE_TEACHER_MIN_CONFIDENCE="${PHASE_TEACHER_MIN_CONFIDENCE:-0.05}"
 PHASE_TEACHER_MISSING_POLICY="${PHASE_TEACHER_MISSING_POLICY:-error}"
 PHASE_TEACHER_HEAD_ONLY="${PHASE_TEACHER_HEAD_ONLY:-0}"
 PHASE_TEACHER_RESIDUAL_HEADS_ONLY="${PHASE_TEACHER_RESIDUAL_HEADS_ONLY:-0}"
+PHASE_RESIDUAL_HEADS_ONLY="${PHASE_RESIDUAL_HEADS_ONLY:-0}"
 SUPERVISION_REPLICA_MODE="${SUPERVISION_REPLICA_MODE:-cycle}"
 PHASE_NORMAL_CACHE_DIR="${PHASE_NORMAL_CACHE_DIR:-}"
 W_PHASE_NORMAL_RESIDUAL="${W_PHASE_NORMAL_RESIDUAL:-0.0}"
 PHASE_NORMAL_RESIDUAL_LOSS_TYPE="${PHASE_NORMAL_RESIDUAL_LOSS_TYPE:-huber}"
 PHASE_NORMAL_RESIDUAL_HUBER_DELTA="${PHASE_NORMAL_RESIDUAL_HUBER_DELTA:-0.25}"
 PHASE_NORMAL_RESIDUAL_MIN_CONFIDENCE="${PHASE_NORMAL_RESIDUAL_MIN_CONFIDENCE:-0.0}"
+PHASE_NORMAL_RESIDUAL_WEIGHT_MODE="${PHASE_NORMAL_RESIDUAL_WEIGHT_MODE:-uniform}"
+PHASE_NORMAL_RESIDUAL_MAGNITUDE_SCALE="${PHASE_NORMAL_RESIDUAL_MAGNITUDE_SCALE:-0.05}"
+PHASE_NORMAL_RESIDUAL_MAGNITUDE_BOOST="${PHASE_NORMAL_RESIDUAL_MAGNITUDE_BOOST:-0.0}"
 PHASE_NORMAL_RESIDUAL_RIGID_WEIGHT="${PHASE_NORMAL_RESIDUAL_RIGID_WEIGHT:-1.0}"
 PHASE_NORMAL_RESIDUAL_CHI_WEIGHT="${PHASE_NORMAL_RESIDUAL_CHI_WEIGHT:-1.0}"
 PHASE_NORMAL_MISSING_POLICY="${PHASE_NORMAL_MISSING_POLICY:-error}"
@@ -174,6 +184,7 @@ STRICT_CACHE_NPZ_PRECHECK="${STRICT_CACHE_NPZ_PRECHECK:-0}"
 AATYPE_PRECHECK="${AATYPE_PRECHECK:-1}"
 NODE_MASK_PRECHECK="${NODE_MASK_PRECHECK:-1}"
 USE_EXISTING_SUBSETS="${USE_EXISTING_SUBSETS:-0}"
+VALIDATE_EXISTING_SUBSETS="${VALIDATE_EXISTING_SUBSETS:-$PRECHECK_ONLY}"
 TRUST_PRECHECKED_SAMPLES="${TRUST_PRECHECKED_SAMPLES:-$USE_EXISTING_SUBSETS}"
 PRECHECK_WORKERS="${PRECHECK_WORKERS:-8}"
 GPU_MONITOR_INTERVAL="${GPU_MONITOR_INTERVAL:-30}"
@@ -311,6 +322,24 @@ case "$PHASE_RESIDUAL_TAU_MODE" in
     exit 1
     ;;
 esac
+case "$PHASE_WARP_VARIANT" in
+  residue_monotone|global_monotone|global_chain_monotone|chain_nonmonotone|residue_nonmonotone) ;;
+  *)
+    echo "ERROR: unsupported PHASE_WARP_VARIANT=$PHASE_WARP_VARIANT"
+    exit 1
+    ;;
+esac
+python - <<PY
+value = float("$PHASE_NONMONOTONE_MAX_OFFSET")
+if not 0.0 < value <= 1.0:
+    raise SystemExit("ERROR: PHASE_NONMONOTONE_MAX_OFFSET must be in (0, 1]")
+scale = float("$PHASE_CHAIN_RESIDUAL_SCALE")
+steps = int("$PHASE_CHAIN_SMOOTHING_STEPS")
+if scale < 0.0:
+    raise SystemExit("ERROR: PHASE_CHAIN_RESIDUAL_SCALE must be >= 0")
+if steps < 0:
+    raise SystemExit("ERROR: PHASE_CHAIN_SMOOTHING_STEPS must be >= 0")
+PY
 case "$PHASE_RESIDUAL_BRIDGE_MODE" in
   se3_geodesic|cartesian_backbone) ;;
   *)
@@ -327,6 +356,21 @@ case "$PHASE_RESIDUAL_ACTIVE_BLOCKS" in
 esac
 if [[ "$PATH_PARAMETERIZATION" != "phase_block_orthogonal_residual_v2" && "$PHASE_RESIDUAL_ACTIVE_BLOCKS" != "all" ]]; then
   echo "ERROR: PHASE_RESIDUAL_ACTIVE_BLOCKS is only valid for phase_block_orthogonal_residual_v2"
+  exit 1
+fi
+case "$PHASE_RESIDUAL_DECODER_MODE" in
+  independent|low_rank) ;;
+  *)
+    echo "ERROR: PHASE_RESIDUAL_DECODER_MODE must be independent or low_rank"
+    exit 1
+    ;;
+esac
+if [[ "$PHASE_RESIDUAL_DECODER_MODE" == "low_rank" && "$PATH_PARAMETERIZATION" != "phase_block_orthogonal_residual_v2" ]]; then
+  echo "ERROR: PHASE_RESIDUAL_DECODER_MODE=low_rank requires phase_block_orthogonal_residual_v2"
+  exit 1
+fi
+if ! [[ "$PHASE_RESIDUAL_RANK" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: PHASE_RESIDUAL_RANK must be a positive integer"
   exit 1
 fi
 case "$PHASE_RESIDUAL_ENVELOPE" in
@@ -392,6 +436,13 @@ case "$PHASE_NORMAL_RESIDUAL_LOSS_TYPE" in
     exit 1
     ;;
 esac
+case "$PHASE_NORMAL_RESIDUAL_WEIGHT_MODE" in
+  uniform|target_magnitude|applied_path|applied_path_magnitude) ;;
+  *)
+    echo "ERROR: unsupported PHASE_NORMAL_RESIDUAL_WEIGHT_MODE=$PHASE_NORMAL_RESIDUAL_WEIGHT_MODE"
+    exit 1
+    ;;
+esac
 case "$PHASE_NORMAL_MISSING_POLICY" in
   error|skip) ;;
   *)
@@ -412,6 +463,8 @@ delta = float("$PHASE_NORMAL_RESIDUAL_HUBER_DELTA")
 min_confidence = float("$PHASE_NORMAL_RESIDUAL_MIN_CONFIDENCE")
 rigid_weight = float("$PHASE_NORMAL_RESIDUAL_RIGID_WEIGHT")
 chi_weight = float("$PHASE_NORMAL_RESIDUAL_CHI_WEIGHT")
+magnitude_scale = float("$PHASE_NORMAL_RESIDUAL_MAGNITUDE_SCALE")
+magnitude_boost = float("$PHASE_NORMAL_RESIDUAL_MAGNITUDE_BOOST")
 if weight < 0.0:
     raise SystemExit("ERROR: W_PHASE_NORMAL_RESIDUAL must be >= 0")
 if delta <= 0.0:
@@ -420,6 +473,10 @@ if not 0.0 <= min_confidence <= 1.0:
     raise SystemExit("ERROR: PHASE_NORMAL_RESIDUAL_MIN_CONFIDENCE must be in [0, 1]")
 if rigid_weight < 0.0 or chi_weight < 0.0:
     raise SystemExit("ERROR: phase-normal component weights must be >= 0")
+if magnitude_scale <= 0.0:
+    raise SystemExit("ERROR: PHASE_NORMAL_RESIDUAL_MAGNITUDE_SCALE must be > 0")
+if magnitude_boost < 0.0:
+    raise SystemExit("ERROR: PHASE_NORMAL_RESIDUAL_MAGNITUDE_BOOST must be >= 0")
 if weight > 0.0 and rigid_weight == 0.0 and chi_weight == 0.0:
     raise SystemExit("ERROR: positive MD residual weight requires a positive component weight")
 if weight > 0.0 and not "$PHASE_NORMAL_CACHE_DIR":
@@ -519,6 +576,13 @@ case "$PRECHECK_ONLY" in
   0|1) ;;
   *)
     echo "ERROR: PRECHECK_ONLY must be 0 or 1"
+    exit 1
+    ;;
+esac
+case "$VALIDATE_EXISTING_SUBSETS" in
+  0|1) ;;
+  *)
+    echo "ERROR: VALIDATE_EXISTING_SUBSETS must be 0 or 1"
     exit 1
     ;;
 esac
@@ -840,6 +904,29 @@ write_from_manifest("$STAGE1V2_VAL_CACHE_DIR/manifest.json", "$VAL_SUBSET", "$VA
 PY
 fi
 
+if [[ "$USE_EXISTING_SUBSETS" == "1" && "$VALIDATE_EXISTING_SUBSETS" == "1" ]]; then
+  case "$STAGE1V2_MODE" in
+    oracle_motion|oracle_motion_residue_shuffled|oracle_motion_sample_shuffled)
+      python scripts/validate_stage2_feature_subset.py \
+        --data-dir processed_data/triplets \
+        --split train \
+        --sample-list "$TRAIN_SUBSET" \
+        --cache-dir "$STAGE1V2_TRAIN_CACHE_DIR" \
+        --feature-mode "$STAGE1V2_MODE" \
+        --feature-names "$STAGE1V2_FEATURES" \
+        --esm-num-layers "$ESM_NUM_LAYERS"
+      python scripts/validate_stage2_feature_subset.py \
+        --data-dir processed_data/triplets \
+        --split "$VAL_SPLIT" \
+        --sample-list "$VAL_SUBSET" \
+        --cache-dir "$STAGE1V2_VAL_CACHE_DIR" \
+        --feature-mode "$STAGE1V2_MODE" \
+        --feature-names "$STAGE1V2_FEATURES" \
+        --esm-num-layers "$ESM_NUM_LAYERS"
+      ;;
+  esac
+fi
+
 if [[ "$PRECHECK_ONLY" == "1" ]]; then
   echo "=============================================="
   echo "Stage-2 + OracleMotion-UB precheck passed"
@@ -943,11 +1030,17 @@ fi
 if [[ "$PHASE_TEACHER_RESIDUAL_HEADS_ONLY" == "1" ]]; then
   PHASE_TEACHER_ARGS+=(--phase_teacher_residual_heads_only)
 fi
+if [[ "$PHASE_RESIDUAL_HEADS_ONLY" == "1" ]]; then
+  PHASE_TEACHER_ARGS+=(--phase_residual_heads_only)
+fi
 PHASE_NORMAL_ARGS=(
   --w_phase_normal_residual "$W_PHASE_NORMAL_RESIDUAL"
   --phase_normal_residual_loss_type "$PHASE_NORMAL_RESIDUAL_LOSS_TYPE"
   --phase_normal_residual_huber_delta "$PHASE_NORMAL_RESIDUAL_HUBER_DELTA"
   --phase_normal_residual_min_confidence "$PHASE_NORMAL_RESIDUAL_MIN_CONFIDENCE"
+  --phase_normal_residual_weight_mode "$PHASE_NORMAL_RESIDUAL_WEIGHT_MODE"
+  --phase_normal_residual_magnitude_scale "$PHASE_NORMAL_RESIDUAL_MAGNITUDE_SCALE"
+  --phase_normal_residual_magnitude_boost "$PHASE_NORMAL_RESIDUAL_MAGNITUDE_BOOST"
   --phase_normal_residual_rigid_weight "$PHASE_NORMAL_RESIDUAL_RIGID_WEIGHT"
   --phase_normal_residual_chi_weight "$PHASE_NORMAL_RESIDUAL_CHI_WEIGHT"
   --phase_normal_missing_policy "$PHASE_NORMAL_MISSING_POLICY"
@@ -1026,8 +1119,14 @@ echo "timewarp logit:  $TIME_WARP_LOGIT_SCALE"
 echo "timewarp eps:    $TIME_WARP_RATE_EPS"
 echo "timewarp clip:   $TIME_WARP_RATE_CLIP"
 echo "phase tau mode:  $PHASE_RESIDUAL_TAU_MODE"
+echo "phase warp:      $PHASE_WARP_VARIANT"
+echo "phase free max:  $PHASE_NONMONOTONE_MAX_OFFSET"
+echo "phase chain scale:$PHASE_CHAIN_RESIDUAL_SCALE"
+echo "phase chain steps:$PHASE_CHAIN_SMOOTHING_STEPS"
 echo "phase bridge:    $PHASE_RESIDUAL_BRIDGE_MODE"
 echo "phase blocks:    $PHASE_RESIDUAL_ACTIVE_BLOCKS"
+echo "phase decoder:   $PHASE_RESIDUAL_DECODER_MODE"
+echo "phase rank:      $PHASE_RESIDUAL_RANK"
 echo "phase gates:     rot=$PHASE_RESIDUAL_ROTATION_GATE_BIAS trans=$PHASE_RESIDUAL_TRANSLATION_GATE_BIAS chi=$PHASE_RESIDUAL_CHI_GATE_BIAS"
 echo "phase envelope:  $PHASE_RESIDUAL_ENVELOPE"
 echo "phase scale:     $PHASE_RESIDUAL_SCALE"
@@ -1051,10 +1150,12 @@ echo "w_phase_teacher: $W_PHASE_TEACHER"
 echo "phase teacher mask/conf: $PHASE_TEACHER_MASK_MODE/$PHASE_TEACHER_MIN_CONFIDENCE"
 echo "phase head only: $PHASE_TEACHER_HEAD_ONLY"
 echo "phase/resid heads only: $PHASE_TEACHER_RESIDUAL_HEADS_ONLY"
+echo "spatial residual heads only: $PHASE_RESIDUAL_HEADS_ONLY"
 echo "supervision replicas: $SUPERVISION_REPLICA_MODE"
 echo "phase-normal cache: ${PHASE_NORMAL_CACHE_DIR:-OFF}"
 echo "w_phase_normal_residual: $W_PHASE_NORMAL_RESIDUAL"
 echo "phase-normal train min confidence: $PHASE_NORMAL_RESIDUAL_MIN_CONFIDENCE"
+echo "phase-normal train weighting: mode=$PHASE_NORMAL_RESIDUAL_WEIGHT_MODE scale=$PHASE_NORMAL_RESIDUAL_MAGNITUDE_SCALE boost=$PHASE_NORMAL_RESIDUAL_MAGNITUDE_BOOST"
 echo "phase-normal component weights: rigid=$PHASE_NORMAL_RESIDUAL_RIGID_WEIGHT chi=$PHASE_NORMAL_RESIDUAL_CHI_WEIGHT"
 echo "w_fm_chi:        $W_FM_CHI"
 echo "w_fm_rigid:      $W_FM_RIGID"
@@ -1138,8 +1239,14 @@ python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA {torch.versio
   --time_warp_rate_eps "$TIME_WARP_RATE_EPS" \
   --time_warp_rate_clip "$TIME_WARP_RATE_CLIP" \
   --phase_residual_tau_mode "$PHASE_RESIDUAL_TAU_MODE" \
+  --phase_warp_variant "$PHASE_WARP_VARIANT" \
+  --phase_nonmonotone_max_offset "$PHASE_NONMONOTONE_MAX_OFFSET" \
+  --phase_chain_residual_scale "$PHASE_CHAIN_RESIDUAL_SCALE" \
+  --phase_chain_smoothing_steps "$PHASE_CHAIN_SMOOTHING_STEPS" \
   --phase_residual_bridge_mode "$PHASE_RESIDUAL_BRIDGE_MODE" \
   --phase_residual_active_blocks "$PHASE_RESIDUAL_ACTIVE_BLOCKS" \
+  --phase_residual_decoder_mode "$PHASE_RESIDUAL_DECODER_MODE" \
+  --phase_residual_rank "$PHASE_RESIDUAL_RANK" \
   --phase_residual_rotation_gate_bias "$PHASE_RESIDUAL_ROTATION_GATE_BIAS" \
   --phase_residual_translation_gate_bias "$PHASE_RESIDUAL_TRANSLATION_GATE_BIAS" \
   --phase_residual_chi_gate_bias "$PHASE_RESIDUAL_CHI_GATE_BIAS" \
