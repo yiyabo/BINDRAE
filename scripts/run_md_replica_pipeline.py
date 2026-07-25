@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import subprocess
 import sys
@@ -14,6 +15,8 @@ from typing import Any, Dict, List, Mapping, Sequence
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,6 +37,15 @@ def parse_args() -> argparse.Namespace:
         "--normal-projection-mode",
         choices=["product", "block"],
         default="product",
+    )
+    parser.add_argument(
+        "--canonical-data-dir",
+        type=Path,
+        default=Path("processed_data/triplets"),
+        help=(
+            "Triplet root containing samples/<base_sample_id>/torsion_apo.npz; "
+            "validated before any replica stage is run"
+        ),
     )
     parser.add_argument("--force", action="store_true")
     return parser.parse_args()
@@ -69,6 +81,45 @@ def passed(path: Path, *, status: str) -> bool:
 def write_status(path: Path, state: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def preflight_canonical_cache(
+    data_dir: Path, record: Mapping[str, Any]
+) -> Dict[str, Any]:
+    from scripts.export_md_phase_normal_targets import _load_canonical_residue_axis
+
+    system_sample_id = str(record["system_sample_id"])
+    replica_sample_id = str(record["sample_id"])
+    derived_system_id = replica_sample_id.split("__silver_r", 1)[0]
+    if derived_system_id != system_sample_id:
+        raise ValueError(
+            f"Replica sample {replica_sample_id!r} does not belong to "
+            f"system {system_sample_id!r}"
+        )
+    resolved_data_dir = data_dir.resolve()
+    cache_path = resolved_data_dir / "samples" / system_sample_id / "torsion_apo.npz"
+    keys, names = _load_canonical_residue_axis(
+        resolved_data_dir, replica_sample_id
+    )
+    return {
+        "status": "passed",
+        "data_dir": str(resolved_data_dir),
+        "cache": str(cache_path),
+        "cache_sha256": file_sha256(cache_path),
+        "n_residues": len(keys),
+        "first_residue_key": list(keys[0]),
+        "last_residue_key": list(keys[-1]),
+        "first_residue_name": names[0],
+        "last_residue_name": names[-1],
+    }
 
 
 def run_command(
@@ -125,8 +176,9 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
     pull_dir.mkdir(parents=True, exist_ok=True)
     target_dir.mkdir(parents=True, exist_ok=True)
     pipeline_status = pull_dir / "pipeline_status.json"
+    previous_state = load_json(pipeline_status)
     state: Dict[str, Any] = {
-        "schema_version": "bindrae_md_replica_pipeline_v1",
+        "schema_version": "bindrae_md_replica_pipeline_v2",
         "status": "starting",
         "matrix": str(args.matrix),
         "matrix_index": args.index,
@@ -138,9 +190,40 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
         "protocol": record["protocol"],
         "residual_envelope": args.residual_envelope,
         "cpu_threads": args.cpu_threads,
+        "canonical_data_dir": str(args.canonical_data_dir.resolve()),
         "started_at": utc_now(),
         "stages": {},
     }
+    if previous_state is not None:
+        state["resumed_from"] = {
+            "schema_version": previous_state.get("schema_version"),
+            "status": previous_state.get("status"),
+            "failed_stage": previous_state.get("failed_stage"),
+            "started_at": previous_state.get("started_at"),
+            "finished_at": previous_state.get("finished_at"),
+        }
+    try:
+        canonical_cache = preflight_canonical_cache(
+            args.canonical_data_dir, record
+        )
+    except Exception as error:
+        state["status"] = "failed"
+        state["failed_stage"] = "canonical_cache_preflight"
+        state["stages"]["canonical_cache_preflight"] = {
+            "status": "failed",
+            "finished_at": utc_now(),
+            "error_type": type(error).__name__,
+            "error": str(error),
+        }
+        write_status(pipeline_status, state)
+        raise
+    state["canonical_cache"] = canonical_cache
+    state["stages"]["canonical_cache_preflight"] = {
+        "status": "passed",
+        "finished_at": utc_now(),
+        "output": canonical_cache["cache"],
+    }
+    write_status(pipeline_status, state)
     protocol = dict(record["protocol"])
     python = sys.executable
 
@@ -159,6 +242,7 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
         "--report-interval", str(protocol["report_interval"]),
         "--rmsd-k-kj-mol-nm2", str(protocol["rmsd_k_kj_mol_nm2"]),
         "--final-target-rmsd-nm", str(protocol["final_target_rmsd_nm"]),
+        "--min-mapping-fraction", str(protocol.get("min_mapping_fraction", 0.95)),
     ]
     if protocol.get("resample_initial_velocities"):
         pull_command.append("--resample-initial-velocities")
@@ -206,6 +290,7 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
                 "--preparation-report", str(record["preparation_report"]),
                 "--output-dir", str(target_dir),
                 "--sample-id", str(record["sample_id"]),
+                "--data-dir", canonical_cache["data_dir"],
                 "--residual-envelope", args.residual_envelope,
                 "--normal-projection-mode", args.normal_projection_mode,
             ],

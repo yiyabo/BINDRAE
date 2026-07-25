@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Collect passed contexts, then submit five independent silver replicas per system.
+# Collect passed contexts, then submit a declared range of silver replicas.
 
 #SBATCH --job-name=mdctx_continue
 #SBATCH --nodes=1
@@ -26,7 +26,22 @@ ENDPOINT_HOLD_STEPS="${ENDPOINT_HOLD_STEPS:-2000}"
 REPORT_INTERVAL="${REPORT_INTERVAL:-100}"
 RMSD_K_KJ_MOL_NM2="${RMSD_K_KJ_MOL_NM2:-200000}"
 FINAL_TARGET_RMSD_NM="${FINAL_TARGET_RMSD_NM:-0.025}"
+MIN_MAPPING_FRACTION="${MIN_MAPPING_FRACTION:-0.95}"
+REPLICA_START="${REPLICA_START:-0}"
+REPLICA_STOP="${REPLICA_STOP:-4}"
 REPLICA_JOB_NAME="${REPLICA_JOB_NAME:-mdrep_pilot12}"
+
+for value_name in REPLICA_START REPLICA_STOP; do
+  value="${!value_name}"
+  if ! [[ "$value" =~ ^[0-9]+$ ]]; then
+    echo "$value_name must be a non-negative integer; got $value" >&2
+    exit 2
+  fi
+done
+if (( REPLICA_STOP < REPLICA_START )); then
+  echo "REPLICA_STOP must be >= REPLICA_START" >&2
+  exit 2
+fi
 
 export PATH=/data/soft/slurm/24.11.4/bin:$PATH
 cd "$ROOT"
@@ -56,8 +71,8 @@ python3 scripts/build_md_replica_matrix.py \
   --candidate-manifest "$CANDIDATE_MANIFEST" \
   --context-manifest "$COLLECTED_MANIFEST" \
   --output-dir "$REPLICA_OUTPUT_DIR" \
-  --replica-start 0 \
-  --replica-stop 4 \
+  --replica-start "$REPLICA_START" \
+  --replica-stop "$REPLICA_STOP" \
   --seed-base "$SEED_BASE" \
   --protocol-tag "$PROTOCOL_TAG" \
   --pre-equilibration-steps "$PRE_EQUILIBRATION_STEPS" \
@@ -65,7 +80,8 @@ python3 scripts/build_md_replica_matrix.py \
   --endpoint-hold-steps "$ENDPOINT_HOLD_STEPS" \
   --report-interval "$REPORT_INTERVAL" \
   --rmsd-k-kj-mol-nm2 "$RMSD_K_KJ_MOL_NM2" \
-  --final-target-rmsd-nm "$FINAL_TARGET_RMSD_NM"
+  --final-target-rmsd-nm "$FINAL_TARGET_RMSD_NM" \
+  --min-mapping-fraction "$MIN_MAPPING_FRACTION"
 
 MATRIX="$REPLICA_OUTPUT_DIR/replica_matrix.jsonl"
 TASKS=$(wc -l < "$MATRIX" | tr -d ' ')
@@ -82,9 +98,9 @@ FINALIZE_JOB=$(sbatch --parsable \
   --export=ALL,MATRIX="$MATRIX",OUTPUT_DIR="$FINALIZATION_DIR" \
   scripts/slurm/finalize_md_replica_matrix_cpu.sh)
 
-python3 - "$SUBMISSION_RECORD" "$SYSTEMS" "$TASKS" "$REPLICA_JOB" "$FINALIZE_JOB" <<'PY'
+python3 - "$SUBMISSION_RECORD" "$SYSTEMS" "$TASKS" "$REPLICA_JOB" "$FINALIZE_JOB" "$REPLICA_START" "$REPLICA_STOP" "$MIN_MAPPING_FRACTION" <<'PY'
 import json, sys
-path, systems, tasks, replica_job, finalize_job = sys.argv[1:]
+path, systems, tasks, replica_job, finalize_job, replica_start, replica_stop, mapping = sys.argv[1:]
 with open(path, "w") as handle:
     json.dump(
         {
@@ -92,6 +108,8 @@ with open(path, "w") as handle:
             "replica_tasks": int(tasks),
             "replica_job_id": replica_job,
             "finalize_job_id": finalize_job,
+            "replica_range": [int(replica_start), int(replica_stop)],
+            "min_mapping_fraction": float(mapping),
         },
         handle,
         indent=2,

@@ -28,6 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--report-interval", type=int, default=100)
     parser.add_argument("--rmsd-k-kj-mol-nm2", type=float, default=200000.0)
     parser.add_argument("--final-target-rmsd-nm", type=float, default=0.025)
+    parser.add_argument("--min-mapping-fraction", type=float, default=0.95)
     return parser.parse_args()
 
 
@@ -71,6 +72,9 @@ def make_transition_id(parent_transition_id: str, replica_index: int) -> str:
 def build_matrix(args: argparse.Namespace) -> Dict[str, Any]:
     if args.replica_start < 0 or args.replica_stop < args.replica_start:
         raise ValueError("Replica range must satisfy 0 <= start <= stop")
+    min_mapping_fraction = float(getattr(args, "min_mapping_fraction", 0.95))
+    if not 0.0 < min_mapping_fraction <= 1.0:
+        raise ValueError("min_mapping_fraction must be in (0, 1]")
     candidates = load_jsonl(args.candidate_manifest)
     contexts = load_jsonl(args.context_manifest)
     candidate_by_sample = {sample_id(record): record for record in candidates}
@@ -90,6 +94,7 @@ def build_matrix(args: argparse.Namespace) -> Dict[str, Any]:
         "report_interval": args.report_interval,
         "rmsd_k_kj_mol_nm2": args.rmsd_k_kj_mol_nm2,
         "final_target_rmsd_nm": args.final_target_rmsd_nm,
+        "min_mapping_fraction": min_mapping_fraction,
         "resample_initial_velocities": True,
     }
 

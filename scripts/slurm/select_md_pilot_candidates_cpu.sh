@@ -19,6 +19,7 @@ SCAN_LIMIT="${SCAN_LIMIT:-8000}"
 SELECT_COUNT="${SELECT_COUNT:-16}"
 SEED="${SEED:-20260713}"
 WORKERS="${WORKERS:-20}"
+MIN_RESIDUE_MAPPING_FRACTION="${MIN_RESIDUE_MAPPING_FRACTION:-0.95}"
 
 cd "$ROOT"
 mkdir -p logs/slurm "$OUTPUT_DIR"
@@ -36,6 +37,7 @@ echo "Output dir:   $OUTPUT_DIR"
 echo "Scan limit:   $SCAN_LIMIT"
 echo "Select count: $SELECT_COUNT"
 echo "Workers:      $WORKERS"
+echo "Min mapping:  $MIN_RESIDUE_MAPPING_FRACTION"
 
 python scripts/select_md_pilot_candidates.py \
   --data-dir processed_data/triplets \
@@ -44,7 +46,8 @@ python scripts/select_md_pilot_candidates.py \
   --scan-limit "$SCAN_LIMIT" \
   --select-count "$SELECT_COUNT" \
   --seed "$SEED" \
-  --workers "$WORKERS"
+  --workers "$WORKERS" \
+  --min-residue-mapping-fraction "$MIN_RESIDUE_MAPPING_FRACTION"
 
 python scripts/audit_md_transition_manifest.py \
   --manifest "$OUTPUT_DIR/selected_transition_manifest.jsonl" \

@@ -20,6 +20,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--index", type=int, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument(
+        "--replica-matrix",
+        type=Path,
+        action="append",
+        default=[],
+        help=(
+            "Explicit replica_matrix.jsonl provenance. Repeat for merged caches "
+            "whose target directories are detached from the source matrices."
+        ),
+    )
+    parser.add_argument(
         "--phase-target-mode",
         choices=("inferred", "identity"),
         default="identity",
@@ -57,19 +67,31 @@ def resolve_project_path(path: str | Path) -> Path:
     return path if path.is_absolute() else PROJECT_ROOT / path
 
 
-def find_replica_record(collection_record: Dict[str, Any]) -> Dict[str, Any]:
-    matrix_path = resolve_project_path(
-        infer_replica_matrix(Path(collection_record["source_dir"]))
-    )
+def find_replica_record(
+    collection_record: Dict[str, Any],
+    replica_matrices: List[Path] | None = None,
+) -> Dict[str, Any]:
+    if replica_matrices:
+        matrix_paths = [resolve_project_path(path) for path in replica_matrices]
+    else:
+        matrix_paths = [
+            resolve_project_path(
+                infer_replica_matrix(Path(collection_record["source_dir"]))
+            )
+        ]
     sample_id = str(collection_record["sample_id"])
-    matches = [
-        record
-        for record in load_jsonl(matrix_path)
-        if str(record.get("sample_id")) == sample_id
-    ]
+    matches = []
+    for matrix_path in matrix_paths:
+        if not matrix_path.is_file():
+            raise FileNotFoundError(f"Missing replica matrix: {matrix_path}")
+        matches.extend(
+            record
+            for record in load_jsonl(matrix_path)
+            if str(record.get("sample_id")) == sample_id
+        )
     if len(matches) != 1:
         raise ValueError(
-            f"Expected one matrix record for {sample_id!r} in {matrix_path}, "
+            f"Expected one matrix record for {sample_id!r} in {matrix_paths}, "
             f"found {len(matches)}"
         )
     return matches[0]
@@ -81,7 +103,7 @@ def main() -> None:
     if not 0 <= args.index < len(records):
         raise IndexError(f"index={args.index} outside [0, {len(records)})")
     collection_record = records[args.index]
-    replica = find_replica_record(collection_record)
+    replica = find_replica_record(collection_record, args.replica_matrix)
     system_id = str(replica["system_sample_id"])
     replica_index = int(replica["replica_index"])
     output_dir = resolve_project_path(args.output_root) / system_id / f"replica_{replica_index:02d}"

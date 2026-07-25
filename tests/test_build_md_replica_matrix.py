@@ -61,6 +61,7 @@ class BuildMDReplicaMatrixTest(unittest.TestCase):
                 report_interval=100,
                 rmsd_k_kj_mol_nm2=200000.0,
                 final_target_rmsd_nm=0.025,
+                min_mapping_fraction=0.95,
             )
             summary = MODULE.build_matrix(args)
             rows = [
@@ -71,6 +72,9 @@ class BuildMDReplicaMatrixTest(unittest.TestCase):
             self.assertEqual([row["seed"] for row in rows], [1001, 1002, 1003, 1004])
             self.assertEqual(len({row["transition_id"] for row in rows}), 4)
             self.assertTrue(all(row["protocol"]["resample_initial_velocities"] for row in rows))
+            self.assertTrue(
+                all(row["protocol"]["min_mapping_fraction"] == 0.95 for row in rows)
+            )
 
 
 if __name__ == "__main__":

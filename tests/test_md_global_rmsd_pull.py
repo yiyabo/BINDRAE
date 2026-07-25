@@ -32,6 +32,31 @@ class MDGlobalRMSDPullTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cpu_threads must be >= 0"):
             MODULE.platform_properties("CPU", -1)
 
+    def test_ca_mapping_handles_one_holo_insertion(self):
+        mapping = MODULE.match_endpoint_topology_ca(
+            ["ALA", "GLY", "SER", "THR"],
+            ["ALA", "GLY", "ASP", "SER", "THR"],
+            ["ALA", "GLY", "ASP", "SER", "THR"],
+            [10, 20, 30, 40, 50],
+            min_mapping_fraction=0.8,
+        )
+
+        np.testing.assert_array_equal(mapping["apo_indices"], [0, 1, 2, 3])
+        np.testing.assert_array_equal(mapping["holo_indices"], [0, 1, 3, 4])
+        np.testing.assert_array_equal(mapping["topology_ca_indices"], [10, 20, 40, 50])
+        self.assertEqual(mapping["mapped_residues"], 4)
+        self.assertAlmostEqual(mapping["mapping_fraction"], 0.8)
+
+    def test_ca_mapping_enforces_frozen_coverage(self):
+        with self.assertRaisesRegex(ValueError, "below 0.9500"):
+            MODULE.match_endpoint_topology_ca(
+                ["ALA", "GLY", "SER", "THR"],
+                ["ALA", "GLY", "ASP", "SER", "THR"],
+                ["ALA", "GLY", "ASP", "SER", "THR"],
+                [10, 20, 30, 40, 50],
+                min_mapping_fraction=0.95,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

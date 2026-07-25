@@ -25,6 +25,10 @@ from scripts.run_md_pilot_dynamics_smoke import (  # noqa: E402
     kabsch_transform,
 )
 from src.data.md_pilot_selection import parse_ca_records  # noqa: E402
+from src.data.residue_alignment import (  # noqa: E402
+    canonical_resname,
+    triple_exact_residue_alignment,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -60,6 +64,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-final-apo-ca-rmsd-a", type=float, default=1.0)
     parser.add_argument("--max-final-ligand-rmsd-a", type=float, default=5.0)
     parser.add_argument("--min-target-progress-fraction", type=float, default=0.5)
+    parser.add_argument("--min-mapping-fraction", type=float, default=0.95)
     return parser.parse_args()
 
 
@@ -78,6 +83,53 @@ def platform_properties(platform_name: str, cpu_threads: int) -> Dict[str, str]:
     elif platform_name == "CPU" and cpu_threads > 0:
         properties["Threads"] = str(cpu_threads)
     return properties
+
+
+def match_endpoint_topology_ca(
+    apo_names: List[str],
+    holo_names: List[str],
+    topology_names: List[str],
+    topology_ca_indices: List[int],
+    *,
+    min_mapping_fraction: float,
+) -> Dict[str, Any]:
+    """Build one explicit CA correspondence across apo, holo, and MD topology."""
+
+    if len(topology_names) != len(topology_ca_indices):
+        raise ValueError("Topology residue names and CA indices must have matching lengths")
+    if not 0.0 < min_mapping_fraction <= 1.0:
+        raise ValueError("min_mapping_fraction must be in (0, 1]")
+    triples = triple_exact_residue_alignment(apo_names, holo_names, topology_names)
+    mapped = len(triples)
+    counts = {
+        "apo_residues": len(apo_names),
+        "holo_residues": len(holo_names),
+        "topology_residues": len(topology_names),
+    }
+    fractions = {
+        "apo_mapping_fraction": mapped / max(len(apo_names), 1),
+        "holo_mapping_fraction": mapped / max(len(holo_names), 1),
+        "topology_mapping_fraction": mapped / max(len(topology_names), 1),
+    }
+    mapping_fraction = min(fractions.values())
+    if mapping_fraction < min_mapping_fraction:
+        raise ValueError(
+            f"Mapped {mapped} residues across apo/holo/topology "
+            f"(minimum fraction {mapping_fraction:.4f}) below "
+            f"{min_mapping_fraction:.4f}"
+        )
+    return {
+        **counts,
+        **fractions,
+        "mapped_residues": mapped,
+        "mapping_fraction": mapping_fraction,
+        "mapping_method": "single_chain_global_sequence_exact",
+        "apo_indices": np.asarray([value[0] for value in triples], dtype=np.int64),
+        "holo_indices": np.asarray([value[1] for value in triples], dtype=np.int64),
+        "topology_ca_indices": np.asarray(
+            [topology_ca_indices[value[2]] for value in triples], dtype=np.int64
+        ),
+    }
 
 
 def run_pull(args: argparse.Namespace) -> Dict[str, Any]:
@@ -118,22 +170,31 @@ def run_pull(args: argparse.Namespace) -> Dict[str, Any]:
     preparation = json.loads((Path(str(npt_report["system_dir"])) / "preparation_report.json").read_text())
     protein_atoms = int(preparation["protein"]["prepared_protein_atoms"])
     solute_atoms = int(preparation["system"]["pre_solvent_atoms"])
-    topology_atoms = list(pdb.topology.atoms())
-    ca_indices = [
-        atom.index for atom in topology_atoms[:protein_atoms] if atom.name == "CA"
-    ]
+    topology_ca_indices = []
+    topology_residue_names = []
+    for residue in pdb.topology.residues():
+        residue_atoms = [atom for atom in residue.atoms() if atom.index < protein_atoms]
+        ca_atoms = [atom for atom in residue_atoms if atom.name == "CA"]
+        if len(ca_atoms) == 1:
+            topology_ca_indices.append(ca_atoms[0].index)
+            topology_residue_names.append(canonical_resname(residue.name))
     apo = parse_ca_records(apo_path)
     holo = parse_ca_records(holo_path)
-    apo_xyz = np.asarray(apo["xyz"], dtype=np.float64)
-    holo_xyz = np.asarray(holo["xyz"], dtype=np.float64)
-    if len(ca_indices) != len(apo_xyz) or apo_xyz.shape != holo_xyz.shape:
-        raise ValueError(
-            f"CA mapping mismatch: topology={len(ca_indices)}, apo={len(apo_xyz)}, holo={len(holo_xyz)}"
-        )
+    mapping = match_endpoint_topology_ca(
+        list(apo["residue_names"]),
+        list(holo["residue_names"]),
+        topology_residue_names,
+        topology_ca_indices,
+        min_mapping_fraction=args.min_mapping_fraction,
+    )
+    apo_xyz = np.asarray(apo["xyz"], dtype=np.float64)[mapping["apo_indices"]]
+    holo_xyz = np.asarray(holo["xyz"], dtype=np.float64)[mapping["holo_indices"]]
+    ca_indices = mapping["topology_ca_indices"].tolist()
 
     initial_positions = initial_state.getPositions(asNumpy=True)
     initial_angstrom = np.asarray(initial_positions.value_in_unit(unit.angstrom))
     current_ca = initial_angstrom[ca_indices]
+    holo_reference_ca = current_ca.copy()
     endpoint_rotation, endpoint_translation = kabsch_transform(holo_xyz, current_ca)
     apo_target_angstrom = apo_xyz @ endpoint_rotation + endpoint_translation
     reference_nm = np.asarray(initial_positions.value_in_unit(unit.nanometer)).copy()
@@ -239,7 +300,7 @@ def run_pull(args: argparse.Namespace) -> Dict[str, Any]:
             "target_rmsd_nm": target_rmsd_nm,
             "cv_apo_rmsd_nm": cv_value,
             "apo_ca_rmsd_angstrom": kabsch_rmsd(current, apo_target_angstrom),
-            "holo_ca_rmsd_angstrom": stability["protein_ca_rmsd_angstrom"],
+            "holo_ca_rmsd_angstrom": kabsch_rmsd(current, holo_reference_ca),
             "ligand_heavy_rmsd_angstrom": stability["ligand_heavy_rmsd_angstrom"],
             "temperature_k": temperature,
             "potential_kj_mol": potential,
@@ -317,6 +378,11 @@ def run_pull(args: argparse.Namespace) -> Dict[str, Any]:
         "reverse_for_model_direction": True,
         "platform": args.platform,
         "seed": args.seed,
+        "residue_mapping": {
+            key: value
+            for key, value in mapping.items()
+            if key not in {"apo_indices", "holo_indices", "topology_ca_indices"}
+        },
         "initial_velocities": (
             "seeded_maxwell_boltzmann"
             if args.resample_initial_velocities

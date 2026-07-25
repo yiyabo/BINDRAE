@@ -562,14 +562,31 @@ gates.
 
 ## Path-4 v2 Identification Status (2026-07-18)
 
-The expanded atomistic lane produced 1,185 accepted replica targets over 283
-endpoint systems. After the blockwise phase-normal contract was enforced, the
-active inferred cache contains 1,180 replicas over 282 systems. Replica
-consensus with at least two paths per endpoint produced 266 deterministic
-system targets. Mean phase agreement is 0.9546 and mean spatial-residual
-agreement is 0.6999; both are agreement scores where higher is better. The
-current family/scaffold-disjoint consensus screen contains 208 train and 24
-validation systems.
+The first expanded atomistic lane produced 1,185 accepted replica targets over
+283 endpoint systems. After the blockwise phase-normal contract was enforced,
+that inferred cache contained 1,180 replicas over 282 systems. The final
+endpoint-pair-deduplicated lane then admitted 48 systems, ran five replicas per
+system, and accepted 160 of 240 targets. All 160 accepted targets passed a
+fresh block-normal re-export audit before they were merged with the first
+lane.
+
+The frozen blockwise inferred cache now contains 1,340 replicas over 326
+systems, with no duplicate records. Its phase-supervision density is 0.0959
+and its residual-supervision density is 0.0873. Consensus with at least two
+replicas per endpoint produces 303 deterministic system targets; the remaining
+23 systems have one accepted replica and are retained only in the replica
+corpus. Mean phase agreement is 0.9563 and mean spatial-residual agreement is
+0.7036; both are agreement scores where higher is better.
+
+The strict 30% sequence-identity, 80% sequence-coverage, exact
+Bemis-Murcko-scaffold split contains 261 train, 33 validation, and 32 test
+systems before consensus filtering. The frozen consensus lists contain 241
+train, 30 validation, and 32 test systems. System, protein-family, ligand-
+scaffold, and joint-component overlap are all zero. The full OracleMotion
+feature cache covers all 303 consensus IDs, but its legacy files do not all
+carry canonical residue hashes. The matched screen therefore uses the fresh
+canonical cache described below. Feature availability does not authorize using
+a checkpoint pretrained on validation or test endpoints.
 
 The following diagnostics separate implementation failure from generalization
 failure:
@@ -598,8 +615,232 @@ reported on the same complete validation target set. They are the last
 label-filtering diagnostics before returning to data scale and clean
 pretraining.
 
-A final endpoint-pair-deduplicated lane contains 62 previously unprocessed
-systems. Context array `146368` is followed by continuation `146369`, which
-will launch five independent replicas per admitted context using the validated
-400,000 kJ/mol/nm2, 20,000-step protocol. Setup or context failures remain
-recorded data-quality outcomes and are not silently retried.
+The final endpoint-pair-deduplicated lane is complete. Context processing
+admitted 48 of 62 previously unprocessed systems, and the validated
+400,000 kJ/mol/nm2, 20,000-step protocol produced 160 accepted replicas. The
+active immutable artifacts are:
+
+- `phase_block_cache_sin2_inferred1340_20260718_v3` for replica targets;
+- `phase_block_cache_sin2_consensus_min2_20260718_v2` for deterministic system
+  supervision;
+- `phase_block_cache_sin2_identity1340_20260718_v1` for matched identity-phase
+  residual-only replica targets;
+- `phase_block_cache_sin2_identity_consensus_min2_20260718_v1` for matched
+  identity-phase residual-only deterministic targets;
+- `phase_normal_group_split326_family30_scaffold_20260718_v2` for frozen group
+  assignments and consensus-filtered train/validation/test lists.
+
+The identity re-export passed for all 1,340 replicas under the `block` normal
+projection and `sin2` endpoint envelope. Its 303-system consensus has exact
+identity phase (`max |tau-t| = 0`) and the same system IDs as the inferred-phase
+consensus. Mean identity-reference residual agreement is 0.6951 (higher is
+better), compared with 0.7036 for the inferred-phase residual target. The
+residual-only ablation therefore no longer reuses a residual defined under a
+learned phase reference.
+
+The first prechecks `146635`-`146637` only verified existing subset files. Jobs
+`146638`-`146640` then hard-failed before the first optimization step because
+the legacy 64k OracleMotion cache lacked `residue_identity_hash`. The launcher
+now runs `validate_stage2_feature_subset.py` for `PRECHECK_ONLY=1`, loading every
+selected sample through the production dataset path. This prevents an existing
+subset from bypassing cache-schema, amino-acid, node-mask, ESM, or residue-axis
+validation.
+
+OracleMotion was re-exported canonically for all 303 systems into
+`oracle_motion_mdphase_consensus303_canonical_v2e_20260718_v1/merged`. One stale
+ESM cache, `3rsl-A-RSF-215`, contained 332 rows for a 166-residue canonical
+sample. `cache_ahojdb_esm2.py` now prefers the canonical torsion sequence and
+residue keys over raw PDB traversal; job `146646` rebuilt that ESM7 cache.
+Production-loader precheck `146649` then validated all 241 training and 30
+validation samples.
+
+The matched from-scratch jobs completed with two A100s, batch size eight per
+GPU, and ten epochs: `146650` is warp-only, `146652` is identity-phase
+residual-only, and `146653` is the full phase-normal model. Their validation
+supervision results are:
+
+- warp-only phase loss decreases 8.21%, from 0.129960 to 0.119286 (lower is
+  better), with its best checkpoint at epoch 9;
+- residual-only normal loss decreases only 0.19%, from 0.387335 to 0.386617,
+  then worsens, with its best checkpoint at epoch 4;
+- full joint loss decreases 3.28%, from 0.272592 to 0.263648, with its best
+  checkpoint at epoch 9.
+
+Validation jobs `146654`-`146657` evaluate the synchronous bridge, warp-only,
+residual-only, and full paths, respectively. The frozen 30-system evaluation
+covers 129 accepted replicas. Relative to the synchronous Cartesian bridge,
+the full model reduces
+system-macro product RMSE by 7.40%, rotation MAE by 1.94%, translation MAE by
+15.37%, chi MAE by 1.31%, and phase-tau MAE by 1.59% (all lower is better).
+Paired system bootstrap intervals are on the improvement side for these five
+metrics. However, full versus warp-only differences are small and every paired
+geometry interval crosses zero. Residual-only is also statistically tied with
+the synchronous bridge on product, rotation, and translation path errors.
+
+The present evidence therefore validates learned asynchronous phase, but does
+not yet establish a generalization benefit from the normal residual branch.
+The 32-system test split remains untouched. No test result should be generated
+until the residual representation decision is frozen.
+
+A leakage-clean endpoint-trunk experiment remains the next representation
+study after the from-scratch matched screen. Any supervised endpoint pretraining
+must exclude the frozen validation/test endpoint IDs and their protein-family
+or ligand-scaffold groups. The prior 64k checkpoint remains an upper-bound
+diagnostic because it does not satisfy that exclusion contract.
+
+## Leakage-Clean Endpoint Trunk (2026-07-18)
+
+The frozen validation and test groups were used only as exclusion sets, never
+as optimization or model-selection examples. Starting from the 64,724-sample
+endpoint pool, `build_stage2_leakage_clean_subset.py` removed every exact
+holdout ID, every sequence with at least 30% global identity and 80% coverage
+to a holdout sequence, and every exact non-isomeric Bemis-Murcko scaffold seen
+in a holdout ligand. Invalid structural or ligand metadata also hard-fails the
+sample. The audit retained 59,216 samples and excluded 5,508. Exclusion reasons
+are non-exclusive: 4,473 family matches, 687 scaffold matches, 660 invalid
+metadata records, and all 62 exact holdout IDs.
+
+The existing canonical OracleMotion export covers 59,086 of those samples.
+The remaining 130 are historical canonical-export failures, primarily stale
+ESM/residue-axis mismatches, and are excluded rather than admitted through a
+legacy-schema fallback. A consumer cache with 59,086 hard-linked NPZ files and
+a matching manifest lives at
+`oracle_motion_endpointpre_leakclean_canonical59086_20260718_v1`. Production
+loader precheck passed for a deterministic 128-sample smoke subset and all 30
+frozen validation systems.
+
+Two one-epoch, two-A100 smoke runs distinguish a runnable objective from a
+useful pretraining objective. The endpoint-exact phase-normal parameterization
+completed training and validation, but its rigid and chi flow-matching terms
+were exactly zero and analytic-bridge smoothness dominated the loss. It is not
+used for large-scale trunk pretraining. The unconstrained flow parameterization
+instead produced non-zero train flow-matching losses (`chi=1.0555`,
+`rigid=7.7704`; lower is better) and a reusable checkpoint. This flow model is
+not the final path predictor: downstream Path-4 initialization uses
+`shared_trunk`, which transfers the endpoint-motion representation while
+resetting the time-warp and normal-residual heads.
+
+The formal direct run
+`stage2_endpointtrunk_leakclean_flow_train59086_val30_e10_bs16x3_bud8192_20260718_v1`
+uses three A100s, batch size 16 per GPU, an 8,192-residue per-GPU budget, and ten
+epochs. Startup reports 1,385 batches per epoch and 13,850 total steps. At batch
+100, step time was 1.12 seconds after data warm-up; observed memory was
+25.4-27.4 GiB per GPU with no OOM. This checkpoint remains pretraining evidence
+only. Its scientific value must be tested by a matched scratch-versus-clean-
+trunk Path-4 comparison on the frozen validation split, with the test split
+still untouched.
+
+## Leakage-Clean Trunk Transfer Result (2026-07-19)
+
+The formal endpoint trunk completed all ten epochs. Validation total loss was
+lowest at epoch 8 (`2.242113`, lower is better), and its shared representation
+was transferred with `shared_trunk` initialization into matched warp-only,
+identity-phase residual-only, and full phase-normal runs. The three downstream
+runs used the frozen 241-system training split, 30-system validation split,
+global batch size 16, ten epochs, and fresh optimizer/head state. All completed
+without OOM. Their best supervision losses were `0.1228` for warp-only,
+`0.3840` for residual-only, and `0.2668` for full (lower is better).
+
+The selected checkpoints were then evaluated on the same 30 held-out systems,
+129 accepted MD replicas, and 20-step path grid as the from-scratch screen.
+System-macro results are:
+
+| Variant | Product RMSE ↓ | Translation MAE Å ↓ | Rotation MAE rad ↓ | Chi MAE rad ↓ | Phase tau MAE ↓ | Pair accuracy ↑ |
+|---|---:|---:|---:|---:|---:|---:|
+| Synchronous Cartesian | 1.405388 | 0.753937 | 0.252262 | 0.450839 | 0.307116 | 0.0000 |
+| Clean-trunk warp-only | 1.369134 | 0.715614 | 0.250040 | 0.448844 | 0.305425 | 0.4841 |
+| Clean-trunk residual-only | 1.405249 | 0.753473 | 0.251977 | 0.451863 | 0.307116 | 0.0000 |
+| Clean-trunk full | **1.345731** | **0.684968** | **0.249085** | **0.448145** | **0.304647** | **0.5395** |
+
+Relative to the synchronous bridge, clean-trunk full improves product RMSE by
+4.24%, translation MAE by 9.15%, rotation MAE by 1.26%, chi MAE by 0.60%, and
+phase-tau MAE by 0.80% (all lower is better). Paired system bootstrap intervals
+are on the improvement side for those five metrics. This independently
+confirms that the endpoint-exact learned path is better than the synchronous
+Cartesian bridge.
+
+The stricter promotion tests do not pass. Full versus clean-trunk warp-only
+improves product RMSE by 1.71% and translation MAE by 4.28%, but both paired
+95% intervals cross zero; among the main path metrics, only the small chi and
+phase-midpoint improvements have intervals fully on the improvement side.
+Residual-only remains tied with the synchronous bridge on rigid path errors and
+slightly worsens chi MAE. Clean-trunk full is also worse than from-scratch full
+by 3.41% product RMSE, 7.35% translation MAE, 0.69% rotation MAE, 0.72% chi MAE,
+and 0.80% phase-tau MAE; all five paired intervals are on the degradation side.
+
+Therefore the leakage-clean trunk is a valid negative transfer result, not the
+new anchor. It should not initialize the final deterministic model without a
+new transfer strategy. The from-scratch warp-only model remains the defensible
+interpretable anchor. The normal-residual branch remains an implemented
+hypothesis: the current data validate asynchronous phase but still do not
+establish a held-out generalization benefit from off-bridge residual learning.
+The frozen test split remains untouched.
+
+## Deterministic Residual Oracle and Low-Rank Screen (2026-07-19)
+
+A leave-one-replica-out oracle ladder was run before changing the residual
+architecture. On the frozen validation lane, 26 systems and 121 replicas had at
+least three accepted paths. A same-system consensus residual reduced residual
+MSE relative to zero residual by 43.29%; the mean absolute gain was 0.12039 with
+a system-bootstrap 95% interval of `[0.06877, 0.17954]`, and 25 of 26 systems
+improved. A held-out-aware route oracle was 7.48% worse than the consensus and
+did not provide evidence for repeatable route modes. This establishes that a
+shared deterministic residual target exists within systems, but it does not
+show that endpoints can predict that target across unseen systems.
+
+The consensus target is strongly low-rank in time. For 241 training systems,
+rank four explains a median 92.49% of combined residual energy and has an
+effective-rank median of 3.31. On the independent 30-system validation split,
+rank four explains 93.67% with a 10th percentile of 86.82% and an
+effective-rank median of 3.43. These replicated statistics justified one
+predeclared architecture test: a graph-coupled rank-four decoder with fixed
+endpoint-conditioned spatial bases and path-global time coefficients.
+
+The decoder passed 59 related CPU tests, a true FlashIPA CUDA
+forward/backward test, and a 241-train/30-validation one-epoch trainer smoke.
+The matched ten-epoch runs then used two A100s, batch size eight per GPU, the
+same frozen split, and the same optimization contract as the earlier
+independent-head screen.
+
+The full rank-four model reduced training total loss from 0.4399 to 0.3216
+(lower is better), but its validation normal-residual loss was best at epoch 0
+(`0.14271`) and worsened to `0.14689`; its predicted residual norm grew from
+`0.0275` to `0.1696`. The identity-phase residual-only model showed the same
+pattern more strongly: training loss fell from `0.4107` to `0.3229`, while
+validation loss rose from `0.3865` to `0.4394` and validation residual MAE rose
+from `0.5423` to `0.6041` (all lower is better).
+
+The selected checkpoints were evaluated on the same 30 systems, 129 MD
+replicas, and 20-step path grid:
+
+| Variant | Product RMSE ↓ | Translation MAE Å ↓ | Rotation MAE rad ↓ | Chi MAE rad ↓ | Phase tau MAE ↓ | Pair accuracy ↑ |
+|---|---:|---:|---:|---:|---:|---:|
+| Synchronous Cartesian | 1.405388 | 0.753937 | 0.252262 | 0.450839 | 0.307116 | 0.0000 |
+| From-scratch warp-only | **1.305897** | **0.636869** | 0.249854 | **0.444006** | 0.302232 | 0.5063 |
+| Independent residual-only | 1.404697 | 0.756353 | 0.251819 | 0.451500 | 0.307116 | 0.0000 |
+| Independent full | 1.301403 | 0.638045 | **0.247382** | 0.444934 | 0.302226 | **0.5229** |
+| Rank-four residual-only | 1.405288 | 0.753865 | 0.251510 | 0.450223 | 0.307116 | 0.0000 |
+| Rank-four full | 1.310484 | 0.640652 | 0.258755 | 0.449598 | **0.301561** | 0.4905 |
+
+For rank-four full versus warp-only, paired system bootstrap gives a product
+improvement of `-0.00459` with 95% interval `[-0.03484, 0.02522]`; negative is
+worse under the improvement convention. Rotation and chi are significantly
+worse, with improvement intervals `[-0.01674, -0.00141]` and
+`[-0.01137, -0.00000]`. Contact-event coverage increases by 0.0241, but only
+10.3% of systems improve and the gain does not transfer to aggregate path
+geometry. Rank-four residual-only differs from the synchronous bridge by only
+`0.00010` product RMSE, which is not practically meaningful.
+
+The deterministic Path-4 residual is therefore not promoted. The
+from-scratch warp-only model remains the current anchor, and the untouched
+32-system test split is still reserved for one final evaluation after all
+validation decisions are frozen. The residual code and diagnostics remain as
+a reproducible negative result and long-term research branch.
+
+Further Path-4 work must change the information or data regime, not sweep rank,
+gate bias, or learning rate. The next valid reopening condition is either a
+clear residual learning curve from substantially more family/scaffold-disjoint
+MD systems or additional inference-time conditioning that actually carries
+route information. A stochastic global path latent should be attempted only
+if a larger replica corpus shows that a route-mode oracle beats deterministic
+consensus; the present oracle ladder does not show that.

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
@@ -11,12 +13,26 @@ from src.data.md_pilot_selection import (
     describe_ligand,
     kabsch_align,
     read_sample_ids,
+    screen_sample,
     select_diverse_candidates,
 )
 from src.data.md_transition_manifest import validate_transition_record
 
 
 class MDPilotSelectionTest(unittest.TestCase):
+    @staticmethod
+    def _write_ca_pdb(path: Path, residue_names: list[str]) -> None:
+        lines = []
+        for index, residue_name in enumerate(residue_names, start=1):
+            x = float(index)
+            y = float((index % 3) * 0.7)
+            z = float((index % 5) * 0.4)
+            lines.append(
+                f"ATOM  {index:5d}  CA  {residue_name:>3s} A{index:4d}    "
+                f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00 20.00           C\n"
+            )
+        path.write_text("".join(lines) + "END\n")
+
     def test_kabsch_removes_rigid_transform(self):
         points = np.asarray(
             [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 3.0]]
@@ -36,6 +52,70 @@ class MDPilotSelectionTest(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(len(first), 3)
         self.assertEqual(len(set(first)), 3)
+
+    def test_screen_maps_a_small_endpoint_residue_count_difference(self):
+        reference_names = [
+            "ALA", "GLY", "SER", "THR", "VAL", "LEU", "ILE", "ASN", "GLN", "ASP",
+            "GLU", "LYS", "ARG", "HIS", "PHE", "TYR", "TRP", "CYS", "MET", "PRO",
+        ]
+        query_names = [*reference_names[:10], "ALA", *reference_names[10:]]
+        with tempfile.TemporaryDirectory() as temporary:
+            data_dir = Path(temporary)
+            sample_dir = data_dir / "samples" / "mapped-A-LIG-1"
+            sample_dir.mkdir(parents=True)
+            self._write_ca_pdb(sample_dir / "apo.pdb", reference_names)
+            self._write_ca_pdb(sample_dir / "holo.pdb", query_names)
+            (sample_dir / "ligand.sdf").write_text("test\n")
+            (sample_dir / "meta.json").write_text(
+                json.dumps(
+                    {
+                        "apo_pdb": "1abc",
+                        "holo_pdb": "2def",
+                        "ligand_resname": "LIG",
+                    }
+                )
+            )
+            config = {
+                "data_dir": str(data_dir),
+                "excluded_resnames": [],
+                "min_residues": 10,
+                "max_residues": 500,
+                "min_sequence_identity": 0.95,
+                "min_residue_mapping_fraction": 0.95,
+                "min_heavy_atoms": 1,
+                "max_heavy_atoms": 100,
+                "max_abs_charge": 2,
+                "pocket_radius": 100.0,
+                "contact_radius": 8.0,
+                "min_pocket_residues": 1,
+                "moving_threshold": 1.0,
+                "min_global_rmsd": 0.0,
+                "min_pocket_rmsd": 0.0,
+                "min_max_displacement": 0.0,
+                "max_global_rmsd": 100.0,
+                "max_pocket_rmsd": 100.0,
+                "max_max_displacement": 100.0,
+            }
+            ligand = {
+                "eligible": True,
+                "reason": "ok",
+                "heavy_atoms": 10,
+                "formal_charge": 0,
+                "contains_metal": False,
+                "fragment_count": 1,
+                "organic_copy_count": 1,
+                "extra_nonorganic_fragments": 0,
+                "canonical_smiles": "CC",
+                "inchikey": "TEST",
+                "ligand_xyz": np.asarray([[1.0, 0.0, 0.0]]),
+            }
+            with patch("src.data.md_pilot_selection.describe_ligand", return_value=ligand):
+                result = screen_sample("mapped-A-LIG-1", config)
+
+        self.assertTrue(result["eligible"])
+        self.assertEqual(result["mapped_residues"], 20)
+        self.assertAlmostEqual(result["residue_mapping_fraction"], 20 / 21)
+        self.assertEqual(result["reason"], "ok")
 
     def test_selection_balances_categories_and_deduplicates_endpoints(self):
         rows = [

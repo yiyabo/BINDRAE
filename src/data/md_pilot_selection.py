@@ -12,6 +12,8 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
+from src.data.residue_alignment import align_residue_names
+
 
 METAL_ATOMIC_NUMBERS = frozenset(
     {
@@ -281,33 +283,67 @@ def screen_sample(sample_id: str, config: Mapping[str, Any]) -> Dict[str, Any]:
         return {**base, "eligible": False, "reason": "missing_ca"}
     if len(apo["chains"]) != 1 or len(holo["chains"]) != 1:
         return {**base, "eligible": False, "reason": "not_single_chain"}
-    if apo_xyz.shape != holo_xyz.shape:
-        return {
-            **base,
-            "eligible": False,
-            "reason": "ca_count_mismatch",
-            "apo_n_residues": len(apo_xyz),
-            "holo_n_residues": len(holo_xyz),
-        }
-    n_residues = int(len(apo_xyz))
-    if not int(config["min_residues"]) <= n_residues <= int(config["max_residues"]):
+    apo_n_residues = int(len(apo_xyz))
+    holo_n_residues = int(len(holo_xyz))
+    if max(apo_n_residues, holo_n_residues) > int(config["max_residues"]):
         return {
             **base,
             "eligible": False,
             "reason": "residue_count",
-            "n_residues": n_residues,
+            "apo_n_residues": apo_n_residues,
+            "holo_n_residues": holo_n_residues,
         }
 
-    sequence_matches = sum(a == b for a, b in zip(apo["residue_names"], holo["residue_names"]))
-    sequence_identity = float(sequence_matches / n_residues)
+    alignment = align_residue_names(apo["residue_names"], holo["residue_names"])
+    sequence_identity = alignment.sequence_identity
+    mapping_fraction = alignment.symmetric_mapping_fraction
+    mapped_residues = len(alignment.exact_pairs)
+    mapping_fields = {
+        "apo_n_residues": apo_n_residues,
+        "holo_n_residues": holo_n_residues,
+        "mapped_residues": mapped_residues,
+        "sequence_identity": sequence_identity,
+        "residue_mapping_fraction": mapping_fraction,
+        "apo_residue_mapping_fraction": alignment.reference_mapping_fraction,
+        "holo_residue_mapping_fraction": alignment.query_mapping_fraction,
+        "residue_mapping_method": "single_chain_global_sequence_exact",
+    }
+    if not int(config["min_residues"]) <= mapped_residues <= int(config["max_residues"]):
+        return {
+            **base,
+            **mapping_fields,
+            "eligible": False,
+            "reason": "residue_count",
+            "n_residues": mapped_residues,
+        }
     if sequence_identity < float(config["min_sequence_identity"]):
         return {
             **base,
+            **mapping_fields,
             "eligible": False,
             "reason": "sequence_identity",
-            "n_residues": n_residues,
-            "sequence_identity": sequence_identity,
+            "n_residues": mapped_residues,
         }
+    if mapping_fraction < float(config["min_residue_mapping_fraction"]):
+        return {
+            **base,
+            **mapping_fields,
+            "eligible": False,
+            "reason": "residue_mapping",
+            "n_residues": mapped_residues,
+        }
+
+    apo_indices = np.asarray(
+        [reference_index for reference_index, _ in alignment.exact_pairs],
+        dtype=np.int64,
+    )
+    holo_indices = np.asarray(
+        [query_index for _, query_index in alignment.exact_pairs],
+        dtype=np.int64,
+    )
+    apo_xyz = apo_xyz[apo_indices]
+    holo_xyz = holo_xyz[holo_indices]
+    n_residues = mapped_residues
 
     ligand = describe_ligand(
         sample_dir / "ligand.sdf",
@@ -324,7 +360,7 @@ def screen_sample(sample_id: str, config: Mapping[str, Any]) -> Dict[str, Any]:
             "eligible": False,
             "reason": f"ligand:{ligand.get('reason', 'unknown')}",
             "n_residues": n_residues,
-            "sequence_identity": sequence_identity,
+            **mapping_fields,
         }
 
     aligned_apo, global_rmsd = kabsch_align(apo_xyz, holo_xyz)
@@ -341,7 +377,7 @@ def screen_sample(sample_id: str, config: Mapping[str, Any]) -> Dict[str, Any]:
             "eligible": False,
             "reason": "pocket_too_small",
             "n_residues": n_residues,
-            "sequence_identity": sequence_identity,
+            **mapping_fields,
             "pocket_residues": pocket_size,
             "nearest_ligand_ca": float(min(apo_distance.min(), holo_distance.min())),
         }
@@ -381,7 +417,7 @@ def screen_sample(sample_id: str, config: Mapping[str, Any]) -> Dict[str, Any]:
         "apo_chain_observed": apo["chains"][0],
         "holo_chain_observed": holo["chains"][0],
         "n_residues": n_residues,
-        "sequence_identity": sequence_identity,
+        **mapping_fields,
         "ca_raw_rmsd": raw_rmsd,
         "ca_aligned_rmsd": global_rmsd,
         "pocket_ca_rmsd": pocket_rmsd,
@@ -398,7 +434,8 @@ def screen_sample(sample_id: str, config: Mapping[str, Any]) -> Dict[str, Any]:
     setup_penalty = (
         0.03 * max(int(ligand.get("organic_copy_count", 1)) - 1, 0)
         + 0.02 * int(ligand.get("extra_nonorganic_fragments", 0))
-        + 0.08 * min(max((n_residues - 350) / 150.0, 0.0), 1.0)
+        + 0.08
+        * min(max((max(apo_n_residues, holo_n_residues) - 350) / 150.0, 0.0), 1.0)
     )
     result["pilot_score"] = float(result["motion_score"] - setup_penalty)
     return result
@@ -472,6 +509,10 @@ def candidate_to_transition_record(row: Mapping[str, Any]) -> Dict[str, Any]:
     holo_pdb = str(row.get("holo_pdb") or "").upper()
     ligand_id = str(row.get("ligand_resname") or "unknown")
     sample_dir = Path(str(row["sample_dir"]))
+    sequence_identity = float(row.get("sequence_identity", 0.0))
+    mapping_fraction = float(
+        row.get("residue_mapping_fraction", sequence_identity)
+    )
     return {
         "schema_version": SCHEMA_VERSION,
         "transition_id": f"ahoj:{sample_id}:pilot",
@@ -524,8 +565,10 @@ def candidate_to_transition_record(row: Mapping[str, Any]) -> Dict[str, Any]:
             "ligand_scaffold_group": row.get("ligand_inchikey"),
         },
         "quality": {
-            "endpoint_mapping_verified": bool(float(row.get("sequence_identity", 0.0)) >= 0.95),
-            "residue_mapping_fraction": float(row.get("sequence_identity", 0.0)),
+            "endpoint_mapping_verified": bool(
+                sequence_identity >= 0.95 and mapping_fraction >= 0.95
+            ),
+            "residue_mapping_fraction": mapping_fraction,
             "transition_verified": False,
             "notes": [
                 "AHoJ apo/holo endpoints selected for MD setup pilot; no intermediate trajectory yet."
@@ -536,6 +579,12 @@ def candidate_to_transition_record(row: Mapping[str, Any]) -> Dict[str, Any]:
             for key in (
                 "selection_rank",
                 "n_residues",
+                "apo_n_residues",
+                "holo_n_residues",
+                "mapped_residues",
+                "sequence_identity",
+                "residue_mapping_fraction",
+                "residue_mapping_method",
                 "ca_aligned_rmsd",
                 "pocket_ca_rmsd",
                 "max_ca_displacement",
@@ -557,6 +606,13 @@ def summarize_screen(rows: Sequence[Mapping[str, Any]], selected: Sequence[Mappi
     categories = Counter(str(row.get("motion_category", "unknown")) for row in selected)
     eligible = [row for row in rows if row.get("eligible") is True]
 
+    def endpoint_pairs(values: Sequence[Mapping[str, Any]]) -> set[Tuple[str, str]]:
+        return {
+            (str(row.get("apo_pdb") or "").upper(), str(row.get("holo_pdb") or "").upper())
+            for row in values
+            if row.get("apo_pdb") and row.get("holo_pdb")
+        }
+
     def median(key: str) -> Optional[float]:
         values = [float(row[key]) for row in eligible if row.get(key) is not None]
         return float(np.median(values)) if values else None
@@ -564,7 +620,9 @@ def summarize_screen(rows: Sequence[Mapping[str, Any]], selected: Sequence[Mappi
     return {
         "screened": len(rows),
         "eligible": len(eligible),
+        "eligible_unique_endpoint_pairs": len(endpoint_pairs(eligible)),
         "selected": len(selected),
+        "selected_unique_endpoint_pairs": len(endpoint_pairs(selected)),
         "reasons": dict(sorted(reasons.items())),
         "selected_categories": dict(sorted(categories.items())),
         "eligible_medians": {

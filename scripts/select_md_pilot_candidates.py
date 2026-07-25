@@ -64,6 +64,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-residues", type=int, default=80)
     parser.add_argument("--max-residues", type=int, default=500)
     parser.add_argument("--min-sequence-identity", type=float, default=0.95)
+    parser.add_argument("--min-residue-mapping-fraction", type=float, default=0.95)
     parser.add_argument("--min-heavy-atoms", type=int, default=8)
     parser.add_argument("--max-heavy-atoms", type=int, default=70)
     parser.add_argument("--max-abs-charge", type=int, default=2)
@@ -98,6 +99,10 @@ def write_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> None:
 
 def main() -> None:
     args = parse_args()
+    if args.select_count <= 0:
+        raise ValueError("--select-count must be positive")
+    if not 0.0 < args.min_residue_mapping_fraction <= 1.0:
+        raise ValueError("--min-residue-mapping-fraction must be in (0, 1]")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     sample_ids = read_sample_ids(args.sample_list, scan_limit=args.scan_limit, seed=args.seed)
     config: Dict[str, Any] = {
@@ -137,6 +142,8 @@ def main() -> None:
     )
     summary = {
         **summarize_screen(rows, selected),
+        "requested_select_count": args.select_count,
+        "selection_shortfall": max(args.select_count - len(selected), 0),
         "sample_list": str(args.sample_list),
         "data_dir": str(args.data_dir),
         "seed": args.seed,

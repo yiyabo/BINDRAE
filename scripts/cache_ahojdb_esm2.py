@@ -10,6 +10,7 @@ ESM-2 Cache for AHoJ-DB (Stage-2)
 import os
 import sys
 import platform
+import numpy as np
 import torch
 from pathlib import Path
 from typing import Dict, Optional, Tuple, List
@@ -24,6 +25,7 @@ if str(project_root) not in sys.path:
 from src.data.residue_identity import (
     RESIDUE_ALIGNMENT_VERSION,
     iter_standard_residues,
+    load_residue_keys,
     residue_key_from_biopython,
     residue_keys_to_array,
     residue_names_to_sequence,
@@ -191,6 +193,32 @@ class ESM2CacheAHoJ:
         metadata = self.extract_sequence_and_keys(pdb_path)
         return metadata[0] if metadata is not None else None
 
+    def extract_sample_sequence_and_keys(self, sample_dir: Path):
+        """Prefer the canonical Stage-2 torsion axis over all chains in a PDB."""
+        torsion_path = sample_dir / "torsion_apo.npz"
+        if torsion_path.exists():
+            try:
+                with np.load(torsion_path, allow_pickle=False) as data:
+                    residue_keys = load_residue_keys(data)
+                    sequence = (
+                        str(np.asarray(data["sequence_str"]).item())
+                        if "sequence_str" in data
+                        else ""
+                    )
+                if residue_keys is not None and sequence:
+                    if len(residue_keys) != len(sequence):
+                        raise ValueError(
+                            f"{torsion_path} residue key count {len(residue_keys)} "
+                            f"does not match sequence length {len(sequence)}"
+                        )
+                    return sequence, residue_keys
+            except Exception as exc:
+                print(
+                    f"Canonical torsion metadata failed for {sample_dir.name}: {exc}"
+                )
+
+        return self.extract_sequence_and_keys(sample_dir / "apo.pdb")
+
     def encode_sequence(self, sample_id: str, sequence: str, residue_keys=None) -> Optional[Dict]:
         try:
             data = [(sample_id, sequence)]
@@ -258,11 +286,10 @@ class ESM2CacheAHoJ:
             if self._esm_cache_satisfies_request(esm_path):
                 continue
                 
-            apo_pdb = d / "apo.pdb"
-            if not apo_pdb.exists():
+            if not (d / "apo.pdb").exists():
                 continue
                 
-            metadata = self.extract_sequence_and_keys(apo_pdb)
+            metadata = self.extract_sample_sequence_and_keys(d)
             if metadata:
                 seq, residue_keys = metadata
                 tasks.append((sample_id, seq, residue_keys, esm_path))
