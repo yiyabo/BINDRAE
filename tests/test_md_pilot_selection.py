@@ -200,6 +200,86 @@ class MDPilotSelectionTest(unittest.TestCase):
         self.assertEqual(result["organic_copy_count"], 2)
         self.assertEqual(result["heavy_atoms"], 3)
 
+    def _write_multi_fragment_sdf(self, path: Path, smiles: str) -> None:
+        from rdkit import Chem
+        from rdkit.Chem import AllChem
+
+        molecule = Chem.AddHs(Chem.MolFromSmiles(smiles))
+        self.assertEqual(AllChem.EmbedMolecule(molecule, randomSeed=11), 0)
+        writer = Chem.SDWriter(str(path))
+        writer.write(molecule)
+        writer.close()
+
+    def test_distinct_organic_fragments_are_rejected_by_default(self):
+        try:
+            import rdkit  # noqa: F401
+        except ImportError:
+            self.skipTest("RDKit is only required in the BINDRAE-MD environment")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "mixed.sdf"
+            # A 12-heavy-atom ligand co-exported with glycerol.
+            self._write_multi_fragment_sdf(path, "c1ccccc1C(=O)NCCO.OCC(O)CO")
+            result = describe_ligand(
+                path, min_heavy_atoms=8, max_heavy_atoms=70, max_abs_charge=2
+            )
+        self.assertFalse(result["eligible"])
+        self.assertEqual(result["reason"], "multiple_unique_organic_fragments")
+
+    def test_largest_policy_keeps_the_dominant_fragment(self):
+        try:
+            import rdkit  # noqa: F401
+        except ImportError:
+            self.skipTest("RDKit is only required in the BINDRAE-MD environment")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "mixed.sdf"
+            self._write_multi_fragment_sdf(path, "c1ccccc1C(=O)NCCO.OCC(O)CO")
+            result = describe_ligand(
+                path,
+                min_heavy_atoms=8,
+                max_heavy_atoms=70,
+                max_abs_charge=2,
+                multi_fragment_policy="largest",
+            )
+        self.assertTrue(result["eligible"])
+        self.assertEqual(result["reason"], "ok")
+        self.assertEqual(result["unique_organic_fragments"], 2)
+        self.assertEqual(result["discarded_unique_fragments"], 1)
+        # Glycerol has six heavy atoms and is below the eight-atom ligand floor.
+        self.assertEqual(result["discarded_max_heavy_atoms"], 6)
+        self.assertNotIn(".", result["canonical_smiles"])
+
+    def test_largest_policy_refuses_two_comparable_ligands(self):
+        try:
+            import rdkit  # noqa: F401
+        except ImportError:
+            self.skipTest("RDKit is only required in the BINDRAE-MD environment")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "ambiguous.sdf"
+            # Two distinct drug-sized fragments; neither dominates the other.
+            self._write_multi_fragment_sdf(path, "c1ccccc1C(=O)NCCO.c1ccccc1S(=O)(=O)NCC")
+            result = describe_ligand(
+                path,
+                min_heavy_atoms=8,
+                max_heavy_atoms=70,
+                max_abs_charge=2,
+                multi_fragment_policy="largest",
+            )
+        self.assertFalse(result["eligible"])
+        self.assertEqual(result["reason"], "ambiguous_primary_fragment")
+
+    def test_unknown_multi_fragment_policy_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "unused.sdf"
+            path.write_text("")
+            with self.assertRaises(ValueError):
+                describe_ligand(
+                    path,
+                    min_heavy_atoms=8,
+                    max_heavy_atoms=70,
+                    max_abs_charge=2,
+                    multi_fragment_policy="keep-everything",
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

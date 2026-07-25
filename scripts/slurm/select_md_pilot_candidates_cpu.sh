@@ -20,6 +20,11 @@ SELECT_COUNT="${SELECT_COUNT:-16}"
 SEED="${SEED:-20260713}"
 WORKERS="${WORKERS:-20}"
 MIN_RESIDUE_MAPPING_FRACTION="${MIN_RESIDUE_MAPPING_FRACTION:-0.95}"
+# Acquisition-capacity controls. Defaults reproduce the frozen scan exactly; the
+# 0.95 mapping gate, holdout leakage filter, and physical gates are unaffected.
+EXCLUDE_RESNAME_PRESET="${EXCLUDE_RESNAME_PRESET:-frozen23}"
+MULTI_FRAGMENT_POLICY="${MULTI_FRAGMENT_POLICY:-reject}"
+FRAGMENT_DOMINANCE_RATIO="${FRAGMENT_DOMINANCE_RATIO:-2.0}"
 
 cd "$ROOT"
 mkdir -p logs/slurm "$OUTPUT_DIR"
@@ -38,6 +43,8 @@ echo "Scan limit:   $SCAN_LIMIT"
 echo "Select count: $SELECT_COUNT"
 echo "Workers:      $WORKERS"
 echo "Min mapping:  $MIN_RESIDUE_MAPPING_FRACTION"
+echo "Resname preset: $EXCLUDE_RESNAME_PRESET"
+echo "Fragment policy: $MULTI_FRAGMENT_POLICY (dominance $FRAGMENT_DOMINANCE_RATIO)"
 
 python scripts/select_md_pilot_candidates.py \
   --data-dir processed_data/triplets \
@@ -47,7 +54,10 @@ python scripts/select_md_pilot_candidates.py \
   --select-count "$SELECT_COUNT" \
   --seed "$SEED" \
   --workers "$WORKERS" \
-  --min-residue-mapping-fraction "$MIN_RESIDUE_MAPPING_FRACTION"
+  --min-residue-mapping-fraction "$MIN_RESIDUE_MAPPING_FRACTION" \
+  --exclude-resname-preset "$EXCLUDE_RESNAME_PRESET" \
+  --multi-fragment-policy "$MULTI_FRAGMENT_POLICY" \
+  --fragment-dominance-ratio "$FRAGMENT_DOMINANCE_RATIO"
 
 python scripts/audit_md_transition_manifest.py \
   --manifest "$OUTPUT_DIR/selected_transition_manifest.jsonl" \
