@@ -60,6 +60,8 @@ ARGS=(
   --convergence "${CONVERGENCE}"
   --timeout_sec "${TIMEOUT_SEC}"
   --min_frames "${MIN_FRAMES}"
+  --shard_index "${SHARD_INDEX:-0}"
+  --num_shards "${NUM_SHARDS:-1}"
 )
 
 if [[ "${CLEAN}" == "1" ]]; then

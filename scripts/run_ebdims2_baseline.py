@@ -20,6 +20,11 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+try:
+    from scripts.ca_baseline_common import canonical_ca_pair, write_ca_only_pdb
+except ModuleNotFoundError:  # Direct ``python scripts/...`` execution.
+    from ca_baseline_common import canonical_ca_pair, write_ca_only_pdb
+
 
 AA_MASS = {
     "ALA": 71.0,
@@ -80,6 +85,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--clean", action="store_true")
     parser.add_argument("--skip_existing", action="store_true")
     parser.add_argument("--dry_run", action="store_true")
+    parser.add_argument("--shard_index", type=int, default=0)
+    parser.add_argument("--num_shards", type=int, default=1)
     return parser.parse_args()
 
 
@@ -192,8 +199,7 @@ def sample_info(data_dir: Path, sample_id: str, same_chain_only: bool) -> Dict[s
             "apo_chain": apo_chain,
             "holo_chain": holo_chain,
         }
-    apo_xyz = np.stack([rec["xyz"] for rec in apo], axis=0)
-    holo_xyz = np.stack([rec["xyz"] for rec in holo], axis=0)
+    apo_xyz, holo_xyz, coordinate_source = canonical_ca_pair(sample_dir, apo, holo)
     raw_rmsd = float(np.sqrt(np.mean(np.sum((apo_xyz - holo_xyz) ** 2, axis=1))))
     return {
         "sample_id": sample_id,
@@ -206,6 +212,7 @@ def sample_info(data_dir: Path, sample_id: str, same_chain_only: bool) -> Dict[s
         "n_ca": n,
         "ca_rmsd": kabsch_rmsd(apo_xyz, holo_xyz),
         "ca_raw_rmsd": raw_rmsd,
+        "coordinate_source": coordinate_source,
     }
 
 
@@ -266,6 +273,7 @@ def append_jsonl(path: Path, row: Dict[str, object]) -> None:
 def select_candidates(args: argparse.Namespace) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
     data_dir = Path(args.data_dir)
     ids = read_sample_ids(Path(args.sample_file))[: int(args.candidate_scan_limit)]
+    ids = ids[int(args.shard_index) :: int(args.num_shards)]
     eligible: List[Dict[str, object]] = []
     rejected: List[Dict[str, object]] = []
     for sample_id in ids:
@@ -295,8 +303,13 @@ def run_one(args: argparse.Namespace, info: Dict[str, object]) -> Dict[str, obje
     run_dir.mkdir(parents=True, exist_ok=True)
     if args.clean:
         clean_run_dir(run_dir)
-    shutil.copy2(str(info["apo_pdb"]), run_dir / "apo.pdb")
-    shutil.copy2(str(info["holo_pdb"]), run_dir / "holo.pdb")
+    apo_records = parse_ca_records(Path(str(info["apo_pdb"])), str(info["apo_chain"]))
+    holo_records = parse_ca_records(Path(str(info["holo_pdb"])), str(info["holo_chain"]))
+    apo_ca, holo_ca, coordinate_source = canonical_ca_pair(
+        Path(str(info["sample_dir"])), apo_records, holo_records
+    )
+    write_ca_only_pdb(run_dir / "apo.pdb", apo_records, apo_ca)
+    write_ca_only_pdb(run_dir / "holo.pdb", holo_records, holo_ca)
 
     existing_frames = list_frames(run_dir)
     if args.skip_existing and len(existing_frames) >= int(args.min_frames):
@@ -361,6 +374,11 @@ def run_one(args: argparse.Namespace, info: Dict[str, object]) -> Dict[str, obje
     (run_dir / "runner_stderr_tail.txt").write_text(stderr, encoding="utf-8")
     return {
         **info,
+        "source_apo_pdb": str(info["apo_pdb"]),
+        "source_holo_pdb": str(info["holo_pdb"]),
+        "apo_pdb": str(run_dir / "apo.pdb"),
+        "holo_pdb": str(run_dir / "holo.pdb"),
+        "coordinate_source": coordinate_source,
         "status": status,
         "run_dir": str(run_dir),
         "frames": len(frames),
@@ -376,6 +394,12 @@ def run_one(args: argparse.Namespace, info: Dict[str, object]) -> Dict[str, obje
 
 def main() -> None:
     args = parse_args()
+    if args.num_shards < 1:
+        raise ValueError("num_shards must be at least 1")
+    if args.shard_index < 0 or args.shard_index >= args.num_shards:
+        raise ValueError(
+            f"shard_index must be in [0, {args.num_shards}), got {args.shard_index}"
+        )
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = Path(args.manifest_output) if args.manifest_output else output_dir / "run_manifest.jsonl"
@@ -411,6 +435,8 @@ def main() -> None:
         "convergence": float(args.convergence),
         "timeout_sec": int(args.timeout_sec),
         "min_frames": int(args.min_frames),
+        "shard_index": int(args.shard_index),
+        "num_shards": int(args.num_shards),
     }
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")

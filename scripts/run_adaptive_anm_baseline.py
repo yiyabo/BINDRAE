@@ -27,6 +27,7 @@ from run_anm_baseline import (  # noqa: E402
     select_candidates,
     write_ca_pdb,
 )
+from ca_baseline_common import canonical_ca_pair  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -157,8 +158,9 @@ def run_one(args: argparse.Namespace, info: Dict[str, object]) -> Dict[str, obje
     try:
         apo_records = parse_ca_records(Path(str(info["apo_pdb"])), str(info["apo_chain"]))
         holo_records = parse_ca_records(Path(str(info["holo_pdb"])), str(info["holo_chain"]))
-        apo = np.stack([rec["xyz"] for rec in apo_records], axis=0)
-        holo = np.stack([rec["xyz"] for rec in holo_records], axis=0)
+        apo, holo, coordinate_source = canonical_ca_pair(
+            Path(str(info["sample_dir"])), apo_records, holo_records
+        )
         frames_xyz, diag = adaptive_anm_path(apo, holo, args)
         for frame_idx, coords in enumerate(frames_xyz, start=1):
             write_ca_pdb(run_dir / f"DIMS_MD{frame_idx:04d}.pdb", apo_records, coords)
@@ -191,6 +193,7 @@ def run_one(args: argparse.Namespace, info: Dict[str, object]) -> Dict[str, obje
         "step_mode": str(args.step_mode),
         "wall_sec": wall_sec,
         "error": error,
+        "coordinate_source": coordinate_source if status != "failed" else info.get("coordinate_source"),
         **diag,
     }
 

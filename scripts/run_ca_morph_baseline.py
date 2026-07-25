@@ -12,6 +12,11 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+try:
+    from scripts.ca_baseline_common import canonical_ca_pair
+except ModuleNotFoundError:  # Direct ``python scripts/...`` execution.
+    from ca_baseline_common import canonical_ca_pair
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run simple CA morphing baselines")
@@ -132,8 +137,7 @@ def sample_info(data_dir: Path, sample_id: str, same_chain_only: bool) -> Dict[s
             "apo_chain": apo_chain,
             "holo_chain": holo_chain,
         }
-    apo_xyz = np.stack([rec["xyz"] for rec in apo], axis=0)
-    holo_xyz = np.stack([rec["xyz"] for rec in holo], axis=0)
+    apo_xyz, holo_xyz, coordinate_source = canonical_ca_pair(sample_dir, apo, holo)
     raw_rmsd = float(np.sqrt(np.mean(np.sum((apo_xyz - holo_xyz) ** 2, axis=1))))
     return {
         "sample_id": sample_id,
@@ -146,6 +150,7 @@ def sample_info(data_dir: Path, sample_id: str, same_chain_only: bool) -> Dict[s
         "n_ca": len(apo),
         "ca_rmsd": kabsch_rmsd(apo_xyz, holo_xyz),
         "ca_raw_rmsd": raw_rmsd,
+        "coordinate_source": coordinate_source,
     }
 
 
@@ -228,8 +233,9 @@ def run_one(args: argparse.Namespace, info: Dict[str, object]) -> Dict[str, obje
     try:
         apo_records = parse_ca_records(Path(str(info["apo_pdb"])), str(info["apo_chain"]))
         holo_records = parse_ca_records(Path(str(info["holo_pdb"])), str(info["holo_chain"]))
-        apo = np.stack([rec["xyz"] for rec in apo_records], axis=0)
-        holo = np.stack([rec["xyz"] for rec in holo_records], axis=0)
+        apo, holo, coordinate_source = canonical_ca_pair(
+            Path(str(info["sample_dir"])), apo_records, holo_records
+        )
         disp = holo - apo
         for frame_idx, t_val in enumerate(np.linspace(1.0 / int(args.n_frames), 1.0, int(args.n_frames)), start=1):
             frac = interpolation_fraction(str(args.method), float(t_val))
@@ -253,6 +259,7 @@ def run_one(args: argparse.Namespace, info: Dict[str, object]) -> Dict[str, obje
         "last_frame": frames[-1].name if frames else None,
         "wall_sec": wall_sec,
         "error": error,
+        "coordinate_source": coordinate_source if status != "failed" else info.get("coordinate_source"),
     }
 
 

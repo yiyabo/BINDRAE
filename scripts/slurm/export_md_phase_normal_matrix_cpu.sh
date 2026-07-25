@@ -13,6 +13,7 @@ set -euo pipefail
 ROOT=${ROOT:-/mnt/inaisfs/data/home/zhaozc_criait/XinxiangWang/BINDRAE}
 COLLECTION_MANIFEST=${COLLECTION_MANIFEST:?COLLECTION_MANIFEST is required}
 OUTPUT_ROOT=${OUTPUT_ROOT:?OUTPUT_ROOT is required}
+REPLICA_MATRICES=${REPLICA_MATRICES:-}
 PHASE_TARGET_MODE=${PHASE_TARGET_MODE:-identity}
 RESIDUAL_ENVELOPE=${RESIDUAL_ENVELOPE:-sin2}
 NORMAL_PROJECTION_MODE=${NORMAL_PROJECTION_MODE:-product}
@@ -27,10 +28,19 @@ mkdir -p logs/slurm "${OUTPUT_ROOT}"
 export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-8}
 
+MATRIX_ARGS=()
+if [[ -n "${REPLICA_MATRICES}" ]]; then
+  IFS=':' read -r -a MATRIX_PATHS <<< "${REPLICA_MATRICES}"
+  for matrix_path in "${MATRIX_PATHS[@]}"; do
+    MATRIX_ARGS+=(--replica-matrix "${matrix_path}")
+  done
+fi
+
 python scripts/export_md_phase_normal_matrix_entry.py \
   --collection-manifest "${COLLECTION_MANIFEST}" \
   --index "${MATRIX_INDEX}" \
   --output-root "${OUTPUT_ROOT}" \
+  "${MATRIX_ARGS[@]}" \
   --phase-target-mode "${PHASE_TARGET_MODE}" \
   --residual-envelope "${RESIDUAL_ENVELOPE}" \
   --normal-projection-mode "${NORMAL_PROJECTION_MODE}"
