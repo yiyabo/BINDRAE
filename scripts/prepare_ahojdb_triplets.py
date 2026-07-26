@@ -587,6 +587,7 @@ def extract_ligand_from_pdb(
     *,
     residue_number: Optional[int] = None,
     select_single_residue: bool = True,
+    covalent_closure: bool = True,
 ) -> Tuple[np.ndarray, str, Dict]:
     """Extract the ligand from a chain, selecting *one* component instance.
 
@@ -663,11 +664,14 @@ def extract_ligand_from_pdb(
     # Pass 2: decide which residues are the ligand.
     if select_single_residue:
         selection = select_ligand_residues(
-            views, resname=ligand_resname, resnum=int(residue_number)
+            views, resname=ligand_resname, resnum=int(residue_number),
+            covalent_closure=covalent_closure,
         )
         chosen = set(selection.selected_indices)
         diagnostics = selection.as_diagnostics()
-        diagnostics["selection_mode"] = "seed_plus_covalent_closure"
+        diagnostics["selection_mode"] = (
+            "seed_plus_covalent_closure" if covalent_closure else "seed_only"
+        )
     else:
         target = ligand_resname.strip().upper()
         chosen = {i for i, view in enumerate(views) if view.resname == target}

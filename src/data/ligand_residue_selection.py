@@ -216,11 +216,19 @@ def select_ligand_residues(
     insertion_code: str | None = None,
     tolerance: float = COVALENT_TOLERANCE,
     traverse_metal_ions: bool = False,
+    covalent_closure: bool = True,
 ) -> LigandSelection:
     """Select the seed residue and everything covalently attached to it.
 
     ``residues`` should already exclude waters and standard polymer residues;
     this function does not re-derive that classification.
+
+    ``covalent_closure=False`` restricts the result to the seed residue alone.
+    The closure is right for an oligosaccharide written one unit per residue, but
+    it can over-reach: on ``3hxy-A-MDN-443`` it grew a 9-atom diphosphonate into
+    68 atoms.  Callers that can verify their result -- the extraction repair
+    checks the selection against what was already written -- should try both and
+    keep whichever reproduces the deposited ligand, rather than deciding here.
 
     Raises:
         LigandResidueNotFound: if no residue matches ``resname`` and ``resnum``.
@@ -246,7 +254,7 @@ def select_ligand_residues(
     # Transitive covalent closure. Chains hold tens of hetero residues after the
     # caller drops waters, so the naive pairwise sweep is not worth optimising.
     selected = {seed_index}
-    frontier = [seed_index]
+    frontier = [seed_index] if covalent_closure else []
     while frontier:
         current = frontier.pop()
         for index, candidate in enumerate(residues):

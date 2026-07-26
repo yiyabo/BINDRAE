@@ -130,6 +130,26 @@ class SelectLigandResiduesTest(unittest.TestCase):
         self.assertEqual(selection.discarded_same_resname, (2,))
         self.assertTrue(selection.defect_present)
 
+    def test_closure_can_be_disabled_for_callers_that_verify_their_result(self):
+        """The closure over-reaches on some structures -- on `3hxy-A-MDN-443` it
+        grew a 9-atom diphosphonate into 68 atoms. A caller that can check its
+        answer against what was already written tries both and keeps the one
+        that reproduces the deposited ligand."""
+        residues = [
+            _residue("BGC", 1, [[0.0, 0.0, 0.0]], ["O"]),
+            _residue("BGC", 2, [[1.44, 0.0, 0.0]], ["C"]),
+        ]
+
+        with_closure = select_ligand_residues(residues, resname="BGC", resnum=1)
+        seed_only = select_ligand_residues(
+            residues, resname="BGC", resnum=1, covalent_closure=False
+        )
+
+        self.assertEqual(with_closure.selected_indices, (0, 1))
+        self.assertEqual(seed_only.selected_indices, (0,))
+        self.assertEqual(seed_only.covalent_partner_indices, ())
+        self.assertEqual(seed_only.discarded_same_resname, (1,))
+
     def test_a_separate_metal_ion_is_not_part_of_the_ligand(self):
         """A site zinc is its own residue and is not ligand scaffold.
 
