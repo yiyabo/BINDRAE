@@ -195,8 +195,11 @@ invalidate endpoints or model inputs.
 ## Open Question
 
 Whether the 303-system silver corpus must be regenerated with corrected ligand
-chemistry is undecided. A paired A/B measurement is running to inform it
-(`processed_data/md_transition/ligand_chem_ab_20260726_v1`, jobs 148807 legacy /
+chemistry is **still undecided**. Two paired A/B measurements were run to inform
+it and neither settles it; the n = 15 replication is both statistically
+inconclusive and confounded by the extraction defect, as recorded at the end of
+this section. The first measurement is
+`processed_data/md_transition/ligand_chem_ab_20260726_v1` (jobs 148807 legacy /
 148808 repaired).
 
 Design: four silent-class systems from the frozen corpus, spanning the largest
@@ -247,6 +250,57 @@ Three readings, kept separate by how well each is supported:
 
 A 16-system replication is running (jobs 148893 legacy, 148894 repaired) because
 n = 4 is too thin to decide whether to regenerate 303 systems of silver MD.
+
+### Replication at n = 15: inconclusive, and confounded
+
+The replication completed
+(`processed_data/md_transition/ligand_chem_ab16_20260726_v1`). One system,
+`2hdr-A-4A3-511`, has no legacy arm -- context task `148896_0` FAILED -- so 15 of
+16 systems are paired.
+
+```text
+replicas   legacy 23/30      repaired 20/30
+systems    legacy 13/15      repaired 11/15
+```
+
+**The pass-rate difference is not distinguishable from noise.** Only five systems
+differ between the arms: `4b3u`, `6ekz`, `7jy1` and `7k8h` favour legacy and
+`4qpd` favours repaired. A two-sided sign test on those five discordant pairs
+gives `p = 0.375`. The `3 vs 6` split at n = 4 did not survive replication as a
+signal; it survived only as a direction.
+
+**The direction is nonetheless mechanistically coherent, and the ligand metric
+points the other way.** Final ligand heavy-atom RMSD improves in 9 of 15 systems
+and worsens in 6:
+
+```text
+improved  4b3u 0.95->0.41   5ibg 1.61->0.90   6ekz 1.69->1.03
+          7k8h 1.29->1.04   1cde 2.05->1.33   and four smaller
+worsened  4whq 0.99->1.96   4yu7 1.39->1.81   and four smaller
+```
+
+So corrected chemistry tends to place the ligand better while passing the pull
+gate slightly less often, which is what a stiffer, more constrained ligand would
+do: `target_progress_fraction` measures how far the *protein* moved, and a floppy
+saturated ligand obstructs it less. Passing the gate more often is not the same
+as producing a more physical path. 9-versus-6 is not a result either.
+
+**The experiment is also confounded, by a defect discovered after it was
+designed.** At least 10 of the 15 paired systems -- `1cde`, `1l2s`, `2c4j`,
+`4b3u`, `4i8x`, `4qpd`, `4yu7`, `5ibg`, `6eg7`, `7k8h`, plus the unpaired `2hdr`
+-- carry the multi-copy extraction defect recorded below. **Both arms therefore
+hold the wrong atoms**, and the comparison is between two chemistry versions of a
+molecule that should not be there. `4i8x` has 8 copies and `6eg7` has 8; `2hdr`
+has 15.
+
+**Verdict: the A/B does not answer whether the 303-system corpus must be
+regenerated, and cannot be salvaged by adding systems.** Its ligands need the
+extraction repair first. The cleaner successor is the 32-system smoke panel
+re-run on repaired ligands (job 149011, output
+`ahoj_mapping_smoke32x2_ligandfix_20260727_v1`), which corrects the atom set as
+well as the chemistry and has a matched 21.9% baseline to compare against.
+
+Recorded so the same confounded comparison is not rebuilt later.
 
 ## Full-Corpus Scan
 
