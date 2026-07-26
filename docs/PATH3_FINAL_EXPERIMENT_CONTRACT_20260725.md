@@ -44,6 +44,15 @@ optimization study and must not be mixed into the matched final matrix.
   pre-repair SDF is preserved as `ligand.legacy_connectivity_only.sdf`. Whether
   the silver paths must be regenerated is open. See
   `LIGAND_BOND_ORDER_DEFECT_20260726.md`.
+- **Data-scale gate addendum (2026-07-26).** The gate's "3,000 novel pairs ->
+  2,000 accepted consensus systems" implies a 67% conversion. The AHoJ smoke
+  panel completed end to end for the first time and measured **21.9%**
+  (7 of 32), and a paired budget probe showed the dominant loss is a physical
+  saturation of the RMSD pull rather than an under-spent sampling budget, so it
+  does not shrink with effort. At the measured rate 2,000 systems needs roughly
+  9,100 pairs against a pool of 1,769 that a full rescan takes to at most 4,000.
+  The 3,000 figure needs replacing, not raising. See
+  `MD_CORPUS_YIELD_MEASUREMENT_20260726.md`.
 
 The strict30 result has already been evaluated once. It remains the valid frozen
 result for the existing checkpoint, but it cannot become a new blind-test result

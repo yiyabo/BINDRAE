@@ -213,14 +213,141 @@ paired.
 | `4whq-F-3N8-608` | 3N8 | 51 | 0 -> 102 |
 | `1cde-A-DZF-225` | DZF | 44 | 0 -> 68 |
 
-## Scope Not Covered
+### First result, n = 4
 
-The repair covered 335 samples. `processed_data/triplets/samples/` holds 91,327
-sample directories with 91,189 `ligand.sdf` files, and **the 1,769-pair
-expansion pool draws from those existing directories**. They still carry the
-defect. The generator fix applies only to newly generated triplets, so the
-expansion pool needs the same repair pass before any scaled MD campaign; the
-335-sample apply took 38 seconds, so the full sweep is a short CPU job.
+Both arms completed. Per system, replica 00:
+
+| System | legacy | repaired |
+|---|---|---|
+| `2hdr-A-4A3-511` | prog 0.421, ligand RMSD **3.23 A**, fail | prog 0.376, ligand RMSD **0.89 A**, fail |
+| `4i8x-A-6P3-401` | prog 0.591, pass | prog 0.597, pass |
+| `4whq-F-3N8-608` | prog 0.677, pass | prog 0.542, pass |
+| `1cde-A-DZF-225` | prog 0.544, pass | prog 0.477, fail |
+
+```text
+legacy    target_passed 6, failed_pull 2
+repaired  target_passed 3, failed_pull 3, failed_target_export 2
+```
+
+Three readings, kept separate by how well each is supported:
+
+1. **The chemistry changes the paths.** Same system, same seed, one file
+   different, and progress moves by up to `0.135`. Corrected chemistry produces
+   *different* silver paths, so the question of regenerating the corpus is real
+   rather than academic.
+2. **The repaired ligand behaves more physically.** The cleanest signal is
+   `2hdr`: ligand heavy-atom RMSD falls from `3.23 A` to `0.89 A`. The legacy
+   ligand, with zero aromatic bonds, was a floppy saturated molecule wandering
+   the pocket; with 90 aromatic bonds the fused ring system is rigid and planar
+   and stays put. This is the repair working as intended.
+3. **The repaired arm passed fewer gates (3 vs 6). No conclusion is drawn.**
+   n = 4, and the transitions sit near the `0.5` boundary where a small shift
+   flips the verdict (`1cde`: 0.544 to 0.477). A rigid ligand plausibly makes
+   the protein harder to pull, but that mechanism is unverified.
+
+A 16-system replication is running (jobs 148893 legacy, 148894 repaired) because
+n = 4 is too thin to decide whether to regenerate 303 systems of silver MD.
+
+## Full-Corpus Scan
+
+The 335-sample apply was followed by a dry run over the whole corpus, because
+the 1,769-pair expansion pool draws from these same directories and the
+generator fix only helps newly generated triplets. 91,189 samples in 13 minutes
+at 48 workers:
+
+```text
+would_repair                    82,485   (90.5%)
+rejected                         8,704   ( 9.5%)
+samples with bond-order changes 70,913   (77.8%)
+bond orders changed          1,216,111
+defect present before           23,194
+resname_chemistry_ambiguous          0
+```
+
+**77.8% of the corpus carries wrong ligand chemistry**, confirming at scale the
+72% seen in the frozen 303. The tiered resname resolution eliminated chemistry
+ambiguity entirely at this scale.
+
+Reaching that scale required three fixes to the tool itself, all of which are
+invisible at 335 samples and are now in the code:
+
+| Problem | Symptom at 90k | Fix |
+|---|---|---|
+| Enumeration cost | Hung before emitting a line | `os.scandir` and resname-from-directory-name; 3-4 metadata round trips per sample became ~1, and only 2 of 91,189 samples needed `meta.json` opened |
+| Serial CCD download | 21,048 components at 0.4/s = 14.6 h | 16-thread pool, 7/s, completed in ~50 min with 0 failures |
+| Cache torn by concurrent writers | Corrupt template on a race | Write to a temp file and `os.replace` |
+
+### Metal coordination
+
+The largest new reject class was `sanitize_failed_after_reconstruction`
+(1,003, of which **944 are HEM**), failing on nitrogen valence. Copying CCD bond
+orders onto a porphyrin leaves each pyrrole nitrogen with its two ring bonds
+plus a bond to iron, which exceeds neutral nitrogen's valence under RDKit's
+default model.
+
+The fix re-types ligand-to-metal bonds as **dative**, which contributes nothing
+to the donor's valence and is the correct model for coordination. A dative bond
+must run donor to metal and RDKit bonds cannot be re-oriented in place, so they
+are removed and re-added. Verified on 40 real failing samples: **40/40 now
+repair**. It also recovered the two largest `ccd_template_parse_failed` groups,
+`ICS` (Fe/Mo cofactor) and `OEX` (Mn/Ca oxygen-evolving cluster), whose CCD
+reference files RDKit could not parse at all.
+
+Losing all heme systems would have been a systematic coverage gap over
+haemoglobin, cytochromes and peroxidases -- the same class of bias the
+nucleotide cofactors would have caused.
+
+## A Second, Deeper Defect: Wrong Ligand Extracted
+
+The full-corpus scan surfaced a defect that is **independent of bond orders and
+more fundamental**. The largest reject class, `substructure_match_failed`
+(3,648), decomposes by what the observed graph actually contains:
+
+```text
+observed > template  2,543     ratios cluster at 1.8, 1.9, 2.8, 3.8, 4.7
+equal                1,043
+observed < template     62
+
+top resnames: GLC(536) BGC(387) XYP(202) MAN(132)   sugars
+              GLU(232) LYS(129) GLY(93) PRO(67)     standard amino acids
+              CU1(251) AU(55)                       metal ions
+```
+
+Three distinct causes:
+
+1. **Oligosaccharides (~1,250).** Non-integer ratios are the glycosidic
+   signature `n x template - (n-1)`; two linked GLC give `2x12-1 = 23`, ratio
+   1.9. Known boundary, described above.
+2. **Standard amino acids (~700).** `GLU`, `LYS`, `GLY`, `PRO`, `PHE`, `ALA`
+   are not ligands. `extract_ligand_from_pdb` collected peptide residues, and
+   the 1.8/2.8 ratios show it collected *several linked residues* at once.
+3. **Metal ions (~300).** `CU1`, `AU` are single-atom ions sharing the file
+   with, or standing in for, the organic ligand.
+
+For these samples `ligand.sdf` and `ligand_coords.npy` do not hold the ligand.
+That means **the model's ligand conditioning input is wrong for them**, not
+merely the MD chemistry -- a strictly larger blast radius than the bond-order
+defect. Stage-2 consumes those coordinates directly.
+
+This is not repaired here. It requires rewriting the extraction in
+`prepare_ahojdb_triplets.py` to filter by residue identity and select a single
+ligand residue, which changes `ligand_coords.npy` for the affected samples and
+is a separate data change needing its own evaluation.
+
+`ligand_coords_shape_mismatch` (64) is a third, unrelated pre-existing
+inconsistency: the SDF and the `.npy` disagree on atom count. The repair
+correctly refuses those rather than writing a mismatched pair.
+
+### Reject classes not resolved
+
+| Class | Count | Status |
+|---|---:|---|
+| `substructure_match_failed` | 3,648 | Wrong ligand extracted; see above |
+| `observed_heavy_atom_fraction_below_threshold` | 2,179 | Crystal observed too little of the component; correct rejection |
+| `observed_sanitize_failed` | 941 | The observed connectivity itself is illegal (oxygen with 3 bonds, chlorine with 1 that still over-valences). Proximity bond perception produced a wrong graph, which CCD reconstruction cannot repair because it presupposes correct connectivity |
+| `unobserved_neighbor_on_sentinel_element` | 573 | Partially observed phosphate; correct rejection |
+| `ccd_template_parse_failed` | 294 | Reduced by metal handling; 28 of 40 retested still fail for other reasons |
+| `ligand_coords_shape_mismatch` | 64 | Pre-existing data inconsistency |
 
 ## Artifacts
 

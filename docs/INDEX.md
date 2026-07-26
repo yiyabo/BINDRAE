@@ -33,7 +33,14 @@ operational truth.
 9. `LIGAND_BOND_ORDER_DEFECT_20260726.md`
    - Connectivity-only ligand SDF root cause, CCD-templated repair, reject
      ledger, the corrected chemistry of the frozen corpus, and the open question
-     of whether the silver MD must be regenerated.
+     of whether the silver MD must be regenerated. Also records a second,
+     deeper defect: for some samples the extracted "ligand" is a peptide, an
+     oligosaccharide, or a metal ion.
+10. `MD_CORPUS_YIELD_MEASUREMENT_20260726.md`
+   - First end-to-end measurement of endpoint pair to accepted consensus system
+     (21.9%), the budget probe showing the loss is physical rather than
+     budgetary, and why the 2,000-system target is not reachable from the
+     available pool.
 
 ## Active Scientific References
 
