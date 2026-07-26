@@ -334,6 +334,118 @@ This is not repaired here. It requires rewriting the extraction in
 ligand residue, which changes `ligand_coords.npy` for the affected samples and
 is a separate data change needing its own evaluation.
 
+### The Defect Is Not Confined To The Reject Bucket
+
+The section above located this defect inside `substructure_match_failed`, which
+made it look like a 3,648-sample problem that the repair already refuses to touch.
+**That framing was wrong and badly understated the scope.**
+
+Querying `reconstruction.component_copies` across the whole v2 dry-run ledger:
+
+```text
+records with component_copies > 1     41,599 / 91,189  = 45.6%
+```
+
+These are samples where matching **succeeded**. The reconstruction found the CCD
+template N separate times, one per disconnected fragment, reported
+`component_copies = N`, and returned `status = would_repair`. They are not
+rejected and they carry no warning. The bond-order repair would write a
+chemically valid SDF for all N copies and move on.
+
+So the reject bucket was never the population. It was the small subset where the
+extra copies happened to be *linked* and so broke element-count matching. The
+larger, silent subset is where they are *unlinked*, and those pass cleanly.
+
+Top components by affected sample count:
+
+```text
+ADP 614  PO4 582  ATP 473  FE2 441  GAL 434  NAD 377  AMP 300  SO4 280
+NAP 252  ANP 243  GLC 237  NAI 236  BGC 234  NDP 194  COA 188  GNP 176
+```
+
+`PO4`, `SO4` and `FE2` are crystallization additives and ions rather than
+biological ligands, so for those samples the extracted "ligand" is wrong twice
+over: multiple copies, of the wrong molecule.
+
+### Confirmation That These Are Defects, Not Real Multi-Copy Binding
+
+`component_copies > 1` has a legitimate reading: a pocket really can bind two
+copies of a component. The discriminator is spatial. Real multi-copy binding is
+clustered in one site; the extraction defect scatters copies across the chain.
+
+Twenty affected samples were checked directly against `ligand.sdf` coordinates,
+computing per-fragment centroids and the maximum pairwise centroid distance:
+
+```text
+max centroid spread > 15 A            20 / 20
+median spread                         72.1 A
+maximum spread                        195.0 A   (3vt2-A-IPT-601, 7 copies)
+ligand_coords.npy atom count == SDF   20 / 20
+```
+
+Worked examples:
+
+| Sample | Copies | Atoms in `.npy` | Template atoms | Spread |
+|---|---:|---:|---:|---:|
+| `2hdr-A-4A3-506` | 15 | 165 | 11 | 83.9 A |
+| `1gu1-J-FA1-201` | 12 | 144 | 12 | 53.2 A |
+| `4i8x-A-6P3-401` | 8 | 120 | 15 | 110.5 A |
+| `3vt2-A-IPT-601` | 7 | 105 | 15 | 195.0 A |
+
+No pocket is 195 A across. These are not multi-copy binding sites. And because
+the `.npy` atom count equals the SDF atom count in every case, **Stage-2 receives
+all of the scattered copies as its ligand conditioning input.**
+
+### The Frozen Training Corpus Is Affected
+
+Cross-referencing against the active Stage-2 split
+(`stage2_oracle_motion_mdphase_consensus266_fam30scaf_blockv2`, seed 20260718):
+
+| Split | Multi-copy systems | Share |
+|---|---:|---:|
+| train | 61 | ~28% |
+| validation | 9 | ~35% |
+
+The ID harvest recovered 220 train and 26 validation identifiers from the split
+summaries, against filenames that say `train_208` and `val_24`, so the
+denominators carry roughly +-12 of uncertainty. The share is ~28% either way.
+
+Unlike the bond-order defect, this one is **silent**: training proceeds normally.
+Roughly one system in four is simply conditioned on the wrong molecular input.
+
+### Two Downstream Consequences
+
+**1. An alternative explanation for the Stage-1 gate collapse.** A recorded
+negative result holds that the ligand gate collapsed to `1.5e-5` and the ligand
+residual contributed exactly zero, attributed at the time to the base-prior loss
+overwhelming the gate gradient. If ~28% of ligand inputs are fragments scattered
+up to 195 A from the pocket, a model that learns to zero the ligand pathway is
+behaving correctly. This is a **live alternative hypothesis, not a demonstrated
+cause**: it has not been shown that Stage-1 used an affected corpus, nor that
+repairing extraction revives the gate. It is now testable, where it was
+previously closed.
+
+**2. It confounds the corpus-yield conclusion.** All three systems in the
+budget probe that was used to argue the MD pull loss is physical carry this
+defect, with 2, 3 and 10 copies spread 32-66 A. Spurious copies are parameterized
+and solvated as real molecules and can sterically pin the loops that must move.
+The withdrawal is recorded in `MD_CORPUS_YIELD_MEASUREMENT_20260726.md`.
+
+### Root Cause Is Shared With The Bond-Order Defect
+
+These are not independent bugs. Both, along with `observed_sanitize_failed` (922,
+over-valent oxygen and chlorine) and `ligand_coords_shape_mismatch` (64), follow
+from one decision: the pipeline reads chemistry out of a coordinate file.
+`Chem.MolFromPDBBlock(pdb_block, removeHs=False, sanitize=False)` infers bonds by
+proximity and respects no residue boundary, and PDB carries no bond orders or
+formal charges to begin with. Missing bond orders, collected same-resname
+residues, distance-invented bonds and atom-count drift are four symptoms of
+treating the ligand as coordinates rather than as a chemical object.
+
+Ordering follows from this: **extraction must be fixed before bond orders are
+applied at corpus scale**, because bond-order repair on a wrong atom set produces
+a chemically valid molecule that is still the wrong molecule.
+
 `ligand_coords_shape_mismatch` (64) is a third, unrelated pre-existing
 inconsistency: the SDF and the `.npy` disagree on atom count. The repair
 correctly refuses those rather than writing a mismatched pair.

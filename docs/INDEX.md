@@ -32,15 +32,19 @@ operational truth.
      test-reuse, and fresh-holdout contract for completing the paper evidence.
 9. `LIGAND_BOND_ORDER_DEFECT_20260726.md`
    - Connectivity-only ligand SDF root cause, CCD-templated repair, reject
-     ledger, the corrected chemistry of the frozen corpus, and the open question
-     of whether the silver MD must be regenerated. Also records a second,
-     deeper defect: for some samples the extracted "ligand" is a peptide, an
-     oligosaccharide, or a metal ion.
+     ledger, and the corrected chemistry of the frozen corpus. Also records the
+     shared root cause -- the pipeline reads chemistry out of a coordinate file
+     -- and a second, larger, silent defect: `extract_ligand_from_pdb` collects
+     every same-resname HETATM residue in the chain, so 45.6% of the corpus and
+     ~28% of the active training split are conditioned on copies scattered up to
+     195 A apart. Read this before any corpus-scale repair; extraction must be
+     fixed first.
 10. `MD_CORPUS_YIELD_MEASUREMENT_20260726.md`
    - First end-to-end measurement of endpoint pair to accepted consensus system
-     (21.9%), the budget probe showing the loss is physical rather than
-     budgetary, and why the 2,000-system target is not reachable from the
-     available pool.
+     (21.9%). **Carries a same-day correction**: the budget probe rules out a
+     budget-limited loss but cannot show the loss is physical, because all three
+     probe systems carry the multi-copy extraction defect. The "2,000 systems is
+     unreachable" verdict inherits that confound and is not settled.
 
 ## Active Scientific References
 
