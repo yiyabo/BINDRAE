@@ -181,12 +181,25 @@ overwrite OracleMotion baseline or REPA comparison outputs.
 - `split_dataset.py`
 - `verify_casf2016.py`
 - `verify_ligand_consistency.py`
+- `repair_triplet_ligand_bond_orders.py` - rebuild ligand bond orders and formal
+  charges from the PDB Chemical Component Dictionary. Triplet SDFs written from
+  PDB HETATM records carry connectivity only, which makes polyphosphates
+  illegal-valence and silently saturates aromatic systems. `prefetch` warms the
+  CCD cache where there is network; `repair` is a dry run unless `--apply`.
+- `disambiguate_ligand_component.py` - evidence for which CCD component an
+  observed ligand is, when a query and a holo entry hold related but distinct
+  components. Read-only; bond geometry is advisory and must not decide identity.
+- `build_ligand_chemistry_ab_experiment.py` - build the paired legacy-versus-
+  repaired ligand chemistry arms as shadow triplet trees, so the arms differ in
+  exactly one file per sample and no frozen artifact is written.
 
 ## Alternate Dataset Line
 
 - `download_ahojdb_pdbs.py`
 - `extract_ahojdb_torsions.py`
-- `prepare_ahojdb_triplets.py`
+- `prepare_ahojdb_triplets.py` - `--ligand-bond-orders ccd` (default) rebuilds
+  ligand bond orders from the CCD; `legacy` reproduces the historical
+  connectivity-only SDF and exists only for comparison.
 - `cache_ahojdb_esm2.py`
 
 ## Archive

@@ -87,6 +87,17 @@ records, not templates.
 - `run_ebdims2_baseline_cpu.sh` - eBDIMS2 external path baseline plus common CA evaluation.
 - `evaluate_ebdims2_ca_paths_cpu.sh` - evaluates already generated CA path baseline manifests.
 
+## Data Repair
+
+- `repair_triplet_ligand_bond_orders_cpu.sh` - CCD bond-order repair sweep over a
+  triplet corpus. `MODE=dryrun` (default) writes only a report; `MODE=apply`
+  rewrites `ligand.sdf` and keeps the original as
+  `ligand.legacy_connectivity_only.sdf`. The CCD prefetch must run first on a
+  networked host; the sweep itself is offline and fails loudly on a cold cache.
+- `audit_stage2_md_reference_trainval_cpu.sh` - apply the frozen strict30
+  production-coordinate contract to train241 and val30, which it had never been
+  run against. Read-only with respect to every frozen artifact.
+
 ## Full-Scale Submission Notes
 
 - The active OracleMotion launcher defaults to 2 A100 through its SBATCH header.

@@ -35,6 +35,15 @@ optimization study and must not be mixed into the matched final matrix.
 - Training and checkpoint selection use only train241 and val30.
 - MD intermediate frames are supervision and evaluation references only. They
   are never inference inputs.
+- **Ligand chemistry addendum (2026-07-26).** The `ligand.sdf` files behind this
+  corpus carried connectivity only, with no bond orders and no formal charges.
+  209 of the 303 systems have had their ligand bond orders corrected against the
+  PDB Chemical Component Dictionary; 198 of those are the silent class, whose MD
+  ran to completion with a chemically wrong ligand. Endpoints, ligand
+  coordinates, splits, thresholds and Stage-2 inputs are unchanged, and every
+  pre-repair SDF is preserved as `ligand.legacy_connectivity_only.sdf`. Whether
+  the silver paths must be regenerated is open. See
+  `LIGAND_BOND_ORDER_DEFECT_20260726.md`.
 
 The strict30 result has already been evaluated once. It remains the valid frozen
 result for the existing checkpoint, but it cannot become a new blind-test result

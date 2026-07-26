@@ -30,6 +30,10 @@ operational truth.
 8. `PATH3_FINAL_EXPERIMENT_CONTRACT_20260725.md`
    - Frozen higher-budget Path-3 training, ablation, external-baseline, metric,
      test-reuse, and fresh-holdout contract for completing the paper evidence.
+9. `LIGAND_BOND_ORDER_DEFECT_20260726.md`
+   - Connectivity-only ligand SDF root cause, CCD-templated repair, reject
+     ledger, the corrected chemistry of the frozen corpus, and the open question
+     of whether the silver MD must be regenerated.
 
 ## Active Scientific References
 
