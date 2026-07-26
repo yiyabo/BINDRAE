@@ -31,6 +31,7 @@ import argparse
 import csv
 import json
 import logging
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Tuple
@@ -48,6 +49,19 @@ try:
     from rdkit import Chem
 except ImportError as exc:
     raise SystemExit(f"❌ RDKit not available: {exc}")
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.data.ligand_bond_orders import (  # noqa: E402
+    LigandBondOrderError,
+    describe_ligand,
+    load_ccd_template,
+    pdb_residue_groups,
+    reconstruct_bond_orders,
+    validate_reconstruction,
+)
 
 
 LOG = logging.getLogger("prepare_ahojdb_triplets")
@@ -819,7 +833,33 @@ def _format_pdb_atom_line(record_type, serial, name, alt_loc, res_name, chain_id
     )
     return line
 
-def pdb_block_to_sdf(pdb_block: str, coords: np.ndarray, out_path: Path) -> None:
+def pdb_block_to_sdf(
+    pdb_block: str,
+    coords: np.ndarray,
+    out_path: Path,
+    *,
+    resname: Optional[str] = None,
+    ccd_dir: Optional[Path] = None,
+    bond_order_mode: str = "ccd",
+    allow_download: bool = True,
+    missing_bond_policy: str = "restore",
+) -> Dict:
+    """Write ``ligand.sdf`` from an extracted HETATM block.
+
+    The PDB format stores no bond orders, so ``MolFromPDBBlock`` yields a graph
+    in which every bond is order 1 and every formal charge is zero.  That is
+    silently wrong for aromatics and fatally wrong for polyphosphates: a
+    phosphorus with four single bonds has illegal valence 4, RDKit completes it
+    to 5 with a hydride, and OpenFF then parameterises a ``P-H`` species whose
+    solvated initial energy is non-finite.
+
+    ``bond_order_mode="ccd"`` (the default) repairs this by copying bond orders
+    and formal charges from the PDB Chemical Component Dictionary entry for
+    ``resname``, preserving atom order and coordinates.  ``"legacy"`` reproduces
+    the historical connectivity-only behaviour and exists only to regenerate
+    pre-repair artifacts for comparison.
+    """
+
     mol = Chem.MolFromPDBBlock(pdb_block, removeHs=False, sanitize=False)
     if mol is None:
         raise ValueError("RDKit failed to build molecule from PDB block")
@@ -832,9 +872,53 @@ def pdb_block_to_sdf(pdb_block: str, coords: np.ndarray, out_path: Path) -> None
     conf = mol.GetConformer()
     for i, xyz in enumerate(coords):
         conf.SetAtomPosition(i, xyz.tolist())
+
+    provenance: Dict = {"bond_order_mode": bond_order_mode}
+    if bond_order_mode == "ccd":
+        if not resname or ccd_dir is None:
+            raise ValueError("bond_order_mode='ccd' requires resname and ccd_dir")
+        Chem.SanitizeMol(mol)
+        elements = [atom.GetSymbol() for atom in mol.GetAtoms()]
+        reference_xyz = np.asarray(conf.GetPositions(), dtype=np.float64)
+        template, template_provenance = load_ccd_template(
+            resname, ccd_dir=Path(ccd_dir), allow_download=allow_download
+        )
+        before = describe_ligand(mol)
+        # extract_ligand_from_pdb() collects every same-resname HETATM residue in
+        # the chain, so an oligosaccharide arrives as N residues joined by
+        # glycosidic bonds -- one connected fragment N times the component size.
+        # The PDB residue numbers survive in the block, so group by them here;
+        # connectivity alone cannot split a covalently linked polymer.
+        mol, diagnostics = reconstruct_bond_orders(
+            mol, template,
+            missing_bond_policy=missing_bond_policy,
+            atom_groups=pdb_residue_groups(mol),
+        )
+        after = validate_reconstruction(
+            mol,
+            reference_elements=elements,
+            reference_coordinates=reference_xyz,
+            template_formal_charge=int(template_provenance["template_formal_charge"]),
+            expected_hydrogen_counts=diagnostics.pop("expected_hydrogen_counts", None),
+        )
+        mol.SetProp("_Name", str(resname).upper())
+        provenance.update(
+            {
+                "ccd": template_provenance,
+                "reconstruction": diagnostics,
+                "connectivity_only_defect_present": bool(before["sentinel_hydrides"]),
+                "formal_charge": int(after["formal_charge"]),
+                "canonical_smiles": after["canonical_smiles"],
+                "bond_orders": after["bond_orders"],
+            }
+        )
+    elif bond_order_mode != "legacy":
+        raise ValueError(f"Unknown bond_order_mode {bond_order_mode!r}")
+
     w = Chem.SDWriter(str(out_path))
     w.write(mol)
     w.close()
+    return provenance
 
 
 def main():
@@ -852,6 +936,19 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--split", type=str, default="0.9,0.05,0.05",
                         help="Train/val/test split ratio")
+    parser.add_argument("--ligand-bond-orders", choices=["ccd", "legacy"], default="ccd",
+                        help="ccd: rebuild bond orders/formal charges from the PDB "
+                             "Chemical Component Dictionary (default). legacy: reproduce "
+                             "the historical connectivity-only SDF, which yields illegal "
+                             "phosphorus valence and non-finite MD setup energies.")
+    parser.add_argument("--ccd-dir", type=Path,
+                        default=PROJECT_ROOT / "processed_data" / "ccd_cache",
+                        help="Directory holding <RESNAME>.sdf CCD references")
+    parser.add_argument("--ccd-offline", action="store_true",
+                        help="Require a warm CCD cache instead of downloading from RCSB")
+    parser.add_argument("--missing-bond-policy", default="restore",
+                        choices=["restore", "reject", "ignore"],
+                        help="What to do with a CCD bond absent from the perceived graph")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
@@ -960,7 +1057,12 @@ def main():
             
             lig_coords = None
             lig_pdb_block = None
-            
+            # The resname actually written into the HETATM block, which is not
+            # always the entry's target_ligand: the holo path uses the id from
+            # ligands.json and the query fallback uses target_ligand.  CCD
+            # lookup must follow the block, not the sample id.
+            effective_ligand_resname = ligand_resname
+
             # Try to find ligand in Holo
             # 1. Get potential ligands from ligands.json
             cand_ligs = ligands_map.get((holo.pdb_id, holo.pocket), [])
@@ -1000,7 +1102,8 @@ def main():
                     # Combined: Holo -> Apo (R_ha, t_ha)
                     lig_coords = apply_rt(raw_coords, R_ha, t_ha)
                     lig_pdb_block = raw_block # PDB block is untransformed, but RDKit will use new coords.
-                    
+                    effective_ligand_resname = l_resname
+
                 except Exception as e:
                     LOG.warning(f"Failed to extract ligand {matched_lig_id} from Holo for {sample_id}: {e}. Falling back to Query structure.")
                     # Fallback to query
@@ -1011,7 +1114,8 @@ def main():
                 # Extract from Query structure and transform to Apo frame
                 lig_coords, lig_pdb_block = extract_ligand_from_pdb(query_pdb_path, ligand_resname, query_chain)
                 lig_coords = apply_rt(lig_coords, R_qa, t_qa)
-            
+                effective_ligand_resname = ligand_resname
+
             if lig_coords.shape[0] == 0:
                 raise ValueError(f"Ligand {ligand_resname} not found or has no heavy atoms after extraction.")
 
@@ -1020,7 +1124,21 @@ def main():
 
             # Write ligand.sdf (strict)
             sdf_path = out_dir / "ligand.sdf"
-            pdb_block_to_sdf(lig_pdb_block, lig_coords, sdf_path)
+            try:
+                ligand_chemistry = pdb_block_to_sdf(
+                    lig_pdb_block,
+                    lig_coords,
+                    sdf_path,
+                    resname=effective_ligand_resname,
+                    ccd_dir=args.ccd_dir,
+                    bond_order_mode=args.ligand_bond_orders,
+                    allow_download=not args.ccd_offline,
+                    missing_bond_policy=args.missing_bond_policy,
+                )
+            except LigandBondOrderError as exc:
+                raise ValueError(
+                    f"Ligand bond-order reconstruction failed [{exc.reason}]: {exc}"
+                ) from exc
 
             # Metadata
             meta = {
@@ -1032,6 +1150,8 @@ def main():
                 "holo_pdb": holo.pdb_id,
                 "holo_chain": holo_chain,
                 "ligand_resname": ligand_resname,
+                "effective_ligand_resname": effective_ligand_resname,
+                "ligand_chemistry": ligand_chemistry,
                 "entry_dir": str(entry_dir),
                 "apo_matrix": str(apo_mat),
                 "holo_matrix": str(holo_mat),
