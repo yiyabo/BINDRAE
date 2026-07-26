@@ -51,6 +51,79 @@ HYDRIDE_SENTINEL_ELEMENTS: frozenset[str] = frozenset({"P", "S", "B", "Si", "As"
 #: proximity-perceived observed graph does not contain.
 MISSING_BOND_POLICIES: frozenset[str] = frozenset({"restore", "reject", "ignore"})
 
+#: Elements whose bonds to an organic ligand are coordination, not covalent.
+#: RDKit's default valence model counts a coordination bond against the donor,
+#: so a heme pyrrole nitrogen ends up trivalent in the ring plus one bond to
+#: iron and fails sanitization. Re-typing those bonds as dative fixes it: a
+#: dative bond contributes nothing to the valence of the atom it starts from.
+COORDINATION_METALS: frozenset[int] = frozenset(
+    list(range(21, 31))      # Sc..Zn
+    + list(range(39, 49))    # Y..Cd
+    + list(range(72, 81))    # Hf..Hg
+    + [3, 4, 11, 12, 13, 19, 20, 37, 38, 55, 56]  # Li Be Na Mg Al K Ca Rb Sr Cs Ba
+)
+
+
+def dative_metal_bonds(molecule: Any) -> int:
+    """Re-type ligand-to-metal bonds as dative, in place. Returns the count.
+
+    RDKit orients a dative bond from donor to acceptor and charges the valence
+    to neither, which is the correct model for the Fe-N bonds of a porphyrin
+    and for the Be-F and Al-F bonds of the fluoride mimics in this corpus.
+    """
+
+    from rdkit import Chem
+
+    # A dative bond must run donor -> metal, and RDKit bonds cannot be
+    # re-oriented in place, so collect first and rebuild.
+    pairs: list[tuple[int, int]] = []
+    for bond in molecule.GetBonds():
+        begin, end = bond.GetBeginAtom(), bond.GetEndAtom()
+        begin_metal = begin.GetAtomicNum() in COORDINATION_METALS
+        end_metal = end.GetAtomicNum() in COORDINATION_METALS
+        if begin_metal == end_metal:
+            continue
+        donor, acceptor = (end, begin) if begin_metal else (begin, end)
+        pairs.append((donor.GetIdx(), acceptor.GetIdx()))
+    if not pairs:
+        return 0
+    for donor_index, metal_index in pairs:
+        molecule.RemoveBond(donor_index, metal_index)
+        molecule.AddBond(donor_index, metal_index, Chem.BondType.DATIVE)
+    for atom in molecule.GetAtoms():
+        if atom.GetAtomicNum() in COORDINATION_METALS:
+            atom.SetNoImplicit(True)
+            atom.SetNumExplicitHs(0)
+    return len(pairs)
+
+
+def sanitize_with_coordination(molecule: Any) -> tuple[Any, int]:
+    """Sanitize, falling back to dative metal bonds when valence fails.
+
+    ``molecule`` must be an ``RWMol``: re-typing requires rebuilding bonds.
+    Returns the molecule and how many bonds were re-typed, so callers can record
+    that a sample needed coordination handling rather than silently changing its
+    chemistry.
+    """
+
+    from rdkit import Chem
+
+    try:
+        Chem.SanitizeMol(molecule)
+        return molecule, 0
+    except Exception:  # noqa: BLE001 - RDKit raises bare exceptions
+        pass
+    if not isinstance(molecule, Chem.RWMol):
+        molecule = Chem.RWMol(molecule)
+    converted = dative_metal_bonds(molecule)
+    if not converted:
+        raise LigandBondOrderError(
+            "sanitize_failed_no_coordination",
+            "Sanitization failed and the molecule has no metal coordination to re-type",
+        )
+    Chem.SanitizeMol(molecule)
+    return molecule, converted
+
 
 class LigandBondOrderError(RuntimeError):
     """Raised when a ligand cannot be reconstructed against its CCD template."""
@@ -120,7 +193,12 @@ def download_ccd_sdf(
             if not payload.strip():
                 errors.append(f"{url}: empty payload")
                 continue
-            destination.write_bytes(payload)
+            # Workers race on the same component, so publish atomically: a
+            # half-written cache file would be parsed as a corrupt template.
+            import os as _os
+            temp = destination.with_suffix(f".{_os.getpid()}.tmp")
+            temp.write_bytes(payload)
+            _os.replace(temp, destination)
             return destination
         if attempt + 1 < max(1, int(retries)):
             time.sleep(retry_backoff_seconds * (attempt + 1))
@@ -152,6 +230,20 @@ def load_ccd_template(
         path = download_ccd_sdf(resname, ccd_dir, timeout_seconds=timeout_seconds)
 
     template = Chem.MolFromMolFile(str(path), removeHs=False, sanitize=True)
+    if template is None:
+        # Metal-containing components (heme, polyoxometalates) fail the strict
+        # parse on valence. Re-read without sanitization and re-type the
+        # coordination bonds before trying again.
+        template = Chem.MolFromMolFile(str(path), removeHs=False, sanitize=False)
+        if template is not None:
+            try:
+                template = Chem.RWMol(template)
+                if dative_metal_bonds(template) == 0:
+                    raise ValueError("no coordination bonds to re-type")
+                Chem.SanitizeMol(template)
+                template = template.GetMol()
+            except Exception:  # noqa: BLE001 - RDKit raises bare exceptions
+                template = None
     if template is None:
         raise LigandBondOrderError(
             "ccd_template_parse_failed", f"RDKit could not parse CCD SDF {path}"
@@ -237,9 +329,9 @@ def _submol(molecule: Any, indices: Sequence[int]) -> Any:
     for index in range(molecule.GetNumAtoms() - 1, -1, -1):
         if index not in keep:
             editable.RemoveAtom(index)
-    sub = editable.GetMol()
     try:
-        Chem.SanitizeMol(sub)
+        editable, _ = sanitize_with_coordination(editable)
+        sub = editable.GetMol() if hasattr(editable, "GetMol") else editable
     except Exception as exc:  # noqa: BLE001 - RDKit raises bare exceptions
         raise LigandBondOrderError(
             "observed_fragment_sanitize_failed",
@@ -409,9 +501,9 @@ def reconstruct_bond_orders(
             + "; the component is too incomplete for a chemically correct rebuild",
         )
 
-    molecule = result.GetMol()
     try:
-        Chem.SanitizeMol(molecule)
+        result, coordination_bonds = sanitize_with_coordination(result)
+        molecule = result.GetMol() if hasattr(result, "GetMol") else result
     except Exception as exc:  # noqa: BLE001 - RDKit raises bare exceptions
         raise LigandBondOrderError(
             "sanitize_failed_after_reconstruction",
@@ -451,6 +543,7 @@ def reconstruct_bond_orders(
         "missing_template_bonds": len(missing_bonds),
         "missing_bond_policy": missing_bond_policy,
         "atoms_with_unobserved_neighbors": len(unobserved_neighbors),
+        "coordination_bonds_retyped": int(coordination_bonds),
         "expected_hydrogen_counts": expected_hydrogens,
         # Observed atom index -> template atom index, valid across all copies.
         # Callers that need the correspondence must use this rather than
@@ -667,7 +760,9 @@ def read_observed_ligand(sdf_path: Path) -> tuple[Any, list[str], Any]:
         )
     molecule = Chem.RemoveAllHs(molecule, sanitize=False)
     try:
-        Chem.SanitizeMol(molecule)
+        molecule = Chem.RWMol(molecule)
+        molecule, _ = sanitize_with_coordination(molecule)
+        molecule = molecule.GetMol() if hasattr(molecule, "GetMol") else molecule
     except Exception as exc:  # noqa: BLE001 - RDKit raises bare exceptions
         raise LigandBondOrderError(
             "observed_sanitize_failed",

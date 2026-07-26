@@ -71,8 +71,19 @@ LEGACY_SDF_NAME = "ligand.legacy_connectivity_only.sdf"
 
 
 def iter_sample_dirs(
-    triplet_root: Path, sample_list: Path | None, limit: int | None
+    triplet_root: Path, sample_list: Path | None, limit: int | None,
+    *, require_ligand: bool = True,
 ) -> list[Path]:
+    """Enumerate sample directories.
+
+    ``os.scandir`` is used rather than ``Path.iterdir`` plus ``is_dir``: on a
+    shared parallel filesystem holding ~90k samples the latter costs one extra
+    metadata round trip per entry, and the per-entry ``ligand.sdf`` existence
+    check costs another. ``scandir`` answers the directory question from the
+    entry it already fetched, and ``require_ligand`` lets callers that do not
+    need the file (resname collection) skip the second check entirely.
+    """
+
     if sample_list is not None:
         names = [
             line.strip()
@@ -84,10 +95,12 @@ def iter_sample_dirs(
             for name in names
         ]
     else:
-        directories = sorted(
-            path for path in Path(triplet_root).iterdir() if path.is_dir()
-        )
-    directories = [path for path in directories if (path / "ligand.sdf").is_file()]
+        with os.scandir(triplet_root) as entries:
+            directories = sorted(
+                Path(entry.path) for entry in entries if entry.is_dir()
+            )
+    if require_ligand:
+        directories = [path for path in directories if (path / "ligand.sdf").is_file()]
     if limit is not None:
         directories = directories[: int(limit)]
     return directories
@@ -428,28 +441,73 @@ def repair_sample(
 
 
 def run_prefetch(args: argparse.Namespace) -> dict[str, Any]:
-    sample_dirs = iter_sample_dirs(args.triplet_root, args.sample_list, args.limit)
+    sample_dirs = iter_sample_dirs(
+        args.triplet_root, args.sample_list, args.limit, require_ligand=False
+    )
+    # Prefetch only needs the de-duplicated resname set, and a sample id encodes
+    # it as <pdb>-<chain>-<RESNAME>-<num>. Parsing the directory name costs zero
+    # I/O; meta.json is opened only for the minority whose name does not parse.
+    # Scanning holo.pdb for the tier-1 fallback is skipped outright: it would
+    # mean reading every structure file in the corpus for a handful of extra
+    # components, which repair can fetch on demand instead.
     wanted: dict[str, list[str]] = {}
+    unparsed = 0
     for sample_dir in sample_dirs:
-        for resname in resname_candidates(sample_dir):
-            wanted.setdefault(resname, []).append(sample_dir.name)
-
-    downloaded, cached, failed = [], [], []
-    for resname in sorted(wanted):
-        destination = ccd_cache_path(resname, args.ccd_dir)
-        if destination.is_file() and destination.stat().st_size > 0:
-            cached.append(resname)
+        parts = sample_dir.name.split("-")
+        resname = parts[-2].strip().upper() if len(parts) >= 3 else ""
+        if not resname:
+            unparsed += 1
+            tiers = resname_candidate_tiers(sample_dir)
+            for name in (tiers[0] if tiers else []):
+                wanted.setdefault(name, []).append(sample_dir.name)
             continue
+        wanted.setdefault(resname, []).append(sample_dir.name)
+    print(
+        f"  scanned {len(sample_dirs)} samples, {len(wanted)} distinct components, "
+        f"{unparsed} needed meta.json",
+        flush=True,
+    )
+
+    ordered = sorted(wanted)
+    cached = [
+        r for r in ordered
+        if ccd_cache_path(r, args.ccd_dir).is_file()
+        and ccd_cache_path(r, args.ccd_dir).stat().st_size > 0
+    ]
+    todo = [r for r in ordered if r not in set(cached)]
+    print(f"  {len(cached)} already cached, {len(todo)} to fetch", flush=True)
+
+    # Fetching is network bound, not CPU bound, so threads are the right tool
+    # and the GIL is irrelevant here. The cache is published atomically, so
+    # concurrent writers of the same component are safe.
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    downloaded: list[str] = []
+    failed: list[dict[str, str]] = []
+
+    def fetch(resname: str) -> tuple[str, str | None, str]:
         try:
             download_ccd_sdf(resname, args.ccd_dir, timeout_seconds=args.timeout_seconds)
-            downloaded.append(resname)
+            return resname, None, ""
         except LigandBondOrderError as exc:
-            failed.append({"resname": resname, "reason": exc.reason, "detail": str(exc)})
-        print(
-            f"  {resname:<6} "
-            f"{'cached' if resname in cached else 'downloaded' if resname in downloaded else 'FAILED'}",
-            flush=True,
-        )
+            return resname, exc.reason, str(exc)
+
+    workers = max(1, int(args.workers))
+    if todo:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(fetch, r) for r in todo]
+            for done, future in enumerate(as_completed(futures), start=1):
+                resname, reason, detail = future.result()
+                if reason is None:
+                    downloaded.append(resname)
+                else:
+                    failed.append({"resname": resname, "reason": reason, "detail": detail})
+                if done % 500 == 0 or done == len(todo):
+                    print(
+                        f"  {done}/{len(todo)} fetched "
+                        f"({len(downloaded)} ok, {len(failed)} failed)",
+                        flush=True,
+                    )
     return {
         "mode": "prefetch",
         "ccd_dir": str(args.ccd_dir),
@@ -461,31 +519,49 @@ def run_prefetch(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _repair_one(job: tuple[Path, dict[str, Any]]) -> dict[str, Any]:
+    """Worker entry point. One bad sample must never stop the sweep."""
+
+    sample_dir, options = job
+    try:
+        return repair_sample(sample_dir, **options)
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "sample_id": sample_dir.name,
+            "sample_dir": str(sample_dir),
+            "status": "error",
+            "reason": type(exc).__name__,
+            "detail": str(exc),
+        }
+
+
 def run_repair(args: argparse.Namespace) -> dict[str, Any]:
     sample_dirs = iter_sample_dirs(args.triplet_root, args.sample_list, args.limit)
+    options = {
+        "ccd_dir": args.ccd_dir,
+        "apply_changes": args.apply,
+        "allow_download": args.allow_download,
+        "missing_bond_policy": args.missing_bond_policy,
+        "min_observed_heavy_atom_fraction": args.min_observed_heavy_atom_fraction,
+        "keep_backup": not args.no_backup,
+    }
+    jobs = [(d, options) for d in sample_dirs]
     rows: list[dict[str, Any]] = []
-    for index, sample_dir in enumerate(sample_dirs, start=1):
-        try:
-            row = repair_sample(
-                sample_dir,
-                ccd_dir=args.ccd_dir,
-                apply_changes=args.apply,
-                allow_download=args.allow_download,
-                missing_bond_policy=args.missing_bond_policy,
-                min_observed_heavy_atom_fraction=args.min_observed_heavy_atom_fraction,
-                keep_backup=not args.no_backup,
-            )
-        except Exception as exc:  # noqa: BLE001 - one bad sample must not stop the sweep
-            row = {
-                "sample_id": sample_dir.name,
-                "sample_dir": str(sample_dir),
-                "status": "error",
-                "reason": type(exc).__name__,
-                "detail": str(exc),
-            }
+    workers = max(1, int(args.workers))
+    if workers == 1:
+        results = (_repair_one(job) for job in jobs)
+    else:
+        import multiprocessing
+
+        pool = multiprocessing.Pool(processes=workers)
+        results = pool.imap_unordered(_repair_one, jobs, chunksize=8)
+    for index, row in enumerate(results, start=1):
         rows.append(row)
-        if index % 50 == 0 or index == len(sample_dirs):
-            print(f"  {index}/{len(sample_dirs)} processed", flush=True)
+        if index % 500 == 0 or index == len(jobs):
+            print(f"  {index}/{len(jobs)} processed", flush=True)
+    if workers > 1:
+        pool.close()
+        pool.join()
 
     status_counts: dict[str, int] = {}
     reject_ledger: dict[str, int] = {}
@@ -545,6 +621,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--missing-bond-policy", default="restore",
                         choices=["restore", "reject", "ignore"],
                         help="What to do with a CCD bond absent from the perceived graph")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Parallel worker processes for repair mode. Reconstruction is "
+                             "CPU bound and per-sample independent, so this scales nearly "
+                             "linearly; the CCD cache is shared read-only and published "
+                             "atomically.")
     parser.add_argument("--min-observed-heavy-atom-fraction", type=float, default=0.80,
                         help="Per-copy coverage of the CCD component required to accept a "
                              "resname. Without it a small ligand matches as a subgraph of a "
