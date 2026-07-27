@@ -485,6 +485,54 @@ defect, with 2, 3 and 10 copies spread 32-66 A. Spurious copies are parameterize
 and solvated as real molecules and can sterically pin the loops that must move.
 The withdrawal is recorded in `MD_CORPUS_YIELD_MEASUREMENT_20260726.md`.
 
+### The Frozen Corpus Was Repaired, 2026-07-27
+
+`scripts/repair_triplet_ligand_extraction.py` was applied to the same 335 samples
+the bond-order repair covered (the frozen consensus corpus plus the smoke panel).
+Report: `logs/ligand_extraction_repair/corpus303_apply_v1`.
+
+```text
+repaired                        99
+single_fragment_not_in_scope   231
+rejected                         5
+ligand atoms  6,516 -> 1,819   (72% discarded)
+```
+
+Verification on disk, all 99: atom count matches the selection, `ligand_coords.npy`
+and the SDF conformer agree to `5.00e-05 A`, both backups present, SDF re-parses.
+Copies removed: median 3x, maximum 17x. The weakest identification still cleared
+the gate with an 11x runner-up margin against a 10x requirement, and the largest
+match deviation was `0.000127 A`.
+
+**Subsetting preserved the bond-order repair**, which was the risk worth checking:
+`1cde-A-DZF-225` went from 92 single and 44 double bonds across four copies to 23
+and 11 for one, exactly a quarter of each.
+
+A second bond-order pass over the repaired corpus is **not** needed. Re-running it
+reports 159 samples with "changed" bonds, but on samples the extraction repair
+never touched the before and after distributions are identical -- `1alw-A-ISA-11`
+is `AROMATIC 6, DOUBLE 1, SINGLE 6` on both sides yet counts 6 changes. The metric
+counts each aromatic bond as changed on a second pass, an artifact of kekule
+versus aromatic representation round-tripping, not work to do. The seven samples
+flagged `defect_present_before` are all sulfur-bearing (`GSH` twice, `ISA`, `SGC`,
+`GTM`, `3SU`, `YIO`) and are the documented false positives of the element-based
+sentinel indicator, which this module explicitly does not treat as a defect on its
+own.
+
+The five rejects fall in two classes, both left untouched:
+
+| Sample | Atoms | Why |
+|---|---:|---|
+| `1ivc-A-ST2-471` | 30 | `copy_match_ambiguous`: two geometrically identical copies |
+| `1ivd-A-ST1-471` | 34 | same |
+| `5gnw-C-URA-301` | 64 | same, eight identical uracils |
+| `1xnk-C-TWY-3` | 36 | no reference reproduced it; oligosaccharide boundary |
+| `3azt-E-BGC-2` | 66 | same |
+
+The ambiguous class is the one case where the alignment matrices would help:
+identical conformers cannot be separated by internal geometry, only by position.
+That path is available and was not needed for the other 99.
+
 ### Root Cause Is Shared With The Bond-Order Defect
 
 These are not independent bugs. Both, along with `observed_sanitize_failed` (922,
