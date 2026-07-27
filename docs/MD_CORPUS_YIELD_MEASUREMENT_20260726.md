@@ -29,6 +29,54 @@ The measured funnel below is unchanged and remains valid as a measurement of
 *this pipeline*. What is withdrawn is the interpretation that the loss is
 irreducible. The affected sections are marked.
 
+## Follow-up, 2026-07-27: the confound was tested and does not explain the loss
+
+The withdrawal above prescribed one experiment: re-run the panel on repaired
+ligands. That has now been done (job 149011, output
+`ahoj_mapping_smoke32x2_ligandfix_20260727_v1`) on the same frozen 32-system
+panel, same seeds, same protocol, same gates. Only the ligands changed -- bond
+orders for the whole panel, and the atom set for 12 of the 32.
+
+```text
+end to end     baseline  7/32 = 21.9%      repaired  9/32 = 28.1%
+```
+
+**The gain is entirely at the context stage, and the pull stage did not move.**
+
+| Stage | Baseline | Repaired |
+|---|---|---|
+| Context admitted | 22/32 = 68.8% | **29/32 = 90.6%** |
+| Context failures | setup 10 | setup 1, nvt 1, npt 1 |
+| Replica pull passed | 18/44 = 41% | 25/58 = 43% |
+| Target export passed | 16 | 23 |
+| Consensus systems | 7 | 9 |
+
+The context recovery is the bond-order repair doing exactly what was predicted:
+the ten setup crashes traced to illegal phosphorus valence are down to one.
+
+**The steric-pinning hypothesis is not supported.** The three systems used in the
+budget probe were re-run with their spurious copies removed. If distant copies
+were pinning the loops, progress should rise:
+
+| System | Ligand atoms | Baseline progress | Repaired |
+|---|---|---|---|
+| `6z85-D-HBI-302` | 170 -> 17 | 0.489, 0.449 | **0.397, 0.424** |
+| `2hiz-A-LIJ-801` | 141 -> 47 | 0.405, 0.399 | **0.377, 0.377** |
+| `1lol-B-XMP-2002` | 48 -> 24 | 0.471, 0.387 | **0.569, 0.585** (passed) |
+
+Two of three got *worse*. Removing 153 atoms from `6z85` moved its progress down
+by `0.09`. And across the repaired panel the 33 pull failures still cluster in
+`0.303`-`0.457`, the same band as before, with none approaching the `0.5` gate.
+
+**Consequence: the original conclusion is restored, on stronger evidence than it
+originally had.** Two independent perturbations now fail to move pull progress --
+tripling the sampling budget, and deleting the spurious ligand atoms. The loss at
+the pull stage is a real property of RMSD-pull path generation on this corpus.
+
+The withdrawal was still correct as a matter of method. The confound was real and
+uncontrolled, and no claim was entitled to survive it untested. It was tested and
+it did not survive; that is the withdrawal working, not a reversal of it.
+
 ## What Was Measured
 
 `processed_data/md_transition/ahoj_mapping_smoke32x2_parallel_retry1_20260726_v1/smoke_state.json`
@@ -122,12 +170,14 @@ The `0.5` gate therefore cannot be declared well-calibrated on this evidence, an
 the ~22% conversion cannot be entered into downstream plans as a fixed physical
 cost. It is the conversion rate *of a pipeline with a known defect in it*.
 
-### What Would Settle It
+### What Would Settle It -- and did
 
-Re-run the same 2x/3x budget probe on systems with `component_copies == 1` and a
-single-fragment ligand, same seeds and same protocol. If progress still saturates
-below `0.5`, the thermodynamic reading is restored. If it does not, a substantial
-part of the 78% loss was self-inflicted.
+Re-run the panel with the spurious copies removed, same seeds and same protocol.
+If progress still saturates below `0.5`, the thermodynamic reading is restored.
+If it does not, a substantial part of the 78% loss was self-inflicted.
+
+This was run on 2026-07-27. Progress still saturates; see the follow-up section
+at the top of this document. The thermodynamic reading is restored.
 
 ## Consequence for the Data-Scale Gate
 
@@ -143,20 +193,30 @@ consensus systems is:
 The current pool is **1,769** novel leakage-clean pairs. The PR #2 rescan is
 estimated to recover 1,000-2,200, reaching **2,800-4,000**.
 
-At the *measured* rate, 2,000 accepted consensus systems is not reachable from
-the available pool, by roughly a factor of two to three, and reachable scale from
-a fully rescanned pool would be on the order of **600-900 accepted systems**.
+**Updated 2026-07-27 with the repaired-pipeline rate.** The conversion to use is
+**28.1%**, measured on the same frozen panel after the ligand repair. The table
+above is superseded by:
 
-**This arithmetic inherits the confound and must not be treated as settled.** The
-`21.9%` in its denominator is the conversion of a pipeline whose ligand inputs are
-defective in a way that plausibly suppresses pull success. If repairing extraction
-raises the conversion, every row of the table above moves and the "not reachable"
-verdict may dissolve.
+| Assumed conversion | Pairs needed for 2,000 systems |
+|---|---:|
+| 67% (contract assumption, never measured) | 3,000 |
+| 21.9% (defective pipeline) | ~9,100 |
+| **28.1% (repaired pipeline)** | **~7,100** |
 
-What is established independently of the confound: the contract's **67%** was
-never measured and is not supported by anything. The `3,000`-pair figure has no
-empirical basis either way. Replacing it requires a conversion rate measured on a
-repaired pipeline, which does not yet exist.
+The current pool is **1,769** novel leakage-clean pairs, and the PR #2 rescan is
+estimated to reach **2,800-4,000**.
+
+**2,000 accepted consensus systems remains out of reach, by roughly a factor of
+1.8.** The repair moved the requirement from 9,100 pairs to 7,100 against a
+ceiling of 4,000; it did not change the verdict. Reachable scale from a fully
+rescanned pool is on the order of **800-1,100 accepted systems**.
+
+This arithmetic no longer inherits the confound: `28.1%` is the conversion of a
+pipeline whose ligand chemistry is correct throughout and whose ligand atom sets
+are correct for every panel system that needed it.
+
+The contract's **67%** was never measured and is not supported by anything. It
+can now be replaced with a measured figure rather than merely deleted.
 
 ## Claim Boundary
 

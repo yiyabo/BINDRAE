@@ -40,11 +40,13 @@ operational truth.
      195 A apart. Read this before any corpus-scale repair; extraction must be
      fixed first.
 10. `MD_CORPUS_YIELD_MEASUREMENT_20260726.md`
-   - First end-to-end measurement of endpoint pair to accepted consensus system
-     (21.9%). **Carries a same-day correction**: the budget probe rules out a
-     budget-limited loss but cannot show the loss is physical, because all three
-     probe systems carry the multi-copy extraction defect. The "2,000 systems is
-     unreachable" verdict inherits that confound and is not settled.
+   - End-to-end measurement of endpoint pair to accepted consensus system:
+     **21.9% on the defective pipeline, 28.1% after the ligand repair**, same
+     frozen panel and seeds. The gain is entirely at the context stage; the pull
+     stage did not move, and deleting spurious ligand atoms lowered pull progress
+     rather than raising it, so the loss there is physical. 2,000 accepted systems
+     needs ~7,100 pairs against a pool ceiling of 4,000 and remains out of reach.
+     Also records a withdrawal and its resolution as a worked example.
 
 ## Active Scientific References
 

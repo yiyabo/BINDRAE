@@ -52,12 +52,21 @@ optimization study and must not be mixed into the matched final matrix.
   **The 67% has no empirical basis and the gate cannot stand as written.**
 - **Correction to the addendum, same day.** The addendum originally added that a
   budget probe "showed the dominant loss is a physical saturation ... so it does
-  not shrink with effort". **That claim is withdrawn.** All three probe systems
-  carry the multi-copy ligand-extraction defect, so the probe cannot separate
-  protein physics from simulation artifact. The `21.9%` is the conversion of a
-  pipeline with a known defect, and the replacement figure for `3,000` cannot be
-  computed until extraction is repaired and the funnel re-measured. See the
-  correction section in `MD_CORPUS_YIELD_MEASUREMENT_20260726.md`.
+  not shrink with effort". That claim was withdrawn because all three probe
+  systems carry the multi-copy ligand-extraction defect, leaving the probe unable
+  to separate protein physics from simulation artifact.
+- **Resolved 2026-07-27.** The panel was re-run on repaired ligands (job 149011)
+  with the frozen 32-system panel, seeds, protocol and gates unchanged. Measured
+  conversion is **28.1%** (9 of 32), up from 21.9%. The gain is entirely at the
+  context stage, 68.8% to 90.6%, which is the bond-order repair removing the
+  setup crashes. The pull stage did not move -- 41% to 43% of replicas -- and
+  deleting 153 spurious ligand atoms from `6z85-D-HBI-302` lowered its progress
+  rather than raising it, so the steric-pinning hypothesis is refuted and the
+  physical reading of the pull loss is restored on stronger evidence.
+  **The gate still fails: 2,000 systems needs ~7,100 pairs against a pool
+  ceiling of 4,000, a shortfall of ~1.8x.** Reachable scale is 800-1,100 systems.
+  `3,000` should be replaced by a figure derived from 28.1%, and the 2,000 target
+  reconsidered. See `MD_CORPUS_YIELD_MEASUREMENT_20260726.md`.
 
 The strict30 result has already been evaluated once. It remains the valid frozen
 result for the existing checkpoint, but it cannot become a new blind-test result
