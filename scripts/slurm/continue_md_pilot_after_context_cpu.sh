@@ -30,6 +30,7 @@ MIN_MAPPING_FRACTION="${MIN_MAPPING_FRACTION:-0.95}"
 REPLICA_START="${REPLICA_START:-0}"
 REPLICA_STOP="${REPLICA_STOP:-4}"
 REPLICA_JOB_NAME="${REPLICA_JOB_NAME:-mdrep_pilot12}"
+PRECHECK_ONLY="${PRECHECK_ONLY:-0}"
 
 for value_name in REPLICA_START REPLICA_STOP; do
   value="${!value_name}"
@@ -40,6 +41,10 @@ for value_name in REPLICA_START REPLICA_STOP; do
 done
 if (( REPLICA_STOP < REPLICA_START )); then
   echo "REPLICA_STOP must be >= REPLICA_START" >&2
+  exit 2
+fi
+if [[ "$PRECHECK_ONLY" != "0" && "$PRECHECK_ONLY" != "1" ]]; then
+  echo "PRECHECK_ONLY must be 0 or 1; got $PRECHECK_ONLY" >&2
   exit 2
 fi
 
@@ -89,9 +94,23 @@ TASKS=$(wc -l < "$MATRIX" | tr -d ' ')
 # Slurm rejects an array whose highest index reaches MaxArraySize, so a matrix
 # larger than one array is submitted as several arrays. Each chunk indexes from
 # 0 and carries its own MATRIX_INDEX_OFFSET; the launcher adds the two back.
-MAX_ARRAY_TASKS="${MAX_ARRAY_TASKS:-$(scontrol show config 2>/dev/null |
-  awk -F'=' '/^MaxArraySize/ {gsub(/ /, "", $2); print $2}')}"
-CHUNK_SIZE=$(( ${MAX_ARRAY_TASKS:-1001} - 1 ))
+DETECTED_MAX_ARRAY_TASKS="$(
+  scontrol show config 2>/dev/null |
+    awk -F'=' '/^[[:space:]]*MaxArraySize/ {gsub(/ /, "", $2); print $2}' || true
+)"
+MAX_ARRAY_TASKS="${MAX_ARRAY_TASKS:-${DETECTED_MAX_ARRAY_TASKS:-1001}}"
+if ! [[ "$MAX_ARRAY_TASKS" =~ ^[0-9]+$ ]] || (( MAX_ARRAY_TASKS <= 1 )); then
+  echo "MAX_ARRAY_TASKS must be an integer greater than 1; got $MAX_ARRAY_TASKS" >&2
+  exit 2
+fi
+CHUNK_SIZE=$((MAX_ARRAY_TASKS - 1))
+CHUNK_COUNT=$(((TASKS + CHUNK_SIZE - 1) / CHUNK_SIZE))
+
+echo "Replica submission plan: systems=$SYSTEMS tasks=$TASKS chunks=$CHUNK_COUNT chunk_size=$CHUNK_SIZE"
+if [[ "$PRECHECK_ONLY" == "1" ]]; then
+  echo "PRECHECK_ONLY=1: artifacts and chunk plan validated; no jobs submitted."
+  exit 0
+fi
 
 REPLICA_JOBS=()
 OFFSET=0
