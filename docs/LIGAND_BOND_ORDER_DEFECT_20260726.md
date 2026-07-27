@@ -533,6 +533,79 @@ The ambiguous class is the one case where the alignment matrices would help:
 identical conformers cannot be separated by internal geometry, only by position.
 That path is available and was not needed for the other 99.
 
+### The 326-System Corpus Is Being Regenerated, 2026-07-27
+
+The open question above -- whether the silver corpus must be regenerated -- was
+resolved by decision rather than by measurement, because neither A/B could answer
+it and the measurement that would (path divergence between old and new ligands)
+costs about as much as simply regenerating.
+
+**Decision and its cost.** Regenerate all 326 systems on repaired ligands. The
+corpus is expected to *shrink*, not grow: the A/B's direction, though not
+significant, was that correct chemistry passes the pull gate slightly less often,
+and a stiffer correctly-typed ligand obstructing the protein is a coherent
+mechanism. At the A/B's -15% the corpus would land near 275.
+
+That shrinkage is a correction, not a loss. A system that passes the gate only
+because its ligand was wrong is a simulation of a molecule that is not there, and
+it cannot support a ligand-conditioned induced-fit claim.
+
+**The decision is reversible.** Output goes to a new root
+(`processed_data/md_transition/corpus326_ligandfix_20260727_v2`); the existing
+corpus's MD products are untouched, so both can be compared before either is
+trained on. Only the *inputs* changed in place, and those have backups.
+
+**Configuration, and why each value.**
+
+| Setting | Value | Reason |
+|---|---|---|
+| Replicas | `0-4`, five attempted | The original corpus attempted five; `n_replicas` in its manifest is how many *passed*. Using the smoke panel's two would unfairly depress the new corpus |
+| Context seed base | `60719000` | The original corpus's |
+| Replica seed base | `60720000` | The original corpus's |
+| Gates | unchanged | `progress >= 0.5`, mapping `0.95`, two-replica consensus |
+| Manifest | real records, four sources merged | See below |
+
+**Caveat that matters for any later comparison: the seeds are not paired
+per system.** `build_md_context_matrix.py` assigns `seed = seed_base +
+candidate_index`, and `candidate_index` follows manifest order. The regeneration
+manifest is ordered by the system list; whether the original used the same order
+is not established. The seed *bases* match, the per-system seeds may not.
+
+This is harmless for the corpus-level question -- how many systems survive -- and
+it is **not** harmless for a per-system path-divergence comparison, where a
+different seed produces a different path even with an identical ligand. Anyone
+measuring old-versus-new path RMSD must establish seed correspondence first, or
+the ligand effect and the seed effect are confounded.
+
+**A failed first attempt, recorded so it is not repeated.** Job 149163 was
+launched with a hand-built minimal manifest carrying only the three fields
+`build_md_context_matrix.py` reads: `transition_id`, `system_sample_id` and
+`endpoints`. Nineteen of the first twenty-five tasks failed -- but at
+`register_context`, not in the MD. Setup, NVT and NPT all returned 0. The
+downstream `register_md_context_replica.py` validates against the full
+`bindrae_md_transition_v1` schema and rejected the records for missing
+`ensemble_id`, `source`, `split.name` and `quality.endpoint_mapping_verified`,
+plus a wrong `schema_version` value. The array was cancelled, costing roughly
+eight CPU-hours of MD that ran correctly and was then discarded.
+
+The fix was **not** to hand-fill the missing fields.
+`quality.endpoint_mapping_verified` is a claim that the endpoint residue mapping
+was verified, and asserting it without performing the verification would be
+fabricating provenance. The original transition manifests were located instead;
+four of them merged cover all 326 systems with their real acquisition values
+(`residue_mapping_fraction 0.967`, `status: metadata_verified`). The relaunch
+(job 149209 -> 149210) uses those records unmodified.
+
+**Operational lesson.** `scripts/audit_md_transition_manifest.py` already exists
+and reports `num_errors` per manifest. Run it before submitting any corpus-scale
+job. On the repaired manifest it returns `326 records, 0 errors, 0 warnings`; run
+on the first attempt it would have caught the defect before 326 tasks were queued.
+
+**What to read when it finishes.** Consensus and `smoke_state.json` are not
+produced automatically; run `scripts/slurm/consolidate_ahoj_smoke_cpu.sh` against
+the output root first. Then compare `consensus.consensus_systems` against the
+existing corpus's **303 of 326**.
+
 ### Root Cause Is Shared With The Bond-Order Defect
 
 These are not independent bugs. Both, along with `observed_sanitize_failed` (922,
