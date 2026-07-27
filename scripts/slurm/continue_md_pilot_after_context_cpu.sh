@@ -85,16 +85,32 @@ python3 scripts/build_md_replica_matrix.py \
 
 MATRIX="$REPLICA_OUTPUT_DIR/replica_matrix.jsonl"
 TASKS=$(wc -l < "$MATRIX" | tr -d ' ')
-LAST_INDEX=$((TASKS - 1))
-REPLICA_JOB=$(sbatch --parsable \
-  --job-name="$REPLICA_JOB_NAME" \
-  --array="0-${LAST_INDEX}%${MAX_CONCURRENT}" \
-  --export=ALL,MATRIX="$MATRIX",PLATFORM=CPU \
-  scripts/slurm/run_md_replica_pipeline_array_cpu.sh)
+
+# Slurm rejects an array whose highest index reaches MaxArraySize, so a matrix
+# larger than one array is submitted as several arrays. Each chunk indexes from
+# 0 and carries its own MATRIX_INDEX_OFFSET; the launcher adds the two back.
+MAX_ARRAY_TASKS="${MAX_ARRAY_TASKS:-$(scontrol show config 2>/dev/null |
+  awk -F'=' '/^MaxArraySize/ {gsub(/ /, "", $2); print $2}')}"
+CHUNK_SIZE=$(( ${MAX_ARRAY_TASKS:-1001} - 1 ))
+
+REPLICA_JOBS=()
+OFFSET=0
+while [[ "$OFFSET" -lt "$TASKS" ]]; do
+  REMAINING=$((TASKS - OFFSET))
+  SPAN=$((REMAINING < CHUNK_SIZE ? REMAINING : CHUNK_SIZE))
+  REPLICA_JOBS+=("$(sbatch --parsable \
+    --job-name="$REPLICA_JOB_NAME" \
+    --array="0-$((SPAN - 1))%${MAX_CONCURRENT}" \
+    --export=ALL,MATRIX="$MATRIX",PLATFORM=CPU,MATRIX_INDEX_OFFSET="$OFFSET" \
+    scripts/slurm/run_md_replica_pipeline_array_cpu.sh)")
+  echo "Submitted replica chunk: offset=$OFFSET span=$SPAN job=${REPLICA_JOBS[-1]}"
+  OFFSET=$((OFFSET + SPAN))
+done
+REPLICA_JOB=$(IFS=,; echo "${REPLICA_JOBS[*]}")
 
 FINALIZATION_DIR="$REPLICA_OUTPUT_DIR/finalization"
 FINALIZE_JOB=$(sbatch --parsable \
-  --dependency="afterany:${REPLICA_JOB}" \
+  --dependency="$(IFS=:; echo "afterany:${REPLICA_JOBS[*]}")" \
   --export=ALL,MATRIX="$MATRIX",OUTPUT_DIR="$FINALIZATION_DIR" \
   scripts/slurm/finalize_md_replica_matrix_cpu.sh)
 
