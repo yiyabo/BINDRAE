@@ -43,6 +43,10 @@ if (( REPLICA_STOP < REPLICA_START )); then
   echo "REPLICA_STOP must be >= REPLICA_START" >&2
   exit 2
 fi
+if ! [[ "$MAX_CONCURRENT" =~ ^[1-9][0-9]*$ ]]; then
+  echo "MAX_CONCURRENT must be a positive integer; got $MAX_CONCURRENT" >&2
+  exit 2
+fi
 if [[ "$PRECHECK_ONLY" != "0" && "$PRECHECK_ONLY" != "1" ]]; then
   echo "PRECHECK_ONLY must be 0 or 1; got $PRECHECK_ONLY" >&2
   exit 2
@@ -106,7 +110,7 @@ fi
 CHUNK_SIZE=$((MAX_ARRAY_TASKS - 1))
 CHUNK_COUNT=$(((TASKS + CHUNK_SIZE - 1) / CHUNK_SIZE))
 
-echo "Replica submission plan: systems=$SYSTEMS tasks=$TASKS chunks=$CHUNK_COUNT chunk_size=$CHUNK_SIZE"
+echo "Replica submission plan: systems=$SYSTEMS tasks=$TASKS chunks=$CHUNK_COUNT chunk_size=$CHUNK_SIZE max_concurrent=$MAX_CONCURRENT scheduling=sequential_chunks"
 if [[ "$PRECHECK_ONLY" == "1" ]]; then
   echo "PRECHECK_ONLY=1: artifacts and chunk plan validated; no jobs submitted."
   exit 0
@@ -117,9 +121,14 @@ OFFSET=0
 while [[ "$OFFSET" -lt "$TASKS" ]]; do
   REMAINING=$((TASKS - OFFSET))
   SPAN=$((REMAINING < CHUNK_SIZE ? REMAINING : CHUNK_SIZE))
+  DEPENDENCY_ARGS=()
+  if ((${#REPLICA_JOBS[@]} > 0)); then
+    DEPENDENCY_ARGS=(--dependency="afterany:${REPLICA_JOBS[-1]}")
+  fi
   REPLICA_JOBS+=("$(sbatch --parsable \
     --job-name="$REPLICA_JOB_NAME" \
     --array="0-$((SPAN - 1))%${MAX_CONCURRENT}" \
+    "${DEPENDENCY_ARGS[@]}" \
     --export=ALL,MATRIX="$MATRIX",PLATFORM=CPU,MATRIX_INDEX_OFFSET="$OFFSET" \
     scripts/slurm/run_md_replica_pipeline_array_cpu.sh)")
   echo "Submitted replica chunk: offset=$OFFSET span=$SPAN job=${REPLICA_JOBS[-1]}"
