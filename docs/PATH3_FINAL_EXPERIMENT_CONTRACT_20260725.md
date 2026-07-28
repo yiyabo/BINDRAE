@@ -45,14 +45,28 @@ optimization study and must not be mixed into the matched final matrix.
   the silver paths must be regenerated is open. See
   `LIGAND_BOND_ORDER_DEFECT_20260726.md`.
 - **Data-scale gate addendum (2026-07-26).** The gate's "3,000 novel pairs ->
-  2,000 accepted consensus systems" implies a 67% conversion. The AHoJ smoke
-  panel completed end to end for the first time and measured **21.9%**
-  (7 of 32), and a paired budget probe showed the dominant loss is a physical
-  saturation of the RMSD pull rather than an under-spent sampling budget, so it
-  does not shrink with effort. At the measured rate 2,000 systems needs roughly
-  9,100 pairs against a pool of 1,769 that a full rescan takes to at most 4,000.
-  The 3,000 figure needs replacing, not raising. See
-  `MD_CORPUS_YIELD_MEASUREMENT_20260726.md`.
+  2,000 accepted consensus systems" implies a 67% conversion, which was never
+  measured. The AHoJ smoke panel completed end to end for the first time and
+  measured **21.9%** (7 of 32). At that rate 2,000 systems needs roughly 9,100
+  pairs against a pool of 1,769 that a full rescan takes to at most 4,000.
+  **The 67% has no empirical basis and the gate cannot stand as written.**
+- **Correction to the addendum, same day.** The addendum originally added that a
+  budget probe "showed the dominant loss is a physical saturation ... so it does
+  not shrink with effort". That claim was withdrawn because all three probe
+  systems carry the multi-copy ligand-extraction defect, leaving the probe unable
+  to separate protein physics from simulation artifact.
+- **Resolved 2026-07-27.** The panel was re-run on repaired ligands (job 149011)
+  with the frozen 32-system panel, seeds, protocol and gates unchanged. Measured
+  conversion is **28.1%** (9 of 32), up from 21.9%. The gain is entirely at the
+  context stage, 68.8% to 90.6%, which is the bond-order repair removing the
+  setup crashes. The pull stage did not move -- 41% to 43% of replicas -- and
+  deleting 153 spurious ligand atoms from `6z85-D-HBI-302` lowered its progress
+  rather than raising it, so the steric-pinning hypothesis is refuted and the
+  physical reading of the pull loss is restored on stronger evidence.
+  **The gate still fails: 2,000 systems needs ~7,100 pairs against a pool
+  ceiling of 4,000, a shortfall of ~1.8x.** Reachable scale is 800-1,100 systems.
+  `3,000` should be replaced by a figure derived from 28.1%, and the 2,000 target
+  reconsidered. See `MD_CORPUS_YIELD_MEASUREMENT_20260726.md`.
 
 The strict30 result has already been evaluated once. It remains the valid frozen
 result for the existing checkpoint, but it cannot become a new blind-test result

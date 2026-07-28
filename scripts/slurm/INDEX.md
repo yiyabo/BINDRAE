@@ -64,6 +64,9 @@ records, not templates.
   collects passed contexts and submits five replicas per admitted system.
 - `finalize_md_replica_matrix_cpu.sh` - after-any replica outcome summary and
   passed-target cache assembly.
+- `consolidate_md_replica_corpus_cpu.sh` - validates a complete replica
+  finalization, builds immutable system-level consensus targets from at least
+  two passed replicas, and writes the corpus state and reference-count audit.
 - `audit_md_rmsd_pull_cpu.sh` / `audit_md_atomistic_path_cpu.sh` - path and atomistic admission audits.
 - `export_md_phase_normal_targets_cpu.sh` - export audited phase/normal-residual targets on CPU.
 - `export_md_phase_normal_matrix_cpu.sh` - array re-export of a merged MD collection under a selected phase reference.

@@ -62,6 +62,18 @@ from src.data.ligand_bond_orders import (  # noqa: E402
     reconstruct_bond_orders,
     validate_reconstruction,
 )
+from src.data.ligand_residue_selection import (  # noqa: E402
+    LigandResidueNotFound,
+    ResidueView,
+    parse_residue_number,
+    select_ligand_residues,
+)
+
+#: Ligand residue-selection modes exposed on the command line.  ``seed`` locates
+#: the component instance by name *and* residue number and extends it over
+#: covalent bonds; ``all-copies`` reproduces the defective name-only behaviour and
+#: exists only to regenerate previously written data.
+LIGAND_RESIDUE_SELECTION_MODES = ("seed", "all-copies")
 
 
 LOG = logging.getLogger("prepare_ahojdb_triplets")
@@ -498,26 +510,119 @@ def write_chain_pdb(structure, chain_id: str, out_path: Path):
     io.save(str(out_path), select=ChainSelect(chain_id))
 
 
-def extract_ligand_from_pdb(pdb_path: Path, ligand_resname: str, chain_id: str) -> Tuple[np.ndarray, str]:
+_TWO_CHAR_ELEMENTS = {
+    "BR", "CL", "CA", "CD", "CE", "CO", "CR", "CS", "CU", "DY", "ER", "EU", "FE", "GA", "GD",
+    "HG", "HO", "IN", "IR", "KR", "LA", "LI", "LU", "MG", "MN", "MO", "NA", "NB", "ND", "NE",
+    "NI", "OS", "PB", "PD", "PM", "PR", "PT", "PU", "RA", "RB", "RE", "RH", "RU", "SB", "SC",
+    "SE", "SI", "SM", "SN", "SR", "TA", "TB", "TC", "TE", "TH", "TI", "TL", "TM", "UR", "XE",
+    "YB", "ZN", "ZR"
+}
+_ONE_CHAR_ELEMENTS = {
+    "B", "C", "F", "H", "I", "K", "N", "O", "P", "S", "U", "V", "W", "Y"
+}
+
+#: Residue names that are solvent, never ligand.  Excluded before the covalent
+#: closure so a hydrogen-bonded water cannot bridge two unrelated residues.
+_SOLVENT_RESNAMES = {"HOH", "WAT", "DOD", "D2O", "H2O"}
+
+
+def _infer_heavy_atom_element(atom, residue_atom_count: int) -> Optional[str]:
+    """Return the atom's element, or ``None`` when the atom must be skipped.
+
+    Extracted verbatim from the original inline inference so the extraction pass
+    can run twice over the same residues -- once to build the selection view and
+    once to emit the chosen atoms -- without duplicating the logic.  Hydrogens,
+    unnameable atoms and RDKit-hostile single letters return ``None``.
+    """
+    element = (atom.element or "").strip().upper()
+    name = atom.get_name().strip().upper()
+
+    if not element:
+        alpha_name = "".join(filter(str.isalpha, name))
+
+        if residue_atom_count == 1:
+            if alpha_name in _TWO_CHAR_ELEMENTS:
+                element = alpha_name
+            elif alpha_name in _ONE_CHAR_ELEMENTS:
+                element = alpha_name
+            if not element and name in _TWO_CHAR_ELEMENTS:
+                element = name
+            if not element and name in _ONE_CHAR_ELEMENTS:
+                element = name
+
+        elif len(alpha_name) == 2 and alpha_name in _TWO_CHAR_ELEMENTS:
+            element = alpha_name
+        elif len(alpha_name) > 0:
+            first = alpha_name[0]
+            if first in _ONE_CHAR_ELEMENTS:
+                element = first
+
+        if not element and name in _TWO_CHAR_ELEMENTS:
+            element = name
+
+        atom.element = element
+
+    if not element:
+        return None
+
+    if element == "H" or element == "D":
+        return None
+    if name.startswith("H") and element not in _TWO_CHAR_ELEMENTS and element not in _ONE_CHAR_ELEMENTS:
+        return None
+
+    is_valid = (element in _TWO_CHAR_ELEMENTS) or (element in _ONE_CHAR_ELEMENTS) or \
+               (element in ["AL", "AR", "AS", "AU", "AG", "BA", "BE", "BI", "CR", "HE", "HF", "NB", "PO", "RN", "RU", "SB", "SE", "SN", "TE", "TI", "XE", "ZR"])
+
+    if not is_valid:
+        if element in ["A", "D", "E", "G", "J", "L", "M", "Q", "R", "T", "X", "Z"]:
+            return None
+
+    return element
+
+
+def extract_ligand_from_pdb(
+    pdb_path: Path,
+    ligand_resname: str,
+    chain_id: str,
+    *,
+    residue_number: Optional[int] = None,
+    select_single_residue: bool = True,
+    covalent_closure: bool = True,
+) -> Tuple[np.ndarray, str, Dict]:
+    """Extract the ligand from a chain, selecting *one* component instance.
+
+    The original implementation filtered HETATM records by chain and residue name
+    only, so every copy of the component anywhere in the chain was concatenated
+    into one "ligand".  Measured on the corpus that hit 45.6% of samples, with
+    fragment centroids a median of 72 A apart, and it silently corrupted the
+    ligand conditioning input rather than failing.  See
+    ``src/data/ligand_residue_selection`` for the full account.
+
+    With ``select_single_residue`` (the default) the seed residue is located by
+    name *and* number, then extended over covalent bonds so a multi-residue
+    entity such as an oligosaccharide survives intact.
+
+    ``select_single_residue=False`` restores the old name-only behaviour and
+    exists only to reproduce previously generated data.  It logs a warning.
+
+    Returns:
+        ``(coords, pdb_block, diagnostics)``.
+    """
     parser = PDBParser(QUIET=True)
     structure = parser.get_structure(pdb_path.stem, str(pdb_path))
-    coords = []
-    
-    # Reuse the sets if possible, or redefine them locally to keep independent
-    _TWO_CHAR_ELEMENTS = {
-        "BR", "CL", "CA", "CD", "CE", "CO", "CR", "CS", "CU", "DY", "ER", "EU", "FE", "GA", "GD", 
-        "HG", "HO", "IN", "IR", "KR", "LA", "LI", "LU", "MG", "MN", "MO", "NA", "NB", "ND", "NE", 
-        "NI", "OS", "PB", "PD", "PM", "PR", "PT", "PU", "RA", "RB", "RE", "RH", "RU", "SB", "SC", 
-        "SE", "SI", "SM", "SN", "SR", "TA", "TB", "TC", "TE", "TH", "TI", "TL", "TM", "UR", "XE", 
-        "YB", "ZN", "ZR"
-    }
-    _ONE_CHAR_ELEMENTS = {
-        "B", "C", "F", "H", "I", "K", "N", "O", "P", "S", "U", "V", "W", "Y"
-    }
 
-    pdb_lines = []
-    serial = 1
+    if select_single_residue and residue_number is None:
+        raise ValueError(
+            f"{pdb_path.name}: residue_number is required to select a single "
+            f"{ligand_resname} instance; pass select_single_residue=False only "
+            "to reproduce the legacy name-only extraction"
+        )
 
+    # Pass 1: every hetero residue in the chain, reduced to heavy atoms. The
+    # closure needs all of them, not just the ones sharing the ligand's name,
+    # because a covalent partner can be a different component.
+    candidates: List[Tuple[object, List[str]]] = []
+    views: List[ResidueView] = []
     for model in structure:
         for chain in model:
             if chain_id and chain.id != chain_id:
@@ -525,87 +630,108 @@ def extract_ligand_from_pdb(pdb_path: Path, ligand_resname: str, chain_id: str) 
             for residue in chain:
                 if residue.get_id()[0] == " ":
                     continue
-                if residue.get_resname().strip() != ligand_resname:
+                resname = residue.get_resname().strip().upper()
+                if resname in _SOLVENT_RESNAMES:
                     continue
-                
-                # Check residue atom count for ion logic
-                is_single_atom = (len(residue) == 1)
 
+                atom_count = len(residue)
+                elements: List[str] = []
+                positions: List[np.ndarray] = []
                 for atom in residue:
-                    element = (atom.element or "").strip().upper()
-                    name = atom.get_name().strip().upper()
-                    
-                    if not element:
-                        alpha_name = "".join(filter(str.isalpha, name))
-                        
-                        if is_single_atom:
-                           if alpha_name in _TWO_CHAR_ELEMENTS:
-                               element = alpha_name
-                           elif alpha_name in _ONE_CHAR_ELEMENTS:
-                               element = alpha_name
-                           if not element and name in _TWO_CHAR_ELEMENTS:
-                               element = name
-                           if not element and name in _ONE_CHAR_ELEMENTS:
-                               element = name
-                        
-                        elif len(alpha_name) == 2 and alpha_name in _TWO_CHAR_ELEMENTS:
-                            element = alpha_name
-                        elif len(alpha_name) > 0:
-                            first = alpha_name[0]
-                            if first in _ONE_CHAR_ELEMENTS:
-                                element = first
-                                
-                        if not element and name in _TWO_CHAR_ELEMENTS:
-                            element = name
-                        
-                        atom.element = element
-
-                    if not element:
+                    element = _infer_heavy_atom_element(atom, atom_count)
+                    if element is None:
                         continue
+                    elements.append(element)
+                    positions.append(atom.get_coord())
+                if not elements:
+                    continue
 
-                    if element == "H" or element == "D": 
-                        continue
-                    if name.startswith("H") and element not in _TWO_CHAR_ELEMENTS and element not in _ONE_CHAR_ELEMENTS:
-                         continue
-                         
-                    # Validity Check
-                    is_valid = (element in _TWO_CHAR_ELEMENTS) or (element in _ONE_CHAR_ELEMENTS) or \
-                               (element in ["AL", "AR", "AS", "AU", "AG", "BA", "BE", "BI", "CR", "HE", "HF", "NB", "PO", "RN", "RU", "SB", "SE", "SN", "TE", "TI", "XE", "ZR"])
-                    
-                    if not is_valid:
-                         if element in ["A", "D", "E", "G", "J", "L", "M", "Q", "R", "T", "X", "Z"]:
-                             continue
-
-                    coords.append(atom.get_coord())
-                    
-                    # Manual Fmt
-                    x, y, z = atom.get_coord()
-                    # ResSeq: Biopython residue.id[1]
-                    r_uid = residue.get_id()[1]
-                    
-                    pdb_line = _format_pdb_atom_line(
-                        record_type="HETATM",
-                        serial=serial,
-                        name=name,
-                        alt_loc=" ",
-                        res_name=ligand_resname,
+                candidates.append((residue, elements))
+                views.append(
+                    ResidueView(
+                        resname=resname,
+                        resnum=int(residue.get_id()[1]),
+                        coords=np.array(positions, dtype=np.float64),
+                        elements=tuple(elements),
+                        insertion_code=residue.get_id()[2],
                         chain_id=chain.id,
-                        res_seq=int(r_uid),
-                        ins_code=" ",
-                        x=x, y=y, z=z,
-                        occ=1.00,
-                        temp=0.00,
-                        element=element
                     )
-                    pdb_lines.append(pdb_line)
-                    serial += 1
+                )
+
+    if not views:
+        raise ValueError(f"Ligand {ligand_resname} not found in {pdb_path}")
+
+    # Pass 2: decide which residues are the ligand.
+    if select_single_residue:
+        selection = select_ligand_residues(
+            views, resname=ligand_resname, resnum=int(residue_number),
+            covalent_closure=covalent_closure,
+        )
+        chosen = set(selection.selected_indices)
+        diagnostics = selection.as_diagnostics()
+        diagnostics["selection_mode"] = (
+            "seed_plus_covalent_closure" if covalent_closure else "seed_only"
+        )
+    else:
+        target = ligand_resname.strip().upper()
+        chosen = {i for i, view in enumerate(views) if view.resname == target}
+        if not chosen:
+            raise ValueError(f"Ligand {ligand_resname} not found in {pdb_path}")
+        LOG.warning(
+            "%s: legacy name-only ligand extraction selected %d residues of %s; "
+            "this reproduces a known defect and must not be used for new data",
+            pdb_path.name, len(chosen), target,
+        )
+        diagnostics = {
+            "selection_mode": "legacy_name_only",
+            "selected_residues": len(chosen),
+            "defect_present": len(chosen) > 1,
+        }
+
+    # Pass 3: emit only the chosen residues, in file order.
+    coords: List[np.ndarray] = []
+    pdb_lines: List[str] = []
+    serial = 1
+    for index in sorted(chosen):
+        residue, elements = candidates[index]
+        view = views[index]
+        emitted = 0
+        for atom in residue:
+            element = _infer_heavy_atom_element(atom, len(residue))
+            if element is None:
+                continue
+            x, y, z = atom.get_coord()
+            coords.append(atom.get_coord())
+            pdb_lines.append(
+                _format_pdb_atom_line(
+                    record_type="HETATM",
+                    serial=serial,
+                    name=atom.get_name().strip().upper(),
+                    alt_loc=" ",
+                    res_name=view.resname,
+                    chain_id=view.chain_id,
+                    res_seq=view.resnum,
+                    ins_code=" ",
+                    x=x, y=y, z=z,
+                    occ=1.00,
+                    temp=0.00,
+                    element=element,
+                )
+            )
+            serial += 1
+            emitted += 1
+        if emitted != len(elements):  # pragma: no cover - inference is deterministic
+            raise ValueError(
+                f"{pdb_path.name}: element inference was not reproducible for "
+                f"{view.resname}/{view.resnum} ({emitted} vs {len(elements)})"
+            )
 
     if not coords:
         raise ValueError(f"Ligand {ligand_resname} not found in {pdb_path}")
 
     coords = np.array(coords, dtype=np.float32)
     pdb_block = "\n".join(pdb_lines) + "\n"
-    return coords, pdb_block
+    return coords, pdb_block, diagnostics
 
 def extract_ligand_by_id(pdb_path: Path, l_chain: str, l_resname: str, l_resnum: str) -> Tuple[np.ndarray, str]:
     parser = PDBParser(QUIET=True)
@@ -884,11 +1010,11 @@ def pdb_block_to_sdf(
             resname, ccd_dir=Path(ccd_dir), allow_download=allow_download
         )
         before = describe_ligand(mol)
-        # extract_ligand_from_pdb() collects every same-resname HETATM residue in
-        # the chain, so an oligosaccharide arrives as N residues joined by
-        # glycosidic bonds -- one connected fragment N times the component size.
-        # The PDB residue numbers survive in the block, so group by them here;
-        # connectivity alone cannot split a covalently linked polymer.
+        # A ligand can legitimately span several residues: an oligosaccharide is
+        # one chemical entity written one unit per residue, so it arrives as one
+        # connected fragment N times the component size. The PDB residue numbers
+        # survive in the block, so group by them here; connectivity alone cannot
+        # split a covalently linked polymer.
         mol, diagnostics = reconstruct_bond_orders(
             mol, template,
             missing_bond_policy=missing_bond_policy,
@@ -941,6 +1067,14 @@ def main():
                              "Chemical Component Dictionary (default). legacy: reproduce "
                              "the historical connectivity-only SDF, which yields illegal "
                              "phosphorus valence and non-finite MD setup energies.")
+    parser.add_argument("--ligand-residue-selection",
+                        choices=list(LIGAND_RESIDUE_SELECTION_MODES), default="seed",
+                        help="seed: select the component instance named by the entry "
+                             "key's residue number, extended over covalent bonds so a "
+                             "multi-residue entity such as an oligosaccharide stays "
+                             "intact (default). all-copies: reproduce the historical "
+                             "name-only filter, which concatenates every copy of the "
+                             "component in the chain and affected 45.6%% of the corpus.")
     parser.add_argument("--ccd-dir", type=Path,
                         default=PROJECT_ROOT / "processed_data" / "ccd_cache",
                         help="Directory holding <RESNAME>.sdf CCD references")
@@ -1057,6 +1191,9 @@ def main():
             
             lig_coords = None
             lig_pdb_block = None
+            # Only the query fallback runs residue selection; the holo path gets an
+            # explicit resnum from ligands.json and already selects one instance.
+            ligand_selection: Dict = {"selection_mode": "holo_ligand_id"}
             # The resname actually written into the HETATM block, which is not
             # always the entry's target_ligand: the holo path uses the id from
             # ligands.json and the query fallback uses target_ligand.  CCD
@@ -1110,9 +1247,43 @@ def main():
                     pass
 
             if lig_coords is None:
-                # Fallback to Query Ligand (original behavior)
-                # Extract from Query structure and transform to Apo frame
-                lig_coords, lig_pdb_block = extract_ligand_from_pdb(query_pdb_path, ligand_resname, query_chain)
+                # Fallback to Query Ligand: extract from the query structure and
+                # transform into the apo frame.  Unlike the holo path above, which
+                # gets an explicit chain/resname/resnum triple from ligands.json,
+                # this path only has the entry's target_ligand resname.  The
+                # residue number comes from the entry key, and without it the
+                # extraction cannot tell one copy of the component from another.
+                target_resnum = parse_residue_number(sample_id)
+                if target_resnum is None:
+                    raise ValueError(
+                        f"cannot recover the ligand residue number from entry key "
+                        f"{sample_id!r}; refusing to fall back to a name-only "
+                        "extraction that would concatenate every copy in the chain"
+                    )
+                try:
+                    lig_coords, lig_pdb_block, ligand_selection = extract_ligand_from_pdb(
+                        query_pdb_path,
+                        ligand_resname,
+                        query_chain,
+                        residue_number=target_resnum,
+                        select_single_residue=args.ligand_residue_selection == "seed",
+                    )
+                except LigandResidueNotFound as exc:
+                    raise ValueError(
+                        f"ligand {ligand_resname}/{target_resnum} absent from "
+                        f"{query_pdb_path.name}: {exc}"
+                    ) from exc
+                if ligand_selection.get("defect_present"):
+                    LOG.info(
+                        "%s: discarded %s other copies of %s (farthest centroid "
+                        "%.1f A) that the name-only filter would have concatenated",
+                        sample_id,
+                        ligand_selection.get("discarded_same_resname"),
+                        ligand_resname,
+                        ligand_selection.get(
+                            "discarded_max_centroid_distance_angstrom", 0.0
+                        ),
+                    )
                 lig_coords = apply_rt(lig_coords, R_qa, t_qa)
                 effective_ligand_resname = ligand_resname
 
@@ -1152,6 +1323,7 @@ def main():
                 "ligand_resname": ligand_resname,
                 "effective_ligand_resname": effective_ligand_resname,
                 "ligand_chemistry": ligand_chemistry,
+                "ligand_residue_selection": ligand_selection,
                 "entry_dir": str(entry_dir),
                 "apo_matrix": str(apo_mat),
                 "holo_matrix": str(holo_mat),

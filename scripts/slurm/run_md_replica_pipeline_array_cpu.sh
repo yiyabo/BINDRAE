@@ -14,7 +14,11 @@ set -euo pipefail
 
 ROOT="${ROOT:-/mnt/inaisfs/data/home/zhaozc_criait/XinxiangWang/BINDRAE}"
 MATRIX="${MATRIX:?Set MATRIX to replica_matrix.jsonl}"
-MATRIX_INDEX="${SLURM_ARRAY_TASK_ID:?Submit this launcher as a Slurm array}"
+# Slurm rejects array indices at or above MaxArraySize (1001 here), so matrices
+# larger than that are submitted as several arrays, each passing the offset of
+# its own chunk. A single-array submission leaves the offset at 0.
+ARRAY_TASK_ID="${SLURM_ARRAY_TASK_ID:?Submit this launcher as a Slurm array}"
+MATRIX_INDEX=$((ARRAY_TASK_ID + ${MATRIX_INDEX_OFFSET:-0}))
 PLATFORM="${PLATFORM:-CPU}"
 RESIDUAL_ENVELOPE="${RESIDUAL_ENVELOPE:-sin2}"
 NORMAL_PROJECTION_MODE="${NORMAL_PROJECTION_MODE:-product}"
@@ -29,7 +33,7 @@ export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-32}"
 
 echo "Matrix: $MATRIX"
-echo "Matrix index: $MATRIX_INDEX"
+echo "Matrix index: $MATRIX_INDEX (array task $ARRAY_TASK_ID + offset ${MATRIX_INDEX_OFFSET:-0})"
 echo "Platform: $PLATFORM"
 echo "Residual envelope: $RESIDUAL_ENVELOPE"
 echo "Normal projection: $NORMAL_PROJECTION_MODE"
