@@ -82,6 +82,9 @@ METAL_ATOMIC_NUMBERS = frozenset(
 )
 
 
+MULTI_FRAGMENT_POLICIES = frozenset({"reject", "largest"})
+
+
 def read_sample_ids(path: str | Path, *, scan_limit: int, seed: int) -> List[str]:
     sample_ids = [line.strip() for line in Path(path).read_text().splitlines() if line.strip()]
     sample_ids = list(dict.fromkeys(sample_ids))
@@ -146,7 +149,33 @@ def describe_ligand(
     min_heavy_atoms: int,
     max_heavy_atoms: int,
     max_abs_charge: int,
+    multi_fragment_policy: str = "reject",
+    fragment_dominance_ratio: float = 2.0,
 ) -> Dict[str, Any]:
+    """Describe the site ligand in one SDF.
+
+    ``multi_fragment_policy`` controls what happens when the file holds more than
+    one distinct organic fragment, which usually means a crystallization additive
+    was co-exported with the ligand:
+
+    ``reject``
+        Frozen behaviour: refuse the sample (``multiple_unique_organic_fragments``).
+    ``largest``
+        Keep the heaviest fragment when it is unambiguously the primary one, i.e.
+        it has at least ``fragment_dominance_ratio`` times the heavy-atom count of
+        the next fragment, or every other fragment is below ``min_heavy_atoms``.
+        Otherwise the sample is refused as ``ambiguous_primary_fragment``.
+
+    Discarded fragments are reported but never modelled downstream, matching the
+    existing treatment of non-organic fragments.
+    """
+    if multi_fragment_policy not in MULTI_FRAGMENT_POLICIES:
+        raise ValueError(
+            f"Unknown multi_fragment_policy {multi_fragment_policy!r}; "
+            f"expected one of {sorted(MULTI_FRAGMENT_POLICIES)}"
+        )
+    if fragment_dominance_ratio < 1.0:
+        raise ValueError("fragment_dominance_ratio must be at least 1.0")
     try:
         from rdkit import Chem
     except ImportError as exc:
@@ -177,15 +206,39 @@ def describe_ligand(
         }
 
     unique_organic = sorted({row[1] for row in organic})
+    primary_smiles = unique_organic[0]
+    discarded_unique_fragments = 0
+    discarded_max_heavy_atoms = 0
     if len(unique_organic) != 1:
-        return {
-            "eligible": False,
-            "reason": "multiple_unique_organic_fragments",
-            "fragment_count": len(fragment_rows),
-            "unique_organic_fragments": len(unique_organic),
+        if multi_fragment_policy != "largest":
+            return {
+                "eligible": False,
+                "reason": "multiple_unique_organic_fragments",
+                "fragment_count": len(fragment_rows),
+                "unique_organic_fragments": len(unique_organic),
+            }
+        heavy_by_smiles = {
+            smiles: max(row[2] for row in organic if row[1] == smiles)
+            for smiles in unique_organic
         }
+        ranked = sorted(unique_organic, key=lambda smiles: (-heavy_by_smiles[smiles], smiles))
+        primary_smiles = ranked[0]
+        primary_heavy_atoms = heavy_by_smiles[primary_smiles]
+        discarded_max_heavy_atoms = heavy_by_smiles[ranked[1]]
+        dominant = primary_heavy_atoms >= fragment_dominance_ratio * discarded_max_heavy_atoms
+        others_are_additives = discarded_max_heavy_atoms < min_heavy_atoms
+        if not (dominant or others_are_additives):
+            return {
+                "eligible": False,
+                "reason": "ambiguous_primary_fragment",
+                "fragment_count": len(fragment_rows),
+                "unique_organic_fragments": len(unique_organic),
+                "primary_heavy_atoms": int(primary_heavy_atoms),
+                "discarded_max_heavy_atoms": int(discarded_max_heavy_atoms),
+            }
+        discarded_unique_fragments = len(unique_organic) - 1
 
-    representative = next(row[0] for row in organic if row[1] == unique_organic[0])
+    representative = next(row[0] for row in organic if row[1] == primary_smiles)
     heavy_atoms = int(representative.GetNumHeavyAtoms())
     formal_charge = int(Chem.GetFormalCharge(representative))
     contains_metal = any(
@@ -213,9 +266,12 @@ def describe_ligand(
         "formal_charge": formal_charge,
         "contains_metal": contains_metal,
         "fragment_count": len(fragment_rows),
-        "organic_copy_count": sum(row[1] == unique_organic[0] for row in organic),
+        "organic_copy_count": sum(row[1] == primary_smiles for row in organic),
         "extra_nonorganic_fragments": len(fragment_rows) - len(organic),
-        "canonical_smiles": unique_organic[0],
+        "unique_organic_fragments": len(unique_organic),
+        "discarded_unique_fragments": discarded_unique_fragments,
+        "discarded_max_heavy_atoms": int(discarded_max_heavy_atoms),
+        "canonical_smiles": primary_smiles,
         "inchikey": inchikey,
         "ligand_xyz": ligand_xyz,
     }
@@ -350,6 +406,8 @@ def screen_sample(sample_id: str, config: Mapping[str, Any]) -> Dict[str, Any]:
         min_heavy_atoms=int(config["min_heavy_atoms"]),
         max_heavy_atoms=int(config["max_heavy_atoms"]),
         max_abs_charge=int(config["max_abs_charge"]),
+        multi_fragment_policy=str(config.get("multi_fragment_policy", "reject")),
+        fragment_dominance_ratio=float(config.get("fragment_dominance_ratio", 2.0)),
     )
     ligand_xyz = ligand.pop("ligand_xyz", None)
     ligand_fields = {f"ligand_{key}": value for key, value in ligand.items()}
@@ -434,6 +492,7 @@ def screen_sample(sample_id: str, config: Mapping[str, Any]) -> Dict[str, Any]:
     setup_penalty = (
         0.03 * max(int(ligand.get("organic_copy_count", 1)) - 1, 0)
         + 0.02 * int(ligand.get("extra_nonorganic_fragments", 0))
+        + 0.02 * int(ligand.get("discarded_unique_fragments", 0))
         + 0.08
         * min(max((max(apo_n_residues, holo_n_residues) - 350) / 150.0, 0.0), 1.0)
     )

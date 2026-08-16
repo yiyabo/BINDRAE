@@ -15,6 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data.md_pilot_selection import (
+    MULTI_FRAGMENT_POLICIES,
     candidate_to_transition_record,
     read_sample_ids,
     screen_samples,
@@ -51,6 +52,23 @@ DEFAULT_EXCLUDED_RESNAMES = ",".join(
     ]
 )
 
+# Named ligand-exclusion presets. The blocklist is a convenience filter, not one of
+# the frozen acquisition gates (0.95 residue mapping, holdout leakage, physical
+# gates, and the consensus requirement are unchanged by any preset here).
+#
+# frozen23            the original 23-component blocklist; unchanged default.
+# glycosylation_only  keep only N-acetylglucosamine excluded. Nucleotide and
+#                     cofactor complexes (ATP/ADP/NAD/FAD/...) are classic
+#                     induced-fit systems and are hard to justify excluding;
+#                     metal-bearing components such as HEM are still refused by
+#                     the unchanged metal gate.
+# none                apply no resname blocklist at all.
+EXCLUDED_RESNAME_PRESETS = {
+    "frozen23": DEFAULT_EXCLUDED_RESNAMES,
+    "glycosylation_only": "NAG",
+    "none": "",
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -69,6 +87,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-heavy-atoms", type=int, default=70)
     parser.add_argument("--max-abs-charge", type=int, default=2)
     parser.add_argument("--exclude-resnames", default=DEFAULT_EXCLUDED_RESNAMES)
+    parser.add_argument(
+        "--exclude-resname-preset",
+        choices=sorted(EXCLUDED_RESNAME_PRESETS),
+        default=None,
+        help=(
+            "Named ligand-exclusion preset. Takes precedence over --exclude-resnames. "
+            "Omit to keep the frozen 23-component blocklist."
+        ),
+    )
+    parser.add_argument(
+        "--multi-fragment-policy",
+        choices=sorted(MULTI_FRAGMENT_POLICIES),
+        default="reject",
+        help=(
+            "How to treat an SDF holding several distinct organic fragments. "
+            "'reject' is the frozen behaviour; 'largest' keeps an unambiguously "
+            "dominant fragment and discards co-exported additives."
+        ),
+    )
+    parser.add_argument(
+        "--fragment-dominance-ratio",
+        type=float,
+        default=2.0,
+        help=(
+            "Heavy-atom ratio the primary fragment must reach over the next "
+            "fragment when --multi-fragment-policy=largest."
+        ),
+    )
     parser.add_argument("--pocket-radius", type=float, default=10.0)
     parser.add_argument("--contact-radius", type=float, default=8.0)
     parser.add_argument("--min-pocket-residues", type=int, default=5)
@@ -103,6 +149,10 @@ def main() -> None:
         raise ValueError("--select-count must be positive")
     if not 0.0 < args.min_residue_mapping_fraction <= 1.0:
         raise ValueError("--min-residue-mapping-fraction must be in (0, 1]")
+    if args.fragment_dominance_ratio < 1.0:
+        raise ValueError("--fragment-dominance-ratio must be at least 1.0")
+    if args.exclude_resname_preset is not None:
+        args.exclude_resnames = EXCLUDED_RESNAME_PRESETS[args.exclude_resname_preset]
     args.output_dir.mkdir(parents=True, exist_ok=True)
     sample_ids = read_sample_ids(args.sample_list, scan_limit=args.scan_limit, seed=args.seed)
     config: Dict[str, Any] = {
@@ -117,6 +167,7 @@ def main() -> None:
             "seed",
             "workers",
             "exclude_resnames",
+            "exclude_resname_preset",
         }
     }
     config["data_dir"] = str(args.data_dir)
@@ -148,6 +199,10 @@ def main() -> None:
         "data_dir": str(args.data_dir),
         "seed": args.seed,
         "scan_limit": args.scan_limit,
+        "exclude_resname_preset": args.exclude_resname_preset or "frozen23_default",
+        "excluded_resnames": config["excluded_resnames"],
+        "multi_fragment_policy": args.multi_fragment_policy,
+        "fragment_dominance_ratio": args.fragment_dominance_ratio,
         "thresholds": config,
     }
     (args.output_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
